@@ -1871,7 +1871,7 @@ impl Element {
         let order = sortable_table::sorted_order(&data, sort.get());
         let mut body = Element::col().width_match();
         for (disp, &ri) in order.iter().enumerate() {
-            body = body.child(sortable_table::body_row(disp, &data[ri], &weights));
+            body = body.child(sortable_table::body_row(disp, ri, &data[ri], &weights, None));
         }
         body.widget = Box::new(sortable_table::SortableBody::new(data, weights, sort));
         body.reactive = true;
@@ -1930,7 +1930,7 @@ impl Element {
         let initial = rows.get();
         let mut body = Element::col().width_match();
         for (disp, row) in initial.iter().enumerate() {
-            body = body.child(sortable_table::body_row(disp, row, &weights));
+            body = body.child(sortable_table::body_row(disp, disp, row, &weights, None));
         }
         body.widget = Box::new(sortable_table::PagedBody::new(rows, weights));
         body.reactive = true;
@@ -2019,6 +2019,51 @@ impl Element {
                 if let Some(h) = a.downcast_mut::<sortable_table::SortableHeader>() {
                     h.set_style(style);
                 }
+            }
+        }
+        self
+    }
+
+    /// 在表格尾部追加一个**操作列**：表头显示 `title`（不可排序），每行单元格由
+    /// `build(行下标)` 生成任意控件（如 查看/编辑/删除 按钮组），列宽按 `weight` 参与分配。
+    /// 仅对 [`table_sortable`](Self::table_sortable) / [`table_selectable`](Self::table_selectable) /
+    /// [`table_sortable_server`](Self::table_sortable_server) 返回的元素有效。
+    ///
+    /// 传给 `build` 的行下标：客户端表格为**原始行下标**（排序后仍锁定同一数据行，与选择语义
+    /// 一致，可直接用作 `cells[row]` / `selected[row]` 索引）；服务端表格为当前页内**显示下标**。
+    /// 在 `build` 内 `move` 捕获该下标即可为每行绑定独立回调。
+    ///
+    /// 性能：操作列不改变重建触发条件——排序/换页才重建，悬停/选择不重建；`build` 只在重建时
+    /// 按行调用一次。大数据集请配合 [`table_sortable_server`](Self::table_sortable_server) 分页。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// Element::table_sortable(cols, rows, sort).actions("操作", 1.6, move |row| {
+    ///     Element::row().spacing(6)
+    ///         .child(Element::button("查看").on_click(move |ctx| ctx.toast(format!("查看 {row}"))))
+    ///         .child(Element::button("删除").outline().on_click(move |ctx| ctx.toast(format!("删除 {row}"))))
+    /// })
+    /// ```
+    pub fn actions(
+        mut self,
+        title: impl Into<String>,
+        weight: f32,
+        build: impl Fn(usize) -> Element + 'static,
+    ) -> Self {
+        let ac = sortable_table::action_col(title.into(), weight, build);
+        // 结构 col[ header, divider, scroll ]。表头行可能直接挂 SortableHeader
+        // （table_sortable/server），或其子行 subrow 挂 SortableHeader（table_selectable 的全选列在前）。
+        if let Some(header) = self.children.get_mut(0) {
+            if !sortable_table::set_header_actions(header, &ac) {
+                if let Some(sub) = header.children.get_mut(1) {
+                    sortable_table::set_header_actions(sub, &ac);
+                }
+            }
+        }
+        // 正文：scroll 为末子，其首个子节点（内层 col）挂响应式正文 widget。
+        if let Some(scroll) = self.children.last_mut() {
+            if let Some(body) = scroll.children.get_mut(0) {
+                sortable_table::set_body_actions(body, &ac);
             }
         }
         self

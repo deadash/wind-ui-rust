@@ -632,6 +632,45 @@ fn main() {
             .height(200),
         ))
         .child(card(
+            "操作列 .actions（末列自定义控件：查看/编辑/删除；回调按原始行下标绑定，排序后仍正确）",
+            Element::table_sortable(
+                // 窄窗下用两数据列 + 操作列，避免挤压换行；操作列做法与列数无关。
+                vec![("名称", 2.0), ("大小(KB)", 1.0)],
+                file_rows()
+                    .into_iter()
+                    .map(|r| vec![r[0], r[1]])
+                    .collect(),
+                signal(Some((0usize, SortOrder::Asc))),
+            )
+            // 尾列由闭包按行生成按钮组；row 为原始行下标（Copy），各按钮 move 捕获它绑定回调。
+            // 用 .small() 紧凑按钮，让三枚操作按钮在窄列内并排不溢出。
+            .actions("操作", 2.6, |row| {
+                Element::row()
+                    .spacing(6)
+                    .child(
+                        Element::button("查看")
+                            .neutral()
+                            .outline()
+                            .small()
+                            .on_click(move |ctx| ctx.toast(format!("查看第 {} 行", row + 1))),
+                    )
+                    .child(
+                        Element::button("编辑")
+                            .outline()
+                            .small()
+                            .on_click(move |ctx| ctx.toast(format!("编辑第 {} 行", row + 1))),
+                    )
+                    .child(
+                        Element::button("删除")
+                            .danger()
+                            .outline()
+                            .small()
+                            .on_click(move |ctx| ctx.toast_err(format!("删除第 {} 行", row + 1))),
+                    )
+            })
+            .height(200),
+        ))
+        .child(card(
             "可排序 + 多选 table_selectable（复选框首列 + 全选三态 + 选中行高亮）",
             Element::col()
                 .width_match()

@@ -23,10 +23,25 @@ use crate::spec::{Align, Dimension};
 use crate::style::{Role, Style};
 use crate::text::TextEngine;
 
-use super::{Element, SortOrder, Truncate, TABLE_CELL_PAD_X, TABLE_HEADER_PAD_Y};
+use super::{Element, SortOrder, Truncate, TABLE_CELL_PAD_X, TABLE_CELL_PAD_Y, TABLE_HEADER_PAD_Y};
 
 /// 受控排序状态：`None` 无排序；`Some((列下标, 方向))` 按该列排序。
 pub(super) type SortState = Signal<Option<(usize, SortOrder)>>;
+
+/// 操作列配置：在表格尾部追加一列，单元格由 `build(行下标)` 按行生成任意控件
+/// （如 查看/编辑/删除 按钮组）。表头显示 `title`（不可排序），列宽按 `weight` 参与分配。
+///
+/// 由 [`Element::actions`](super::Element::actions) 设置后透传给响应式表头与正文；
+/// 排序/换页重建时按行重新调用 `build`。传给 `build` 的行下标：客户端表格
+/// （`table_sortable`/`table_selectable`）为**原始行下标**（排序后仍锁定同一数据行，
+/// 与选择语义一致）；服务端表格（`table_sortable_server`）为当前页内的**显示下标**。
+/// `build` 内用 `move` 捕获该下标即可为每行绑定独立回调。
+#[derive(Clone)]
+pub(super) struct ActionCol {
+    title: String,
+    weight: f32,
+    build: Rc<dyn Fn(usize) -> Element>,
+}
 
 /// 排序指示器（表头箭头）的每实例样式覆盖。用 `Element::sort_indicator(SortStyle{..})` 链式设置；
 /// 字段为 `None` 时回退到主题 [`TableTheme`](crate::theme::TableTheme)，再回退到内置默认。
@@ -273,10 +288,43 @@ impl Widget for HoverRow {
     }
 }
 
-/// 构建一行正文：`disp` 为显示位置（决定斑马纹），`cells` 为该行各列文本。
-/// 结构与 `table_custom` 一致：`col[ row(单元格…), divider ]`，便于列对齐与行分隔。
-/// 行挂 `HoverRow` widget，悬停时整行轻微高亮。
-pub(super) fn body_row(disp: usize, cells: &[String], weights: &[f32]) -> Element {
+/// 操作列单元格：水平内边距 + 内容垂直居中，宽度按权重（内容自身决定高度，行随之等高）。
+/// 与文本列的 `table_cell_pad` 不同——不强制 20px 高，故按钮等较高控件不被压扁。
+fn action_cell(content: Element, weight: f32) -> Element {
+    Element::row()
+        .weight(weight)
+        .cross(Align::Center)
+        .padding_xy(TABLE_CELL_PAD_X, TABLE_CELL_PAD_Y)
+        .child(content)
+}
+
+/// 操作列表头单元格：加粗弱化色标题（单行末尾省略），不可点击（操作列不参与排序）。
+fn action_header_cell(title: &str, weight: f32) -> Element {
+    Element::stack()
+        .weight(weight)
+        .padding_xy(TABLE_CELL_PAD_X, TABLE_HEADER_PAD_Y)
+        .child(
+            Element::label(title.to_string())
+                .font_size(13.0)
+                .font_weight(600)
+                .fg_role(Role::TextMuted)
+                .max_lines(1)
+                .truncate(Truncate::End)
+                .width_match()
+                .height(18),
+        )
+}
+
+/// 构建一行正文：`disp` 为显示位置（决定斑马纹），`orig` 为该行下标（传给操作列生成器），
+/// `cells` 为该行各列文本。结构与 `table_custom` 一致：`col[ row(单元格…), divider ]`。
+/// 行挂 `HoverRow` widget，悬停时整行轻微高亮。`actions` 为 `Some` 时在末尾追加操作单元格。
+pub(super) fn body_row(
+    disp: usize,
+    orig: usize,
+    cells: &[String],
+    weights: &[f32],
+    actions: Option<&ActionCol>,
+) -> Element {
     let mut tr = Element::row().width_match().cross(Align::Stretch);
     // 斑马纹随显示位置交替（而非原始行号），排序后视觉仍规整。
     if disp % 2 == 1 {
@@ -286,6 +334,9 @@ pub(super) fn body_row(disp: usize, cells: &[String], weights: &[f32]) -> Elemen
         let w = weights.get(ci).copied().unwrap_or(1.0);
         tr = tr
             .child(Element::table_cell_pad(Element::label(cell.clone()).font_size(13.0)).weight(w));
+    }
+    if let Some(a) = actions {
+        tr = tr.child(action_cell((a.build)(orig), a.weight));
     }
     tr.widget = Box::new(HoverRow::new());
     Element::col()
@@ -314,6 +365,8 @@ pub(super) struct SortableHeader {
     on_sort: Option<OnSort>,
     /// 每实例样式覆盖（由 `Element::sort_indicator` 设置）；未设字段回退主题。
     style: SortStyle,
+    /// 尾部操作列（由 `Element::actions` 设置）；`Some` 时追加不可排序的操作表头单元格。
+    actions: Option<ActionCol>,
     /// 是否已构建过单元格（首次 on_update 无条件构建）。
     built: bool,
     last_version: u64,
@@ -331,6 +384,7 @@ impl SortableHeader {
             sort,
             on_sort,
             style: SortStyle::default(),
+            actions: None,
             built: false,
         }
     }
@@ -338,6 +392,12 @@ impl SortableHeader {
     /// 设置每实例样式覆盖（`Element::sort_indicator` 在 build 前调用）。
     pub(super) fn set_style(&mut self, style: SortStyle) {
         self.style = style;
+    }
+
+    /// 设置尾部操作列（`Element::actions` 在 build 前调用）；置 `built=false` 令首次构建纳入。
+    pub(super) fn set_actions(&mut self, actions: ActionCol) {
+        self.actions = Some(actions);
+        self.built = false;
     }
 }
 
@@ -358,6 +418,13 @@ impl Widget for SortableHeader {
             // 直接 build+add_child 绕过了父级线性容器 build 循环的 weight→主轴维度转换
             // （见 Element::build），此处手工复现：表头行恒为水平轴，故落到宽度。
             el.width = Dimension::Weight(*w);
+            let id = el.build(tree);
+            tree.add_child(self_id, id);
+        }
+        // 尾部操作列表头（不可排序），与正文操作单元格同权重对齐。
+        if let Some(a) = &self.actions {
+            let mut el = action_header_cell(&a.title, a.weight);
+            el.width = Dimension::Weight(a.weight);
             let id = el.build(tree);
             tree.add_child(self_id, id);
         }
@@ -390,6 +457,10 @@ pub(super) struct SortableBody {
     rows: Vec<Vec<String>>,
     weights: Vec<f32>,
     sort: SortState,
+    /// 尾部操作列（由 `Element::actions` 设置）。
+    actions: Option<ActionCol>,
+    /// 强制下次 on_update 重建（`set_actions` 置位——初始 eager 行不含操作列，需重建一次）。
+    force: bool,
     last_version: u64,
 }
 
@@ -400,23 +471,32 @@ impl SortableBody {
             rows,
             weights,
             sort,
+            actions: None,
+            force: false,
         }
+    }
+
+    /// 设置尾部操作列；置 `force` 令首次 on_update 重建（把操作列纳入，替换初始纯文本行）。
+    pub(super) fn set_actions(&mut self, actions: ActionCol) {
+        self.actions = Some(actions);
+        self.force = true;
     }
 }
 
 impl Widget for SortableBody {
     fn on_update(&mut self, ctx: &mut EventCtx) {
         let ver = self.sort.version();
-        if ver == self.last_version {
+        if !self.force && ver == self.last_version {
             return;
         }
+        self.force = false;
         self.last_version = ver;
         let self_id = ctx.id();
         let tree = ctx.tree_mut();
         clear_children(tree, self_id);
         let order = sorted_order(&self.rows, self.sort.get());
         for (disp, &ri) in order.iter().enumerate() {
-            let el = body_row(disp, &self.rows[ri], &self.weights);
+            let el = body_row(disp, ri, &self.rows[ri], &self.weights, self.actions.as_ref());
             let id = el.build(tree);
             tree.add_child(self_id, id);
         }
@@ -438,6 +518,9 @@ impl Widget for SortableBody {
     fn on_event(&mut self, _ctx: &mut EventCtx, _ev: &Event) -> bool {
         false
     }
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 /// 服务端排序模式的正文：绑定"当前页数据"信号，**不做内部排序**——排序由后端完成，
@@ -445,6 +528,10 @@ impl Widget for SortableBody {
 pub(super) struct PagedBody {
     rows: Signal<Vec<Vec<String>>>,
     weights: Vec<f32>,
+    /// 尾部操作列（由 `Element::actions` 设置）。生成器收到当前页内显示下标。
+    actions: Option<ActionCol>,
+    /// 强制下次 on_update 重建（`set_actions` 置位）。
+    force: bool,
     last_version: u64,
 }
 
@@ -454,23 +541,32 @@ impl PagedBody {
             last_version: rows.version(),
             rows,
             weights,
+            actions: None,
+            force: false,
         }
+    }
+
+    /// 设置尾部操作列；置 `force` 令首次 on_update 重建（把操作列纳入）。
+    pub(super) fn set_actions(&mut self, actions: ActionCol) {
+        self.actions = Some(actions);
+        self.force = true;
     }
 }
 
 impl Widget for PagedBody {
     fn on_update(&mut self, ctx: &mut EventCtx) {
         let ver = self.rows.version();
-        if ver == self.last_version {
+        if !self.force && ver == self.last_version {
             return;
         }
+        self.force = false;
         self.last_version = ver;
         let self_id = ctx.id();
         let tree = ctx.tree_mut();
         clear_children(tree, self_id);
         let data = self.rows.get();
         for (disp, row) in data.iter().enumerate() {
-            let el = body_row(disp, row, &self.weights);
+            let el = body_row(disp, disp, row, &self.weights, self.actions.as_ref());
             let id = el.build(tree);
             tree.add_child(self_id, id);
         }
@@ -491,6 +587,9 @@ impl Widget for PagedBody {
     }
     fn on_event(&mut self, _ctx: &mut EventCtx, _ev: &Event) -> bool {
         false
+    }
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }
 
@@ -517,9 +616,11 @@ fn select_cell(row_sel: Signal<bool>) -> Element {
 /// `row_sel` 为该行（原始行身份）的选择信号：复选框直接绑定，行高亮读取它。
 pub(super) fn select_body_row(
     disp: usize,
+    orig: usize,
     cells: &[String],
     weights: &[f32],
     row_sel: Signal<bool>,
+    actions: Option<&ActionCol>,
 ) -> Element {
     let mut tr = Element::row().width_match().cross(Align::Stretch);
     if disp % 2 == 1 {
@@ -530,6 +631,9 @@ pub(super) fn select_body_row(
         let w = weights.get(ci).copied().unwrap_or(1.0);
         tr = tr
             .child(Element::table_cell_pad(Element::label(cell.clone()).font_size(13.0)).weight(w));
+    }
+    if let Some(a) = actions {
+        tr = tr.child(action_cell((a.build)(orig), a.weight));
     }
     tr.widget = Box::new(SelectableRow::new(row_sel));
     Element::col()
@@ -753,6 +857,8 @@ pub(super) struct SelectableBody {
     weights: Vec<f32>,
     sel: Vec<Signal<bool>>,
     sort: SortState,
+    /// 尾部操作列（由 `Element::actions` 设置）。生成器收到原始行下标（与选择同身份）。
+    actions: Option<ActionCol>,
     built: bool,
     last_version: u64,
 }
@@ -770,8 +876,15 @@ impl SelectableBody {
             weights,
             sel,
             sort,
+            actions: None,
             built: false,
         }
+    }
+
+    /// 设置尾部操作列；置 `built=false` 令首次 on_update 把操作列纳入。
+    pub(super) fn set_actions(&mut self, actions: ActionCol) {
+        self.actions = Some(actions);
+        self.built = false;
     }
 }
 
@@ -792,7 +905,14 @@ impl Widget for SelectableBody {
             let Some(&row_sel) = self.sel.get(ri) else {
                 continue;
             };
-            let el = select_body_row(disp, &self.rows[ri], &self.weights, row_sel);
+            let el = select_body_row(
+                disp,
+                ri,
+                &self.rows[ri],
+                &self.weights,
+                row_sel,
+                self.actions.as_ref(),
+            );
             let id = el.build(tree);
             tree.add_child(self_id, id);
         }
@@ -814,11 +934,58 @@ impl Widget for SelectableBody {
     fn on_event(&mut self, _ctx: &mut EventCtx, _ev: &Event) -> bool {
         false
     }
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 /// 选择列宽度（供构造器对齐表头全选列与正文复选框列）。
 pub(super) const fn select_col_w() -> i32 {
     SELECT_COL_W
+}
+
+/// 构造操作列配置（供 `Element::actions` 组装）。
+pub(super) fn action_col(
+    title: String,
+    weight: f32,
+    build: impl Fn(usize) -> Element + 'static,
+) -> ActionCol {
+    ActionCol {
+        title,
+        weight,
+        build: Rc::new(build),
+    }
+}
+
+/// 若 `el` 挂的是 `SortableHeader` 则设入操作列并返回 true，否则 false（供定位表头）。
+pub(super) fn set_header_actions(el: &mut Element, ac: &ActionCol) -> bool {
+    if let Some(a) = el.widget.as_any_mut() {
+        if let Some(h) = a.downcast_mut::<SortableHeader>() {
+            h.set_actions(ac.clone());
+            return true;
+        }
+    }
+    false
+}
+
+/// 若 `el` 挂的是任一响应式正文（Sortable/Paged/Selectable）则设入操作列并返回 true。
+pub(super) fn set_body_actions(el: &mut Element, ac: &ActionCol) -> bool {
+    let Some(a) = el.widget.as_any_mut() else {
+        return false;
+    };
+    if let Some(b) = a.downcast_mut::<SortableBody>() {
+        b.set_actions(ac.clone());
+        return true;
+    }
+    if let Some(b) = a.downcast_mut::<PagedBody>() {
+        b.set_actions(ac.clone());
+        return true;
+    }
+    if let Some(b) = a.downcast_mut::<SelectableBody>() {
+        b.set_actions(ac.clone());
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1163,6 +1330,108 @@ mod tests {
                 Dimension::Weight(1.5)
             ],
             "重建后各表头单元格应保持比例宽度"
+        );
+    }
+
+    /// 从根 DFS 累加各层局部 bounds 偏移，求目标节点的**绝对**中心点（bounds 是局部坐标，
+    /// 需累加祖先 origin 才对得上 hit_test 的绝对命中）。找不到返回 None。
+    fn abs_center(tree: &Tree, target: crate::core::NodeId) -> Option<Point> {
+        fn walk(
+            tree: &Tree,
+            id: crate::core::NodeId,
+            ox: i32,
+            oy: i32,
+            target: crate::core::NodeId,
+        ) -> Option<Point> {
+            let n = tree.get(id)?;
+            let (x, y) = (ox + n.bounds.x, oy + n.bounds.y);
+            if id == target {
+                return Some(Point::new(x + n.bounds.w / 2, y + n.bounds.h / 2));
+            }
+            for &c in &n.children {
+                if let Some(p) = walk(tree, c, x, y, target) {
+                    return Some(p);
+                }
+            }
+            None
+        }
+        walk(tree, tree.root?, 0, 0, target)
+    }
+
+    #[test]
+    fn actions_column_adds_header_and_body_cells() {
+        // .actions 应给表头与每个正文行各追加一个操作单元格（数据列数 + 1）。
+        let sort = signal(None);
+        let mut tree = layout(
+            Element::table_sortable(
+                vec![("A", 1.0), ("B", 1.0)],
+                vec![vec!["a", "b"], vec!["c", "d"]],
+                sort,
+            )
+            .actions("操作", 1.0, |_row| Element::label("·"))
+            .width(400)
+            .height(300),
+        );
+        let root = tree.root.unwrap();
+        let header = tree.get(root).unwrap().children[0];
+        assert_eq!(
+            tree.get(header).unwrap().children.len(),
+            3,
+            "表头应为 2 数据列 + 1 操作列"
+        );
+        let scroll = *tree.get(root).unwrap().children.last().unwrap();
+        let body = tree.get(scroll).unwrap().children[0]; // 内层 col（挂 SortableBody）
+        let first_row = tree.get(body).unwrap().children[0]; // col[tr, divider]
+        let tr = tree.get(first_row).unwrap().children[0];
+        assert_eq!(
+            tree.get(tr).unwrap().children.len(),
+            3,
+            "正文行应为 2 数据单元格 + 1 操作单元格"
+        );
+    }
+
+    #[test]
+    fn action_button_reports_original_row_after_sort() {
+        // 关键：操作按钮回调按**原始行下标**绑定——排序打乱显示序后，点某显示行的按钮
+        // 仍回报该行的原始下标（可直接用作数据/选择索引）。
+        use std::cell::Cell as StdCell;
+        use std::rc::Rc;
+        let sort = signal(Some((0usize, SortOrder::Asc)));
+        let seen: Rc<StdCell<Option<usize>>> = Rc::new(StdCell::new(None));
+        let seen_c = seen.clone();
+        let mut tree = layout(
+            Element::table_sortable(
+                vec![("v", 1.0)],
+                vec![vec!["3"], vec!["1"], vec!["2"]], // 原始行 0/1/2 = 值 3/1/2
+                sort,
+            )
+            .actions("op", 1.0, move |row| {
+                let s = seen_c.clone();
+                Element::row()
+                    .width(120)
+                    .height(24)
+                    .clickable()
+                    .on_click(move |_| s.set(Some(row)))
+                    .child(Element::label("x"))
+            })
+            .width(400)
+            .height(300),
+        );
+        // 升序显示：值 1,2,3 → 显示序 = 原始行 1,2,0。首个显示行是原始行 1。
+        let root = tree.root.unwrap();
+        let scroll = *tree.get(root).unwrap().children.last().unwrap();
+        let body = tree.get(scroll).unwrap().children[0];
+        let first_row = tree.get(body).unwrap().children[0];
+        let tr = tree.get(first_row).unwrap().children[0];
+        // 操作单元格为该行末子（数据列之后）；其内层为可点击控件。
+        let action = *tree.get(tr).unwrap().children.last().unwrap();
+        let clickable = tree.get(action).unwrap().children[0];
+        let at = abs_center(&tree, clickable).unwrap();
+        click(&mut tree, at);
+        assert_eq!(
+            seen.get(),
+            Some(1),
+            "点首个显示行的操作按钮应回报其原始行下标 1"
         );
     }
 
