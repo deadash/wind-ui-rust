@@ -1772,6 +1772,8 @@ impl Element {
                 let w = columns.get(ci).map(|c| c.1).unwrap_or(1.0);
                 tr = tr.child(cell.weight(w));
             }
+            // 整行悬停轻微高亮（叠层在斑马纹之上、单元格之下；可编辑单元格的 clickable 叠层叠加其上）。
+            tr.widget = Box::new(sortable_table::HoverRow::new());
             scroll = scroll.child(
                 Element::col()
                     .width_match()

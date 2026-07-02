@@ -9,14 +9,15 @@
 //!
 //! 外部只通过 `Element::table_sortable` 使用，无需直接构造本模块类型。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::rc::Rc;
 
+use crate::anim::{Easing, Transition};
 use crate::core::{EventCtx, Widget};
-use crate::event::Event;
+use crate::event::{Event, PointerKind};
 use crate::geometry::{Color, Rect, Size};
-use crate::render::Canvas;
+use crate::render::{Canvas, Paint};
 use crate::signal::Signal;
 use crate::spec::{Align, Dimension};
 use crate::style::{Role, Style};
@@ -184,8 +185,97 @@ fn header_cell(
         .child(inner)
 }
 
+/// 正文行悬停高亮的叠层不透明度（叠层取主题文字色，明暗自适应；"轻微"故低于 clickable 的 0.06）。
+const ROW_HOVER_A: f32 = 0.05;
+
+/// 只读表格正文行的悬停高亮 widget：悬停时在整行背景（斑马纹）之上、单元格内容之下绘制
+/// 一层轻微半透明叠层（主题文字色低 alpha，明暗自适应），带淡入淡出。无点击/焦点/手型，
+/// 纯视觉反馈。Enter/Leave 由框架沿祖先链派发（命中的是子单元格/标签，行仍收到）。
+pub(super) struct HoverRow {
+    hover: bool,
+    /// 叠层不透明度补间（normal=0 / hover）；首帧靠 `primed` 落定。
+    overlay: Cell<Transition<f32>>,
+    primed: Cell<bool>,
+}
+
+impl HoverRow {
+    pub(super) fn new() -> Self {
+        Self {
+            hover: false,
+            overlay: Cell::new(Transition::new(0.0)),
+            primed: Cell::new(false),
+        }
+    }
+}
+
+impl Widget for HoverRow {
+    fn paint(
+        &self,
+        bounds: Rect,
+        _content: Rect,
+        _focused: bool,
+        enabled: bool,
+        canvas: &mut dyn Canvas,
+        style: &Style,
+    ) {
+        let th = crate::theme::current();
+        let target = if enabled && self.hover {
+            ROW_HOVER_A
+        } else {
+            0.0
+        };
+        let mut ov = self.overlay.get();
+        if !self.primed.get() {
+            ov = Transition::new(target);
+            self.primed.set(true);
+        } else if ov.target() != target {
+            ov.retarget(target, th.anim.fast(), Easing::EaseOut);
+        }
+        let a = ov.animate();
+        self.overlay.set(ov);
+        if a > 0.001 {
+            canvas.fill_round_rect(
+                bounds.x as f32,
+                bounds.y as f32,
+                bounds.w as f32,
+                bounds.h as f32,
+                style.corner_radius,
+                &Paint::fill(th.palette.text.scale_alpha(a)),
+            );
+        }
+    }
+    fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
+        if let Event::Pointer(p) = ev {
+            match p.kind {
+                PointerKind::Enter => {
+                    if !self.hover {
+                        self.hover = true;
+                        ctx.mark_dirty();
+                    }
+                    true
+                }
+                PointerKind::Leave => {
+                    if self.hover {
+                        self.hover = false;
+                        ctx.mark_dirty();
+                    }
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+    fn reset_interaction(&mut self) {
+        self.hover = false;
+        self.primed.set(false); // 隐藏期不回放 hover 淡出，下次显示瞬时落定
+    }
+}
+
 /// 构建一行正文：`disp` 为显示位置（决定斑马纹），`cells` 为该行各列文本。
 /// 结构与 `table_custom` 一致：`col[ row(单元格…), divider ]`，便于列对齐与行分隔。
+/// 行挂 `HoverRow` widget，悬停时整行轻微高亮。
 pub(super) fn body_row(disp: usize, cells: &[String], weights: &[f32]) -> Element {
     let mut tr = Element::row().width_match().cross(Align::Stretch);
     // 斑马纹随显示位置交替（而非原始行号），排序后视觉仍规整。
@@ -197,6 +287,7 @@ pub(super) fn body_row(disp: usize, cells: &[String], weights: &[f32]) -> Elemen
         tr = tr
             .child(Element::table_cell_pad(Element::label(cell.clone()).font_size(13.0)).weight(w));
     }
+    tr.widget = Box::new(HoverRow::new());
     Element::col()
         .width_match()
         .child(tr)
@@ -585,6 +676,31 @@ mod tests {
         .width(400)
         .height(300);
         let _tree = layout(el); // 触发首次 on_update：用覆盖样式构建表头单元格
+    }
+
+    #[test]
+    fn hovering_body_row_requests_repaint() {
+        // 悬停正文行：Move 派发经祖先链到达行的 HoverRow → 置 hover + 请求重绘。
+        let sort = signal(Some((0usize, SortOrder::Asc)));
+        let mut tree = layout(
+            Element::table_sortable(
+                vec![("名称", 2.0), ("大小", 1.0)],
+                vec![vec!["a", "2"], vec!["b", "1"]],
+                sort,
+            )
+            .width(400)
+            .height(300),
+        );
+        let mut hover = None;
+        let mut capture = None;
+        // 移到正文首行区域（表头约 38px 高，行在其下）。
+        let res = tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Move, Point::new(80, 70), MouseButton::Left),
+            &mut hover,
+            &mut capture,
+        );
+        assert!(res.repaint, "悬停正文行应触发重绘（整行高亮淡入）");
+        assert!(hover.is_some(), "应有命中的悬停节点");
     }
 
     #[test]
