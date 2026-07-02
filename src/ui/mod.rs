@@ -1871,7 +1871,9 @@ impl Element {
         let order = sortable_table::sorted_order(&data, sort.get());
         let mut body = Element::col().width_match();
         for (disp, &ri) in order.iter().enumerate() {
-            body = body.child(sortable_table::body_row(disp, ri, &data[ri], &weights, None));
+            body = body.child(sortable_table::body_row(
+                disp, ri, &data[ri], &weights, None,
+            ));
         }
         body.widget = Box::new(sortable_table::SortableBody::new(data, weights, sort));
         body.reactive = true;

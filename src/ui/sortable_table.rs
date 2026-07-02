@@ -496,7 +496,13 @@ impl Widget for SortableBody {
         clear_children(tree, self_id);
         let order = sorted_order(&self.rows, self.sort.get());
         for (disp, &ri) in order.iter().enumerate() {
-            let el = body_row(disp, ri, &self.rows[ri], &self.weights, self.actions.as_ref());
+            let el = body_row(
+                disp,
+                ri,
+                &self.rows[ri],
+                &self.weights,
+                self.actions.as_ref(),
+            );
             let id = el.build(tree);
             tree.add_child(self_id, id);
         }
@@ -1362,7 +1368,7 @@ mod tests {
     fn actions_column_adds_header_and_body_cells() {
         // .actions 应给表头与每个正文行各追加一个操作单元格（数据列数 + 1）。
         let sort = signal(None);
-        let mut tree = layout(
+        let tree = layout(
             Element::table_sortable(
                 vec![("A", 1.0), ("B", 1.0)],
                 vec![vec!["a", "b"], vec!["c", "d"]],

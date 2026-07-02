@@ -636,10 +636,7 @@ fn main() {
             Element::table_sortable(
                 // 窄窗下用两数据列 + 操作列，避免挤压换行；操作列做法与列数无关。
                 vec![("名称", 2.0), ("大小(KB)", 1.0)],
-                file_rows()
-                    .into_iter()
-                    .map(|r| vec![r[0], r[1]])
-                    .collect(),
+                file_rows().into_iter().map(|r| vec![r[0], r[1]]).collect(),
                 signal(Some((0usize, SortOrder::Asc))),
             )
             // 尾列由闭包按行生成按钮组；row 为原始行下标（Copy），各按钮 move 捕获它绑定回调。
