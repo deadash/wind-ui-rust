@@ -1266,6 +1266,30 @@ impl Tree {
         None
     }
 
+    /// 找 `p` 下**能在指定方向继续滚动**的最近滚动容器：`increase=true` 需能增大 `scroll_y`
+    /// （内容上移 / 向下滚），`false` 需能减小。内层滚动在该方向已到边界（或内容不溢出、
+    /// 根本不可滚）时跳过，冒泡到外层——修正嵌套滚动"内层吃掉滚轮、外层滚不动"的问题。
+    pub fn scroll_target(&self, p: Point, increase: bool) -> Option<NodeId> {
+        let mut cur = self.hit_test(p);
+        while let Some(id) = cur {
+            let n = self.get(id)?;
+            if matches!(n.layout, Layout::Scroll) {
+                let view_h = (n.bounds.h - n.padding.vertical()).max(0);
+                let max = (n.content_h - view_h).max(0);
+                let can = if increase {
+                    n.scroll_y < max
+                } else {
+                    n.scroll_y > 0
+                };
+                if can {
+                    return Some(id);
+                }
+            }
+            cur = n.parent;
+        }
+        None
+    }
+
     /// 滚动节点的 `(当前偏移, 最大偏移)`（基于上一帧布局的内容高/视口高）。
     /// 非滚动节点返回 None。供惯性滑动按边界结算。
     pub fn scroll_range(&self, id: NodeId) -> Option<(i32, i32)> {
@@ -1300,7 +1324,8 @@ impl Tree {
     /// `dy>0`（手指下移）→ 内容下移（scroll_y 减小，自然跟手）。下一帧 arrange 钳制范围。
     /// 返回是否命中可滚动容器。
     pub fn pan_scroll(&mut self, p: Point, dy: i32) -> bool {
-        if let Some(id) = self.scroll_node_at(p) {
+        // dy>0 减小 scroll_y、dy<0 增大；按方向找能继续滚动的容器（内层到界则冒泡外层）。
+        if let Some(id) = self.scroll_target(p, dy < 0) {
             if let Some(n) = self.get_mut(id) {
                 n.scroll_y -= dy;
             }
@@ -2207,6 +2232,74 @@ mod tests {
         assert!(
             !tree.pan_scroll(Point::new(-100, -100), 10),
             "命中外返回 false"
+        );
+    }
+
+    #[test]
+    fn scroll_target_bubbles_when_inner_at_edge() {
+        // 嵌套滚动：外层可滚，内层内容溢出可滚。
+        let inner = {
+            let mut s = Element::scroll().width_match().height(40);
+            for _ in 0..4 {
+                s = s.child(Element::leaf().width_match().height(25)); // 内容 100 > 视口 40 → max=60
+            }
+            s
+        };
+        let outer = Element::scroll()
+            .width(100)
+            .height(100)
+            .child(inner)
+            .child(Element::leaf().width_match().height(300)); // 外层内容远超视口
+        let mut tree = Tree::new();
+        let oid = outer.build(&mut tree);
+        tree.root = Some(oid);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 100), &mut te);
+        let inner_id = tree.get(oid).unwrap().children[0];
+
+        // 内层在顶部（scroll_y=0），向下滚（increase）内层仍有空间 → 命中内层。
+        assert_eq!(
+            tree.scroll_target(Point::new(20, 15), true),
+            Some(inner_id),
+            "内层未到底，向下滚应命中内层"
+        );
+        // 把内层滚到底（scroll_y=max=60），再向下滚 → 内层到界，冒泡外层。
+        tree.set_scroll_y(inner_id, 60);
+        tree.layout_root(Size::new(100, 100), &mut te);
+        assert_eq!(
+            tree.scroll_target(Point::new(20, 15), true),
+            Some(oid),
+            "内层到底后向下滚应冒泡到外层"
+        );
+        // 内层在底部，向上滚（decrease）内层仍可回滚 → 命中内层。
+        assert_eq!(
+            tree.scroll_target(Point::new(20, 15), false),
+            Some(inner_id),
+            "内层可上滚时向上应命中内层"
+        );
+    }
+
+    #[test]
+    fn scroll_target_skips_nonscrollable_inner() {
+        // 内层内容不溢出（不可滚）→ 在其上滚动直接命中外层。
+        let inner = Element::scroll()
+            .width_match()
+            .height(60)
+            .child(Element::leaf().width_match().height(20)); // 20 < 60 → max=0
+        let outer = Element::scroll()
+            .width(100)
+            .height(100)
+            .child(inner)
+            .child(Element::leaf().width_match().height(300));
+        let mut tree = Tree::new();
+        let oid = outer.build(&mut tree);
+        tree.root = Some(oid);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 100), &mut te);
+        assert_eq!(
+            tree.scroll_target(Point::new(20, 10), true),
+            Some(oid),
+            "内层不可滚，滚动应直接命中外层"
         );
     }
 

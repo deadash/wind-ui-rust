@@ -1866,11 +1866,12 @@ impl AppHandler for UiHost {
             (pos.x as f32 / s).round() as i32,
             (pos.y as f32 / s).round() as i32,
         );
-        let Some(node) = self.tree.scroll_node_at(p) else {
-            return false;
-        };
         // scroll_y 速度 = −手指速度（手指上移 vy<0 → 内容上移、scroll_y 增大）；物理→逻辑。
         let vel = -vy / s;
+        // 按惯性方向找能继续滚动的容器：内层到界则冒泡外层（与 pan 一致）。
+        let Some(node) = self.tree.scroll_target(p, vel > 0.0) else {
+            return false;
+        };
         self.fling = Some(Fling {
             node,
             phase: FlingPhase::Glide,
