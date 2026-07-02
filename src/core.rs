@@ -1113,12 +1113,20 @@ impl Tree {
         true
     }
 
-    /// 节点期望的光标形状（取其控件声明；节点缺失回退 Arrow）。
-    /// 禁用回退由宿主在查询前进行处理（见 `App` 的 `cursor()`）。
+    /// 节点期望的光标形状：沿命中节点向祖先回溯——子节点自身声明了非默认光标则用之，
+    /// 否则继承最近祖先的非默认光标（如 `clickable()` 卡片的 `Hand`）。这样悬停在卡片内的
+    /// label/图标等子控件上也显示手型，而非只有落在容器 padding 间隙时才手型。
+    /// 禁用回退由宿主在查询前进行处理（见 `App` 的 `cursor()`）：命中节点启用则其祖先必启用。
     pub fn cursor_at(&self, id: NodeId) -> CursorShape {
-        self.get(id)
-            .map(|n| n.widget.cursor())
-            .unwrap_or(CursorShape::Arrow)
+        for nid in self.ancestor_chain(id) {
+            if let Some(n) = self.get(nid) {
+                let c = n.widget.cursor();
+                if c != CursorShape::Arrow {
+                    return c;
+                }
+            }
+        }
+        CursorShape::Arrow
     }
 
     /// 节点的悬停提示文本（无则 None）。宿主据此在悬停延时后绘制浮层。
@@ -1747,7 +1755,7 @@ fn align_offset(a: Align, avail: i32, size: i32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{Key, KeyEvent, MouseButton, PointerEvent, PointerKind};
+    use crate::event::{CursorShape, Key, KeyEvent, MouseButton, PointerEvent, PointerKind};
     use crate::geometry::{Point, Size};
     use crate::signal::signal;
     use crate::ui::Element;
@@ -1761,6 +1769,34 @@ mod tests {
         let mut te = crate::text::NullTextEngine;
         tree.layout_root(Size::new(w, h), &mut te);
         tree
+    }
+
+    #[test]
+    fn cursor_inherits_from_clickable_ancestor() {
+        // clickable 卡片内的 label/图标子节点自身声明 Arrow，cursor_at 应沿父链回溯到
+        // Clickable 的 Hand——否则悬停卡片内容区只显示箭头、只有 padding 间隙才手型。
+        let tree = layout(
+            Element::col()
+                .width(100)
+                .height(40)
+                .clickable()
+                .child(Element::label("x").width(60).height(20)),
+            100,
+            40,
+        );
+        let hit = tree
+            .hit_test(Point::new(10, 10))
+            .expect("应命中 label 子节点");
+        assert_ne!(
+            hit,
+            tree.root.unwrap(),
+            "命中的应是子 label 而非 clickable 根"
+        );
+        assert_eq!(
+            tree.cursor_at(hit),
+            CursorShape::Hand,
+            "悬停在 clickable 卡片内的子控件上应显示手型"
+        );
     }
 
     #[test]
