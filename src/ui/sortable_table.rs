@@ -1006,6 +1006,43 @@ mod tests {
     }
 
     #[test]
+    fn reactive_table_scrolls_on_wheel() {
+        // 回归：响应式表格的滚动容器须保留内置 ScrollWidget（滚轮 + 滚动条），
+        // 正文 widget 挂在其内部 col 上——否则替换 scroll 的 widget 会丢滚轮/拖动能力。
+        let sort = signal(None);
+        let rows: Vec<Vec<String>> = (0..20).map(|i| vec![format!("r{i}")]).collect();
+        let mut tree = layout(
+            Element::table_sortable(vec![("列", 1.0)], rows, sort)
+                .width(400)
+                .height(200),
+        );
+        // 结构：col[header, divider, scroll]；scroll 保留 ScrollWidget。
+        let root = tree.root.unwrap();
+        let scroll = *tree.get(root).unwrap().children.last().unwrap();
+        assert!(
+            tree.scroll_range(scroll).is_some_and(|(_, max)| max > 0),
+            "20 行应溢出，正文应可滚"
+        );
+        // 在正文区域派发向下滚轮（delta<0），正文应滚动。
+        let mut h = None;
+        let mut cap = None;
+        tree.dispatch_pointer(
+            PointerEvent::single(
+                PointerKind::Wheel(-120),
+                Point::new(80, 120),
+                MouseButton::Left,
+            ),
+            &mut h,
+            &mut cap,
+        );
+        tree.layout_root(Size::new(400, 300), &mut crate::text::NullTextEngine);
+        assert!(
+            tree.get(scroll).unwrap().scroll_y > 0,
+            "滚轮应滚动响应式表格正文（ScrollWidget 未被替换）"
+        );
+    }
+
+    #[test]
     fn clicking_row_checkbox_toggles_that_rows_selection() {
         let sort = signal(None);
         let sel: Vec<Signal<bool>> = (0..2).map(|_| signal(false)).collect();

@@ -1866,14 +1866,16 @@ impl Element {
         header.widget = Box::new(sortable_table::SortableHeader::new(cols, sort, None));
         header.reactive = true;
 
-        // 正文：响应式（排序变化重排重建）。初始行按当前排序状态排列。
+        // 正文：滚动容器保留内置 ScrollWidget（滚轮 + 滚动条拖拽），行由 SortableBody 挂在
+        // 其内部 col 上重建（不替换 scroll 的 widget，否则会丢滚轮/拖动能力）。初始行按当前排序排列。
         let order = sortable_table::sorted_order(&data, sort.get());
-        let mut scroll = Element::scroll().fill();
+        let mut body = Element::col().width_match();
         for (disp, &ri) in order.iter().enumerate() {
-            scroll = scroll.child(sortable_table::body_row(disp, &data[ri], &weights));
+            body = body.child(sortable_table::body_row(disp, &data[ri], &weights));
         }
-        scroll.widget = Box::new(sortable_table::SortableBody::new(data, weights, sort));
-        scroll.reactive = true;
+        body.widget = Box::new(sortable_table::SortableBody::new(data, weights, sort));
+        body.reactive = true;
+        let scroll = Element::scroll().fill().child(body);
 
         Element::col()
             .width_match()
@@ -1923,14 +1925,16 @@ impl Element {
         ));
         header.reactive = true;
 
-        // 正文：绑定当前页数据信号，按后端给定顺序渲染（无内部排序），数据变即重建。
+        // 正文：滚动容器保留内置 ScrollWidget；PagedBody 挂在其内部 col 上，绑定当前页数据信号，
+        // 按后端给定顺序渲染（无内部排序），数据变即重建。
         let initial = rows.get();
-        let mut scroll = Element::scroll().fill();
+        let mut body = Element::col().width_match();
         for (disp, row) in initial.iter().enumerate() {
-            scroll = scroll.child(sortable_table::body_row(disp, row, &weights));
+            body = body.child(sortable_table::body_row(disp, row, &weights));
         }
-        scroll.widget = Box::new(sortable_table::PagedBody::new(rows, weights));
-        scroll.reactive = true;
+        body.widget = Box::new(sortable_table::PagedBody::new(rows, weights));
+        body.reactive = true;
+        let scroll = Element::scroll().fill().child(body);
 
         Element::col()
             .width_match()
@@ -1983,12 +1987,13 @@ impl Element {
             .child(selectall)
             .child(subrow);
 
-        // 正文：响应式（排序变化重排重建），单元格首次布局构建。
-        let mut scroll = Element::scroll().fill();
-        scroll.widget = Box::new(sortable_table::SelectableBody::new(
+        // 正文：滚动容器保留内置 ScrollWidget；SelectableBody 挂在其内部 col 上，首次布局构建行。
+        let mut body = Element::col().width_match();
+        body.widget = Box::new(sortable_table::SelectableBody::new(
             data, weights, selected, sort,
         ));
-        scroll.reactive = true;
+        body.reactive = true;
+        let scroll = Element::scroll().fill().child(body);
 
         Element::col()
             .width_match()
