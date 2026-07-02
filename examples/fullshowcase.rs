@@ -323,76 +323,6 @@ fn main() {
             ),
         ))
         .child(card(
-            "数据表格 table（固定表头 + 滚动 + 斑马纹）",
-            Element::table(
-                vec![("字符", 1.0), ("半角", 1.0), ("全角", 1.0)],
-                vec![
-                    vec!["!", "!", "！"],
-                    vec!["@", "@", "＠"],
-                    vec!["#", "#", "＃"],
-                    vec!["$", "￥", "￥"],
-                ],
-            )
-            .height(160),
-        ))
-        .child(card(
-            "可排序表格 table_sortable（点表头循环 无→升→降；数值列按数值比较）",
-            Element::table_sortable(
-                vec![("名称", 2.0), ("大小(KB)", 1.0), ("修改日期", 1.5)],
-                vec![
-                    vec!["report.pdf", "1280", "2026-05-01"],
-                    vec!["notes.txt", "3", "2026-06-18"],
-                    vec!["photo.png", "845", "2026-04-22"],
-                    vec!["archive.zip", "20480", "2026-06-30"],
-                    vec!["readme.md", "12", "2026-05-15"],
-                ],
-                signal(Some((0usize, SortOrder::Asc))),
-            )
-            .height(200),
-        ))
-        .child(card(
-            "服务端排序 table_sortable_server（前端不排序：点表头→回调重拉当前页）",
-            {
-                // 模拟「后端」全量数据（真实场景在服务器；此处放内存演示解耦流程）。
-                let full: Vec<Vec<String>> = vec![
-                    vec!["report.pdf".into(), "1280".into(), "2026-05-01".into()],
-                    vec!["notes.txt".into(), "3".into(), "2026-06-18".into()],
-                    vec!["photo.png".into(), "845".into(), "2026-04-22".into()],
-                    vec!["archive.zip".into(), "20480".into(), "2026-06-30".into()],
-                    vec!["readme.md".into(), "12".into(), "2026-05-15".into()],
-                ];
-                // 「后端」按排序意图返回当前页（此处演示：全量排序后取全部；真实为 LIMIT/OFFSET）。
-                let backend = move |s: Option<(usize, SortOrder)>| -> Vec<Vec<String>> {
-                    let mut rows = full.clone();
-                    if let Some((col, ord)) = s {
-                        rows.sort_by(|a, b| {
-                            let c = match (a[col].parse::<f64>(), b[col].parse::<f64>()) {
-                                (Ok(x), Ok(y)) => {
-                                    x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
-                                }
-                                _ => a[col].cmp(&b[col]),
-                            };
-                            if matches!(ord, SortOrder::Desc) {
-                                c.reverse()
-                            } else {
-                                c
-                            }
-                        });
-                    }
-                    rows
-                };
-                let sort = signal(Some((1usize, SortOrder::Asc)));
-                let page = signal(backend(sort.get())); // 当前页数据信号
-                Element::table_sortable_server(
-                    vec![("名称", 2.0), ("大小(KB)", 1.0), ("修改日期", 1.5)],
-                    page,
-                    sort,
-                    move |_ctx, new_sort| page.set(backend(new_sort)), // 点表头→重拉
-                )
-                .height(200)
-            },
-        ))
-        .child(card(
             "复选框增强（受控点击拦截 + 危险 / 自定义强调色）",
             Element::col()
                 .width_match()
@@ -662,6 +592,122 @@ fn main() {
         ));
     let images = Element::scroll().fill().child(images_body);
 
+    // 表格页（表格功能较多，集中于独立 tab）。
+    let file_rows = || {
+        vec![
+            vec!["report.pdf", "1280", "2026-05-01"],
+            vec!["notes.txt", "3", "2026-06-18"],
+            vec!["photo.png", "845", "2026-04-22"],
+            vec!["archive.zip", "20480", "2026-06-30"],
+            vec!["readme.md", "12", "2026-05-15"],
+        ]
+    };
+    let file_cols = || vec![("名称", 2.0), ("大小(KB)", 1.0), ("修改日期", 1.5)];
+    // 可排序 + 多选：每行一个选择信号，选中集可被 app 读取。
+    let sel: Vec<Signal<bool>> = (0..file_rows().len()).map(|_| signal(false)).collect();
+    let sel_count = signal(String::from("已选 0 项"));
+    let tables_body = Element::col()
+        .width_match()
+        .spacing(14)
+        .child(card(
+            "数据表格 table（固定表头 + 滚动 + 斑马纹 + 行悬停高亮）",
+            Element::table(
+                vec![("字符", 1.0), ("半角", 1.0), ("全角", 1.0)],
+                vec![
+                    vec!["!", "!", "！"],
+                    vec!["@", "@", "＠"],
+                    vec!["#", "#", "＃"],
+                    vec!["$", "￥", "￥"],
+                ],
+            )
+            .height(160),
+        ))
+        .child(card(
+            "可排序表格 table_sortable（点表头循环 无→升→降；数值列按数值比较）",
+            Element::table_sortable(
+                file_cols(),
+                file_rows(),
+                signal(Some((0usize, SortOrder::Asc))),
+            )
+            .height(200),
+        ))
+        .child(card(
+            "可排序 + 多选 table_selectable（复选框首列 + 全选三态 + 选中行高亮）",
+            Element::col()
+                .width_match()
+                .spacing(8)
+                .child(
+                    Element::table_selectable(
+                        file_cols(),
+                        file_rows(),
+                        sel.clone(),
+                        signal(Some((0usize, SortOrder::Asc))),
+                    )
+                    .height(200),
+                )
+                .child({
+                    // 底部统计：点击"刷新选中数"读取选中集并写入动态标签（演示 app 读取选择）。
+                    let (sel_c, msg) = (sel.clone(), sel_count);
+                    Element::row()
+                        .width_match()
+                        .cross(Align::Center)
+                        .spacing(10)
+                        .child(Element::button("刷新选中数").neutral().outline().on_click(
+                            move |_| {
+                                let n = sel_c.iter().filter(|s| s.get()).count();
+                                msg.set(format!("已选 {n} 项"));
+                            },
+                        ))
+                        .child(
+                            Element::label_rc(sel_count)
+                                .font_size(13.0)
+                                .fg_role(Role::TextMuted)
+                                .height(18)
+                                .weight(1.0),
+                        )
+                }),
+        ))
+        .child(card(
+            "服务端排序 table_sortable_server（前端不排序：点表头→回调重拉当前页）",
+            {
+                // 模拟「后端」全量数据（真实场景在服务器；此处放内存演示解耦流程）。
+                let full: Vec<Vec<String>> = file_rows()
+                    .into_iter()
+                    .map(|r| r.into_iter().map(String::from).collect())
+                    .collect();
+                // 「后端」按排序意图返回当前页（此处演示：全量排序后取全部；真实为 LIMIT/OFFSET）。
+                let backend = move |s: Option<(usize, SortOrder)>| -> Vec<Vec<String>> {
+                    let mut rows = full.clone();
+                    if let Some((col, ord)) = s {
+                        rows.sort_by(|a, b| {
+                            let c = match (a[col].parse::<f64>(), b[col].parse::<f64>()) {
+                                (Ok(x), Ok(y)) => {
+                                    x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+                                }
+                                _ => a[col].cmp(&b[col]),
+                            };
+                            if matches!(ord, SortOrder::Desc) {
+                                c.reverse()
+                            } else {
+                                c
+                            }
+                        });
+                    }
+                    rows
+                };
+                let sort = signal(Some((1usize, SortOrder::Asc)));
+                let page = signal(backend(sort.get())); // 当前页数据信号
+                Element::table_sortable_server(
+                    file_cols(),
+                    page,
+                    sort,
+                    move |_ctx, new_sort| page.set(backend(new_sort)), // 点表头→重拉
+                )
+                .height(200)
+            },
+        ));
+    let tables = Element::scroll().fill().child(tables_body);
+
     let tab = signal(0usize);
     let dot = |hex: u32| ImageContent::from_rgba(16, 16, &solid(16, hex));
     let tabs = Element::tabs_icons(
@@ -669,6 +715,7 @@ fn main() {
         vec![
             ("设置", dot(0x4C8BF5), settings),
             ("控件", dot(0x2EC48B), components),
+            ("表格", dot(0x4C8BF5), tables),
             ("图片", dot(0xF5A623), images),
             ("历史", dot(0x9B59B6), Element::col().fill().child(list)),
             ("关于", dot(0xE5484D), about),

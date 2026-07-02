@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use crate::anim::{Easing, Transition};
 use crate::core::{EventCtx, Widget};
-use crate::event::{Event, PointerKind};
+use crate::event::{Event, Key, PointerKind};
 use crate::geometry::{Color, Rect, Size};
 use crate::render::{Canvas, Paint};
 use crate::signal::Signal;
@@ -494,6 +494,333 @@ impl Widget for PagedBody {
     }
 }
 
+// ==== 行选择（复选框首列 + 全选表头 + 选中行高亮） ====
+
+/// 选择列（复选框）固定宽度 px。
+const SELECT_COL_W: i32 = 40;
+/// 复选框方框边长 px（与 CheckBox 一致，便于自绘全选框视觉统一）。
+const SEL_BOX: i32 = 18;
+/// 选中行高亮叠层不透明度（accent 低 alpha；叠在斑马纹之上、悬停层之下）。
+const ROW_SELECTED_A: f32 = 0.12;
+
+/// 首列复选框单元格：固定宽，内含绑定该行选择信号的复选框（水平居中 + 垂直居中）。
+fn select_cell(row_sel: Signal<bool>) -> Element {
+    let pad = (SELECT_COL_W - SEL_BOX) / 2;
+    Element::row()
+        .width(SELECT_COL_W)
+        .cross(Align::Center)
+        .padding_xy(pad, 0)
+        .child(Element::checkbox("", row_sel).width(SEL_BOX))
+}
+
+/// 构建一行可选正文：[复选框列] + 数据列；行挂 [`SelectableRow`]（悬停 + 选中高亮）。
+/// `row_sel` 为该行（原始行身份）的选择信号：复选框直接绑定，行高亮读取它。
+pub(super) fn select_body_row(
+    disp: usize,
+    cells: &[String],
+    weights: &[f32],
+    row_sel: Signal<bool>,
+) -> Element {
+    let mut tr = Element::row().width_match().cross(Align::Stretch);
+    if disp % 2 == 1 {
+        tr = tr.bg_role(Role::SurfaceAlt);
+    }
+    tr = tr.child(select_cell(row_sel));
+    for (ci, cell) in cells.iter().enumerate() {
+        let w = weights.get(ci).copied().unwrap_or(1.0);
+        tr = tr
+            .child(Element::table_cell_pad(Element::label(cell.clone()).font_size(13.0)).weight(w));
+    }
+    tr.widget = Box::new(SelectableRow::new(row_sel));
+    Element::col()
+        .width_match()
+        .child(tr)
+        .child(Element::divider())
+}
+
+/// 可选正文行：在 [`HoverRow`] 基础上叠加"选中"高亮（accent 低 alpha 底，读取行选择信号）。
+/// 选中底为瞬时（跟随信号），悬停层为淡入淡出，叠在其上。
+pub(super) struct SelectableRow {
+    sel: Signal<bool>,
+    hover: bool,
+    overlay: Cell<Transition<f32>>,
+    primed: Cell<bool>,
+}
+
+impl SelectableRow {
+    pub(super) fn new(sel: Signal<bool>) -> Self {
+        Self {
+            sel,
+            hover: false,
+            overlay: Cell::new(Transition::new(0.0)),
+            primed: Cell::new(false),
+        }
+    }
+}
+
+impl Widget for SelectableRow {
+    fn paint(
+        &self,
+        bounds: Rect,
+        _content: Rect,
+        _focused: bool,
+        enabled: bool,
+        canvas: &mut dyn Canvas,
+        style: &Style,
+    ) {
+        let th = crate::theme::current();
+        // 选中底（accent 低 alpha，瞬时跟随信号）。
+        if enabled && self.sel.get() {
+            canvas.fill_round_rect(
+                bounds.x as f32,
+                bounds.y as f32,
+                bounds.w as f32,
+                bounds.h as f32,
+                style.corner_radius,
+                &Paint::fill(th.palette.accent.scale_alpha(ROW_SELECTED_A)),
+            );
+        }
+        // 悬停层（text 低 alpha，淡入淡出，叠在选中底之上）。
+        let target = if enabled && self.hover {
+            ROW_HOVER_A
+        } else {
+            0.0
+        };
+        let mut ov = self.overlay.get();
+        if !self.primed.get() {
+            ov = Transition::new(target);
+            self.primed.set(true);
+        } else if ov.target() != target {
+            ov.retarget(target, th.anim.fast(), Easing::EaseOut);
+        }
+        let a = ov.animate();
+        self.overlay.set(ov);
+        if a > 0.001 {
+            canvas.fill_round_rect(
+                bounds.x as f32,
+                bounds.y as f32,
+                bounds.w as f32,
+                bounds.h as f32,
+                style.corner_radius,
+                &Paint::fill(th.palette.text.scale_alpha(a)),
+            );
+        }
+    }
+    fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
+        if let Event::Pointer(p) = ev {
+            match p.kind {
+                PointerKind::Enter => {
+                    if !self.hover {
+                        self.hover = true;
+                        ctx.mark_dirty();
+                    }
+                    true
+                }
+                PointerKind::Leave => {
+                    if self.hover {
+                        self.hover = false;
+                        ctx.mark_dirty();
+                    }
+                    true
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+    fn reset_interaction(&mut self) {
+        self.hover = false;
+        self.primed.set(false);
+    }
+}
+
+/// 全选表头单元格 widget：自绘三态复选框（全选 ✓ / 部分选 − / 未选 空），点击切换全选/清空。
+/// 直接读写各行选择信号（单一数据源），故手动勾选行时表头聚合态实时刷新。
+pub(super) struct SelectAllCheck {
+    sel: Vec<Signal<bool>>,
+}
+
+impl SelectAllCheck {
+    pub(super) fn new(sel: Vec<Signal<bool>>) -> Self {
+        Self { sel }
+    }
+    /// 是否全选（非空且每行皆选）。
+    fn all(&self) -> bool {
+        !self.sel.is_empty() && self.sel.iter().all(|s| s.get())
+    }
+    /// 切换：全选→清空；否则→全选。
+    fn toggle_all(&self, ctx: &mut EventCtx) {
+        let target = !self.all();
+        for s in &self.sel {
+            s.set(target);
+        }
+        ctx.mark_dirty_all(); // 影响所有行，升整窗
+    }
+}
+
+impl Widget for SelectAllCheck {
+    fn paint(
+        &self,
+        bounds: Rect,
+        _content: Rect,
+        _focused: bool,
+        enabled: bool,
+        canvas: &mut dyn Canvas,
+        _style: &Style,
+    ) {
+        let th = crate::theme::current();
+        let (p, tg) = (&th.palette, &th.toggle);
+        let n = self.sel.iter().filter(|s| s.get()).count();
+        let all = n > 0 && n == self.sel.len();
+        let some = n > 0 && !all;
+        let box_x = bounds.x as f32 + ((SELECT_COL_W - SEL_BOX) / 2) as f32;
+        let box_y = bounds.y as f32 + ((bounds.h - SEL_BOX) / 2) as f32;
+        let sz = SEL_BOX as f32;
+        let radius = 4.0;
+        let accent = if enabled { tg.accent(p) } else { p.track };
+        let filled = all || some;
+        canvas.fill_round_rect(
+            box_x,
+            box_y,
+            sz,
+            sz,
+            radius,
+            &Paint::fill(if filled { accent } else { tg.knob(p) }),
+        );
+        if !filled {
+            canvas.stroke_round_rect(box_x, box_y, sz, sz, radius, 1.5, &Paint::fill(tg.track(p)));
+        }
+        let mark = Paint::fill(p.on_accent);
+        let s = sz / 18.0; // 18px 基准（与 CheckBox 对勾坐标一致）
+        if all {
+            canvas.draw_line(
+                box_x + 4.0 * s,
+                box_y + 9.0 * s,
+                box_x + 8.0 * s,
+                box_y + 13.0 * s,
+                2.0,
+                &mark,
+            );
+            canvas.draw_line(
+                box_x + 8.0 * s,
+                box_y + 13.0 * s,
+                box_x + 14.0 * s,
+                box_y + 5.0 * s,
+                2.0,
+                &mark,
+            );
+        } else if some {
+            // 部分选中：横杠（indeterminate）。
+            canvas.draw_line(
+                box_x + 4.5 * s,
+                box_y + 9.0 * s,
+                box_x + 13.5 * s,
+                box_y + 9.0 * s,
+                2.0,
+                &mark,
+            );
+        }
+    }
+    fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
+        match ev {
+            Event::Pointer(p) if p.kind == PointerKind::Up => {
+                if ctx.bounds().contains(p.pos) {
+                    self.toggle_all(ctx);
+                }
+                true
+            }
+            Event::Pointer(p) if p.kind == PointerKind::Down => {
+                ctx.request_focus();
+                true
+            }
+            Event::Key(k) if k.pressed && (k.key == Key::Space || k.key == Key::Enter) => {
+                self.toggle_all(ctx);
+                true
+            }
+            _ => false,
+        }
+    }
+    fn focusable(&self) -> bool {
+        true
+    }
+}
+
+/// 可选表格正文：响应式（排序变化重排重建），每行含首列复选框 + 数据列，绑定按原始行身份。
+/// 选择变化不触发本重建（复选框自更新、行高亮经信号重绘），仅排序变化重排。
+pub(super) struct SelectableBody {
+    rows: Vec<Vec<String>>,
+    weights: Vec<f32>,
+    sel: Vec<Signal<bool>>,
+    sort: SortState,
+    built: bool,
+    last_version: u64,
+}
+
+impl SelectableBody {
+    pub(super) fn new(
+        rows: Vec<Vec<String>>,
+        weights: Vec<f32>,
+        sel: Vec<Signal<bool>>,
+        sort: SortState,
+    ) -> Self {
+        Self {
+            last_version: sort.version(),
+            rows,
+            weights,
+            sel,
+            sort,
+            built: false,
+        }
+    }
+}
+
+impl Widget for SelectableBody {
+    fn on_update(&mut self, ctx: &mut EventCtx) {
+        let ver = self.sort.version();
+        if self.built && ver == self.last_version {
+            return;
+        }
+        self.built = true;
+        self.last_version = ver;
+        let self_id = ctx.id();
+        let tree = ctx.tree_mut();
+        clear_children(tree, self_id);
+        let order = sorted_order(&self.rows, self.sort.get());
+        for (disp, &ri) in order.iter().enumerate() {
+            // 选择按原始行下标 ri 绑定（排序后仍按身份跟随）。越界回退（长度不匹配时容错）。
+            let Some(&row_sel) = self.sel.get(ri) else {
+                continue;
+            };
+            let el = select_body_row(disp, &self.rows[ri], &self.weights, row_sel);
+            let id = el.build(tree);
+            tree.add_child(self_id, id);
+        }
+    }
+
+    fn measure(&self, _avail: Size, _style: &Style, _text: &mut dyn TextEngine) -> Size {
+        Size::ZERO
+    }
+    fn paint(
+        &self,
+        _bounds: Rect,
+        _content: Rect,
+        _focused: bool,
+        _enabled: bool,
+        _canvas: &mut dyn Canvas,
+        _style: &Style,
+    ) {
+    }
+    fn on_event(&mut self, _ctx: &mut EventCtx, _ev: &Event) -> bool {
+        false
+    }
+}
+
+/// 选择列宽度（供构造器对齐表头全选列与正文复选框列）。
+pub(super) const fn select_col_w() -> i32 {
+    SELECT_COL_W
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -676,6 +1003,73 @@ mod tests {
         .width(400)
         .height(300);
         let _tree = layout(el); // 触发首次 on_update：用覆盖样式构建表头单元格
+    }
+
+    #[test]
+    fn clicking_row_checkbox_toggles_that_rows_selection() {
+        let sort = signal(None);
+        let sel: Vec<Signal<bool>> = (0..2).map(|_| signal(false)).collect();
+        let mut tree = layout(
+            Element::table_selectable(
+                vec![("名称", 2.0), ("大小", 1.0)],
+                vec![vec!["a", "2"], vec!["b", "1"]],
+                sel.clone(),
+                sort,
+            )
+            .width(400)
+            .height(300),
+        );
+        assert!(!sel[0].get());
+        // 首列复选框（x∈[0,40]，首行在表头/分隔线之下约 y≈58）。
+        click(&mut tree, Point::new(20, 58));
+        assert!(sel[0].get(), "点击首行复选框应选中原始行 0");
+        assert!(!sel[1].get(), "不应影响其它行");
+    }
+
+    #[test]
+    fn select_all_selects_then_clears() {
+        let sort = signal(None);
+        let sel: Vec<Signal<bool>> = (0..3).map(|_| signal(false)).collect();
+        let mut tree = layout(
+            Element::table_selectable(
+                vec![("名称", 1.0)],
+                vec![vec!["a"], vec!["b"], vec!["c"]],
+                sel.clone(),
+                sort,
+            )
+            .width(400)
+            .height(300),
+        );
+        // 全选框在表头首列（x∈[0,40]，y≈19）。
+        click(&mut tree, Point::new(20, 19));
+        assert!(sel.iter().all(|s| s.get()), "点全选应选中所有行");
+        click(&mut tree, Point::new(20, 19));
+        assert!(sel.iter().all(|s| !s.get()), "再点全选应清空");
+    }
+
+    #[test]
+    fn selection_tracks_original_row_across_sort() {
+        // 选择按原始行身份绑定：选中某行后排序重排，该行仍选中（不随显示位置漂移）。
+        let sort = signal(None);
+        let sel: Vec<Signal<bool>> = (0..3).map(|_| signal(false)).collect();
+        let mut tree = layout(
+            Element::table_selectable(
+                vec![("v", 1.0)],
+                vec![vec!["3"], vec!["1"], vec!["2"]], // 原始行 0/1/2 值 3/1/2
+                sel.clone(),
+                sort,
+            )
+            .width(400)
+            .height(300),
+        );
+        sel[0].set(true); // 选中原始行 0（值 3）
+        sort.set(Some((0, SortOrder::Asc))); // 升序：显示序 1,2,3 → 行0 落到末尾
+        tree.layout_root(Size::new(400, 300), &mut crate::text::NullTextEngine);
+        assert!(
+            sel[0].get(),
+            "排序后原始行 0 仍选中（选择按身份跟随，不随位置）"
+        );
+        assert!(!sel[1].get() && !sel[2].get());
     }
 
     #[test]

@@ -1939,6 +1939,64 @@ impl Element {
             .child(scroll.weight(1.0))
     }
 
+    /// 可排序 + 可多选表格：首列复选框 + 表头全选（全/无/部分三态）+ 选中行高亮，
+    /// 同时保留点表头排序。选择按**原始行身份**跟随（`selected[原始行下标]`），排序重排后仍正确。
+    ///
+    /// - `columns` 为 (列标题, 权重)；`rows` 为每行单元格文本。
+    /// - `selected` 为每行一个 `Signal<bool>`（长度须等于 `rows`，按原始行下标索引）；
+    ///   复选框直接绑定，勾选状态即读写这些信号，app 可随时读取选中集。
+    /// - `sort` 同 [`table_sortable`](Self::table_sortable)：点数据列表头循环切换排序。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let rows = vec![vec!["a", "2"], vec!["b", "1"]];
+    /// let selected: Vec<Signal<bool>> = (0..rows.len()).map(|_| signal(false)).collect();
+    /// let sort = signal(None);
+    /// Element::table_selectable(vec![("名称", 2.0), ("大小", 1.0)], rows, selected, sort).height(240)
+    /// ```
+    pub fn table_selectable(
+        columns: Vec<(impl Into<String>, f32)>,
+        rows: Vec<Vec<impl Into<String>>>,
+        selected: Vec<Signal<bool>>,
+        sort: Signal<Option<(usize, SortOrder)>>,
+    ) -> Self {
+        let cols: Vec<(String, f32)> = columns.into_iter().map(|(t, w)| (t.into(), w)).collect();
+        let data: Vec<Vec<String>> = rows
+            .into_iter()
+            .map(|r| r.into_iter().map(Into::into).collect())
+            .collect();
+        let weights: Vec<f32> = cols.iter().map(|c| c.1).collect();
+        let scw = sortable_table::select_col_w();
+
+        // 表头：[全选列] + [可排序数据列子行]，与正文的 [复选框列] + [数据列] 逐列对齐
+        // （子行 weight=1 占 W-scw，其内数据列按 weights 分；正文数据列在固定 scw 后同样按 weights 分）。
+        let selectall = Element::label("")
+            .width(scw)
+            .widget(sortable_table::SelectAllCheck::new(selected.clone()));
+        let mut subrow = Element::row().weight(1.0).cross(Align::Stretch);
+        subrow.widget = Box::new(sortable_table::SortableHeader::new(cols, sort, None));
+        subrow.reactive = true;
+        let header = Element::row()
+            .width_match()
+            .cross(Align::Stretch)
+            .bg_role(Role::SurfaceAlt)
+            .child(selectall)
+            .child(subrow);
+
+        // 正文：响应式（排序变化重排重建），单元格首次布局构建。
+        let mut scroll = Element::scroll().fill();
+        scroll.widget = Box::new(sortable_table::SelectableBody::new(
+            data, weights, selected, sort,
+        ));
+        scroll.reactive = true;
+
+        Element::col()
+            .width_match()
+            .child(header)
+            .child(Element::divider())
+            .child(scroll.weight(1.0))
+    }
+
     /// 覆盖排序表格的排序指示器样式（字形/字号/颜色/槽宽/间距/位置）。仅对
     /// [`table_sortable`](Self::table_sortable) / [`table_sortable_server`](Self::table_sortable_server)
     /// 返回的元素有效——它会定位表头行并设置每实例覆盖（未设字段回退主题 `TableTheme`）。
