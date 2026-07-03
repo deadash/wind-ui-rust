@@ -372,6 +372,16 @@ fn main() {
                 })),
         ))
         .child(card(
+            "开关尺寸（Normal 44×24 vs Small 36×20）",
+            Element::col()
+                .width_match()
+                .spacing(8)
+                .child(row("默认", Element::switch(signal(true))))
+                .child(row("小尺寸", Element::switch(signal(true)).small()))
+                .child(row("小+关态", Element::switch(signal(false)).small()))
+                .child(row("小+禁用", Element::switch(signal(true)).small().disabled(true))),
+        ))
+        .child(card(
             "分段控制器（连体多段单选，点击/方向键切换）",
             Element::col()
                 .width_match()

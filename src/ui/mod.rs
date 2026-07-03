@@ -34,7 +34,7 @@ use crate::text::TextEngine;
 use crate::theme::{Intent, IntentColors};
 
 pub use image::{ImageContent, ImageView};
-pub use inputs::{CheckBox, CheckBoxSize, RadioButton, Slider, Switch, TextInput};
+pub use inputs::{CheckBox, CheckBoxSize, RadioButton, Slider, Switch, SwitchSize, TextInput};
 pub use link::Link;
 pub use list::ListRow;
 pub use nav::{AccordionHeader, CollapsibleHeader, ExpandState, NavRow};
@@ -1115,11 +1115,15 @@ impl Element {
         self.config_button(|b| b.set_icon(icon), "icon()/icon_bytes()")
     }
 
-    /// 小号变体（Button：紧凑内边距；CheckBox：14px 方框）。
+    /// 小号变体（Button：紧凑内边距；CheckBox：14px 方框；Switch：36×20 轨道）。
     pub fn small(mut self) -> Self {
         if let Some(a) = self.widget.as_any_mut() {
             if let Some(c) = a.downcast_mut::<CheckBox>() {
                 c.set_size(CheckBoxSize::Small);
+                return self;
+            }
+            if let Some(s) = a.downcast_mut::<Switch>() {
+                s.set_size(SwitchSize::Small);
                 return self;
             }
         }

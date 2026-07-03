@@ -226,10 +226,36 @@ impl Widget for CheckBox {
 
 // ---------------- Switch ----------------
 
+// 轨道尺寸基准（宽 × 高）；knob 上下各内缩 SWITCH_PAD，直径 = h - 2*PAD。
+const SWITCH_W: i32 = 44;
+const SWITCH_H: i32 = 24;
+const SWITCH_W_SMALL: i32 = 36;
+const SWITCH_H_SMALL: i32 = 20;
+const SWITCH_PAD: f32 = 3.0;
+
+/// Switch 尺寸变体。
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum SwitchSize {
+    #[default]
+    Normal,
+    Small,
+}
+
+impl SwitchSize {
+    /// 该尺寸的轨道宽高（像素）。
+    fn dims(self) -> (i32, i32) {
+        match self {
+            SwitchSize::Normal => (SWITCH_W, SWITCH_H),
+            SwitchSize::Small => (SWITCH_W_SMALL, SWITCH_H_SMALL),
+        }
+    }
+}
+
 pub struct Switch {
     state: Signal<bool>,
     /// 滑块位置补间（0=关、1=开）；同时驱动轨道色 off↔on 渐变。retarget-in-paint。
     pos: Cell<Transition<f32>>,
+    size: SwitchSize,
 }
 
 impl Switch {
@@ -238,7 +264,12 @@ impl Switch {
         Self {
             state,
             pos: Cell::new(Transition::new(init)),
+            size: SwitchSize::Normal,
         }
+    }
+    /// 设置尺寸变体（供 Builder 的 `.small()` 调用）。
+    pub fn set_size(&mut self, size: SwitchSize) {
+        self.size = size;
     }
     fn toggle(&self, ctx: &mut EventCtx) {
         self.state.set(!self.state.get());
@@ -248,7 +279,8 @@ impl Switch {
 
 impl Widget for Switch {
     fn measure(&self, _avail: Size, _style: &Style, _text: &mut dyn TextEngine) -> Size {
-        Size::new(44, 24)
+        let (w, h) = self.size.dims();
+        Size::new(w, h)
     }
     fn paint(
         &self,
@@ -259,8 +291,9 @@ impl Widget for Switch {
         canvas: &mut dyn Canvas,
         _style: &Style,
     ) {
-        let h = 24.min(bounds.h);
-        let w = 44.min(bounds.w);
+        let (bw, bh) = self.size.dims();
+        let h = bh.min(bounds.h);
+        let w = bw.min(bounds.w);
         let x = bounds.x as f32;
         let y = (bounds.y + (bounds.h - h) / 2) as f32;
         let on = self.state.get();
@@ -288,8 +321,8 @@ impl Widget for Switch {
             h as f32 / 2.0,
             &Paint::fill(track),
         );
-        let r = (h - 6) as f32 / 2.0;
-        let (off_cx, on_cx) = (x + 3.0 + r, x + w as f32 - 3.0 - r);
+        let r = (h as f32 - 2.0 * SWITCH_PAD) / 2.0;
+        let (off_cx, on_cx) = (x + SWITCH_PAD + r, x + w as f32 - SWITCH_PAD - r);
         let knob_cx = off_cx.lerp(on_cx, amount);
         canvas.fill_circle(knob_cx, y + h as f32 / 2.0, r, &Paint::fill(tg.knob(p)));
     }
@@ -314,6 +347,9 @@ impl Widget for Switch {
     }
     fn focusable(&self) -> bool {
         true
+    }
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
     }
 }
 
