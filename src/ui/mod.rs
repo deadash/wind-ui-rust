@@ -464,10 +464,14 @@ pub struct Button {
 }
 
 /// 按钮填充变体：实心或描边（透明底 + 意图色边框/文字）。
+/// `OutlineSoft`：柔和描边——静默态中性灰边（`palette.border`，与 dropdown/输入框
+/// 的 field 边框同源）+ 意图色文字；hover/press 边框转意图主色（同 field 控件的
+/// hover 反馈）。适合成排次级按钮（全蓝描边过于喧闹时）。
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum ButtonVariant {
     Solid,
     Outline,
+    OutlineSoft,
 }
 
 impl Button {
@@ -545,7 +549,10 @@ impl Widget for Button {
         let vstate = self.visual_state(enabled);
         // intent 解析：Primary 走 ButtonTheme（保持全局换肤 + style.bg 单点覆盖），其余由 palette 派生。
         let is_primary = matches!(self.intent, Intent::Primary);
-        let is_outline = self.variant == ButtonVariant::Outline;
+        let is_outline = matches!(
+            self.variant,
+            ButtonVariant::Outline | ButtonVariant::OutlineSoft
+        );
         let ic = if is_primary {
             IntentColors {
                 bg: bt.bg(pal),
@@ -629,9 +636,19 @@ impl Widget for Button {
             &Paint::fill(color),
         );
         // Outline：描边（意图主色；禁用用置灰边）。绘于填充之上、内容之下。
+        // OutlineSoft：静默态中性灰边（track，比卡片 border 深一档、清晰可辨），
+        // hover/press 转意图主色反馈；禁用边降为 border（最浅）——保证「正常态边框
+        // 深于禁用态」的层级不反转（text_disabled 比 border/track 深，不能作禁用边）。
         if is_outline {
+            let is_soft = self.variant == ButtonVariant::OutlineSoft;
             let border = if vstate == VisualState::Disabled {
-                pal.text_disabled
+                if is_soft {
+                    pal.border
+                } else {
+                    pal.text_disabled
+                }
+            } else if is_soft && self.state == BtnState::Normal {
+                pal.track
             } else {
                 outline_col
             };
@@ -1134,6 +1151,16 @@ impl Element {
     /// 组合可得不同语义的描边按钮（如蓝色"检查更新"、红色"删除"次按钮）。仅 `Element::button(..)` 可用。
     pub fn outline(self) -> Self {
         self.config_button(|b| b.set_variant(ButtonVariant::Outline), "outline()")
+    }
+
+    /// 柔和描边按钮（中性灰边 + 意图色文字；hover 边框转意图主色）。
+    /// 参考「灰边框、主色文字」的次级按钮惯例，成排放置比全意图色描边安静。
+    /// 与 `.neutral()/.danger()/.accent()` 组合同 [`outline`](Self::outline)。
+    pub fn outline_soft(self) -> Self {
+        self.config_button(
+            |b| b.set_variant(ButtonVariant::OutlineSoft),
+            "outline_soft()",
+        )
     }
 
     /// 启用标志（绑定 `Signal<bool>`，运行期可切换）。**适用于任意控件/容器**：
