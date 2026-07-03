@@ -323,15 +323,29 @@ impl Tree {
     }
 
     /// 在 layout 前向所有响应式节点广播 on_update；同时剔除已被删除的节点。
+    ///
+    /// on_update 中动态重建的子树可能注册**新的**响应式节点（`register_reactive` 追加到
+    /// 列表尾，如响应式重建宿主里挂的响应式表头/正文）——按批次迭代到收敛，令新节点在
+    /// **同一帧**收到回调（否则首帧空白）。清理阶段基于真实列表 retain（而非广播快照的
+    /// 存活集覆盖——那会把广播期间新注册的节点抹掉，使其永远收不到回调）。
     fn dispatch_reactive_updates(&mut self) {
-        let nodes: Vec<NodeId> = self.reactive_nodes.clone();
-        let mut live = Vec::with_capacity(nodes.len());
-        for id in nodes {
-            if self.get(id).is_some() {
-                self.call_on_update(id);
-                live.push(id);
+        let mut start = 0;
+        // 轮数上限防病态相互触发；正常场景一两轮即收敛。
+        for _ in 0..16 {
+            let end = self.reactive_nodes.len();
+            if start >= end {
+                break;
+            }
+            let batch: Vec<NodeId> = self.reactive_nodes[start..end].to_vec();
+            start = end;
+            for id in batch {
+                if self.get(id).is_some() {
+                    self.call_on_update(id);
+                }
             }
         }
+        let mut live = std::mem::take(&mut self.reactive_nodes);
+        live.retain(|&id| self.get(id).is_some());
         self.reactive_nodes = live;
     }
 

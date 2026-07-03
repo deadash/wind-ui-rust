@@ -104,6 +104,12 @@ fn resolve_sort_style(ov: &SortStyle) -> ResolvedSort {
 /// 由应用据此重新拉取"当前页 + 该排序"的数据并写回正文数据信号。多个表头单元格共享。
 pub(super) type OnSort = Rc<RefCell<dyn FnMut(&mut EventCtx, Option<(usize, SortOrder)>)>>;
 
+/// 自定义单元格渲染：`(行下标, 列下标, 单元格文本) -> Option<Element>`。
+/// 返回 `Some` 时该格用自定义控件（徽章/彩色标签等），`None` 回退默认文本渲染。
+/// 排序仍基于单元格文本（渲染与排序键解耦）。行下标语义与操作列一致：
+/// 客户端表格为原始行下标，服务端表格为页内显示下标。
+pub(super) type CellRender = Rc<dyn Fn(usize, usize, &str) -> Option<Element>>;
+
 /// 单元格值比较：两侧都能解析为数值时按数值比，否则按字符串（区分大小写）。
 fn cmp_cells(a: &str, b: &str) -> Ordering {
     match (a.trim().parse::<f64>(), b.trim().parse::<f64>()) {
@@ -315,15 +321,26 @@ fn action_header_cell(title: &str, weight: f32) -> Element {
         )
 }
 
-/// 构建一行正文：`disp` 为显示位置（决定斑马纹），`orig` 为该行下标（传给操作列生成器），
+/// 构建一个数据单元格：有自定义渲染且返回 `Some` 时用自定义控件（垂直居中、不强制行高，
+/// 同操作单元格），否则默认文本渲染（统一内边距 + 20px 行高）。
+fn data_cell(orig: usize, ci: usize, cell: &str, w: f32, render: Option<&CellRender>) -> Element {
+    match render.and_then(|r| r(orig, ci, cell)) {
+        Some(custom) => action_cell(custom, w),
+        None => Element::table_cell_pad(Element::label(cell.to_string()).font_size(13.0)).weight(w),
+    }
+}
+
+/// 构建一行正文：`disp` 为显示位置（决定斑马纹），`orig` 为该行下标（传给操作列/单元格生成器），
 /// `cells` 为该行各列文本。结构与 `table_custom` 一致：`col[ row(单元格…), divider ]`。
-/// 行挂 `HoverRow` widget，悬停时整行轻微高亮。`actions` 为 `Some` 时在末尾追加操作单元格。
+/// 行挂 `HoverRow` widget，悬停时整行轻微高亮。`actions` 为 `Some` 时在末尾追加操作单元格；
+/// `render` 为 `Some` 时逐格询问自定义渲染（`None` 回退默认文本）。
 pub(super) fn body_row(
     disp: usize,
     orig: usize,
     cells: &[String],
     weights: &[f32],
     actions: Option<&ActionCol>,
+    render: Option<&CellRender>,
 ) -> Element {
     let mut tr = Element::row().width_match().cross(Align::Stretch);
     // 斑马纹随显示位置交替（而非原始行号），排序后视觉仍规整。
@@ -332,8 +349,7 @@ pub(super) fn body_row(
     }
     for (ci, cell) in cells.iter().enumerate() {
         let w = weights.get(ci).copied().unwrap_or(1.0);
-        tr = tr
-            .child(Element::table_cell_pad(Element::label(cell.clone()).font_size(13.0)).weight(w));
+        tr = tr.child(data_cell(orig, ci, cell, w, render));
     }
     if let Some(a) = actions {
         tr = tr.child(action_cell((a.build)(orig), a.weight));
@@ -459,7 +475,9 @@ pub(super) struct SortableBody {
     sort: SortState,
     /// 尾部操作列（由 `Element::actions` 设置）。
     actions: Option<ActionCol>,
-    /// 强制下次 on_update 重建（`set_actions` 置位——初始 eager 行不含操作列，需重建一次）。
+    /// 自定义单元格渲染（由 `Element::cell_render` 设置）。
+    render: Option<CellRender>,
+    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render` 置位——初始 eager 行不含它们，需重建一次）。
     force: bool,
     last_version: u64,
 }
@@ -472,6 +490,7 @@ impl SortableBody {
             weights,
             sort,
             actions: None,
+            render: None,
             force: false,
         }
     }
@@ -479,6 +498,12 @@ impl SortableBody {
     /// 设置尾部操作列；置 `force` 令首次 on_update 重建（把操作列纳入，替换初始纯文本行）。
     pub(super) fn set_actions(&mut self, actions: ActionCol) {
         self.actions = Some(actions);
+        self.force = true;
+    }
+
+    /// 设置自定义单元格渲染；置 `force` 令首次 on_update 重建（把自定义格纳入）。
+    pub(super) fn set_cell_render(&mut self, render: CellRender) {
+        self.render = Some(render);
         self.force = true;
     }
 }
@@ -502,6 +527,7 @@ impl Widget for SortableBody {
                 &self.rows[ri],
                 &self.weights,
                 self.actions.as_ref(),
+                self.render.as_ref(),
             );
             let id = el.build(tree);
             tree.add_child(self_id, id);
@@ -536,7 +562,9 @@ pub(super) struct PagedBody {
     weights: Vec<f32>,
     /// 尾部操作列（由 `Element::actions` 设置）。生成器收到当前页内显示下标。
     actions: Option<ActionCol>,
-    /// 强制下次 on_update 重建（`set_actions` 置位）。
+    /// 自定义单元格渲染（由 `Element::cell_render` 设置）。生成器收到当前页内显示下标。
+    render: Option<CellRender>,
+    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render` 置位）。
     force: bool,
     last_version: u64,
 }
@@ -548,6 +576,7 @@ impl PagedBody {
             rows,
             weights,
             actions: None,
+            render: None,
             force: false,
         }
     }
@@ -555,6 +584,12 @@ impl PagedBody {
     /// 设置尾部操作列；置 `force` 令首次 on_update 重建（把操作列纳入）。
     pub(super) fn set_actions(&mut self, actions: ActionCol) {
         self.actions = Some(actions);
+        self.force = true;
+    }
+
+    /// 设置自定义单元格渲染；置 `force` 令首次 on_update 重建。
+    pub(super) fn set_cell_render(&mut self, render: CellRender) {
+        self.render = Some(render);
         self.force = true;
     }
 }
@@ -572,7 +607,14 @@ impl Widget for PagedBody {
         clear_children(tree, self_id);
         let data = self.rows.get();
         for (disp, row) in data.iter().enumerate() {
-            let el = body_row(disp, disp, row, &self.weights, self.actions.as_ref());
+            let el = body_row(
+                disp,
+                disp,
+                row,
+                &self.weights,
+                self.actions.as_ref(),
+                self.render.as_ref(),
+            );
             let id = el.build(tree);
             tree.add_child(self_id, id);
         }
@@ -627,6 +669,7 @@ pub(super) fn select_body_row(
     weights: &[f32],
     row_sel: Signal<bool>,
     actions: Option<&ActionCol>,
+    render: Option<&CellRender>,
 ) -> Element {
     let mut tr = Element::row().width_match().cross(Align::Stretch);
     if disp % 2 == 1 {
@@ -635,8 +678,7 @@ pub(super) fn select_body_row(
     tr = tr.child(select_cell(row_sel));
     for (ci, cell) in cells.iter().enumerate() {
         let w = weights.get(ci).copied().unwrap_or(1.0);
-        tr = tr
-            .child(Element::table_cell_pad(Element::label(cell.clone()).font_size(13.0)).weight(w));
+        tr = tr.child(data_cell(orig, ci, cell, w, render));
     }
     if let Some(a) = actions {
         tr = tr.child(action_cell((a.build)(orig), a.weight));
@@ -865,6 +907,8 @@ pub(super) struct SelectableBody {
     sort: SortState,
     /// 尾部操作列（由 `Element::actions` 设置）。生成器收到原始行下标（与选择同身份）。
     actions: Option<ActionCol>,
+    /// 自定义单元格渲染（由 `Element::cell_render` 设置）。生成器收到原始行下标。
+    render: Option<CellRender>,
     built: bool,
     last_version: u64,
 }
@@ -883,6 +927,7 @@ impl SelectableBody {
             sel,
             sort,
             actions: None,
+            render: None,
             built: false,
         }
     }
@@ -890,6 +935,12 @@ impl SelectableBody {
     /// 设置尾部操作列；置 `built=false` 令首次 on_update 把操作列纳入。
     pub(super) fn set_actions(&mut self, actions: ActionCol) {
         self.actions = Some(actions);
+        self.built = false;
+    }
+
+    /// 设置自定义单元格渲染；置 `built=false` 令首次 on_update 把自定义格纳入。
+    pub(super) fn set_cell_render(&mut self, render: CellRender) {
+        self.render = Some(render);
         self.built = false;
     }
 }
@@ -918,6 +969,7 @@ impl Widget for SelectableBody {
                 &self.weights,
                 row_sel,
                 self.actions.as_ref(),
+                self.render.as_ref(),
             );
             let id = el.build(tree);
             tree.add_child(self_id, id);
@@ -989,6 +1041,26 @@ pub(super) fn set_body_actions(el: &mut Element, ac: &ActionCol) -> bool {
     }
     if let Some(b) = a.downcast_mut::<SelectableBody>() {
         b.set_actions(ac.clone());
+        return true;
+    }
+    false
+}
+
+/// 若 `el` 挂的是任一响应式正文（Sortable/Paged/Selectable）则设入自定义单元格渲染并返回 true。
+pub(super) fn set_body_cell_render(el: &mut Element, render: &CellRender) -> bool {
+    let Some(a) = el.widget.as_any_mut() else {
+        return false;
+    };
+    if let Some(b) = a.downcast_mut::<SortableBody>() {
+        b.set_cell_render(render.clone());
+        return true;
+    }
+    if let Some(b) = a.downcast_mut::<PagedBody>() {
+        b.set_cell_render(render.clone());
+        return true;
+    }
+    if let Some(b) = a.downcast_mut::<SelectableBody>() {
+        b.set_cell_render(render.clone());
         return true;
     }
     false
@@ -1439,6 +1511,83 @@ mod tests {
             Some(1),
             "点首个显示行的操作按钮应回报其原始行下标 1"
         );
+    }
+
+    #[test]
+    fn cell_render_customizes_cells_and_reports_original_row() {
+        use std::cell::RefCell as StdRefCell;
+        // 升序显示 1,2,3 → 显示序 = 原始行 1,2,0；renderer 应按原始行下标逐格询问。
+        let sort = signal(Some((0usize, SortOrder::Asc)));
+        let seen: Rc<StdRefCell<Vec<(usize, usize, String)>>> =
+            Rc::new(StdRefCell::new(Vec::new()));
+        let seen_c = seen.clone();
+        let tree = layout(
+            Element::table_sortable(
+                vec![("v", 1.0), ("w", 1.0)],
+                vec![vec!["3", "x"], vec!["1", "y"], vec!["2", "z"]],
+                sort,
+            )
+            .cell_render(move |row, col, text| {
+                seen_c.borrow_mut().push((row, col, text.to_string()));
+                // 首列自定义（定宽标记控件），次列回退默认文本。
+                (col == 0).then(|| Element::row().width(77).height(24))
+            })
+            .width(400)
+            .height(300),
+        );
+        let calls = seen.borrow();
+        assert_eq!(calls.len(), 6, "3 行 × 2 列每格都应询问 renderer");
+        assert_eq!(calls[0], (1, 0, "1".into()), "首显示行应传原始行下标 1");
+        assert_eq!(calls[2], (2, 0, "2".into()));
+        assert_eq!(calls[4], (0, 0, "3".into()), "值 3 的原始行 0 排到末尾");
+        // 结构：首格为自定义单元格（内容为 77px 标记控件），次格为默认文本格（label 撑满）。
+        let root = tree.root.unwrap();
+        let scroll = *tree.get(root).unwrap().children.last().unwrap();
+        let body = tree.get(scroll).unwrap().children[0];
+        let first_row = tree.get(body).unwrap().children[0];
+        let tr = tree.get(first_row).unwrap().children[0];
+        let cells = tree.get(tr).unwrap().children.clone();
+        assert_eq!(cells.len(), 2);
+        let custom_inner = tree.get(cells[0]).unwrap().children[0];
+        assert_eq!(
+            tree.get(custom_inner).unwrap().width,
+            Dimension::Px(77),
+            "首列应为自定义控件"
+        );
+        let default_inner = tree.get(cells[1]).unwrap().children[0];
+        assert_eq!(
+            tree.get(default_inner).unwrap().width,
+            Dimension::Match,
+            "次列应为默认文本渲染（label 撑满格宽）"
+        );
+    }
+
+    #[test]
+    fn cell_render_composes_with_actions_column() {
+        // cell_render 与 .actions 同时设置：数据格自定义 + 尾列操作格并存。
+        let sort = signal(None);
+        let tree = layout(
+            Element::table_sortable(vec![("A", 1.0), ("B", 1.0)], vec![vec!["a", "b"]], sort)
+                .cell_render(|_, col, _| (col == 0).then(|| Element::label("·").width(33)))
+                .actions("操作", 1.0, |_| Element::label("x"))
+                .width(400)
+                .height(300),
+        );
+        let root = tree.root.unwrap();
+        let scroll = *tree.get(root).unwrap().children.last().unwrap();
+        let body = tree.get(scroll).unwrap().children[0];
+        let first_row = tree.get(body).unwrap().children[0];
+        let tr = tree.get(first_row).unwrap().children[0];
+        assert_eq!(
+            tree.get(tr).unwrap().children.len(),
+            3,
+            "2 数据格 + 1 操作格"
+        );
+        let custom_inner = tree
+            .get(tree.get(tr).unwrap().children[0])
+            .unwrap()
+            .children[0];
+        assert_eq!(tree.get(custom_inner).unwrap().width, Dimension::Px(33));
     }
 
     #[test]

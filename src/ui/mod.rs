@@ -1395,6 +1395,27 @@ impl Element {
         container
     }
 
+    /// 响应式动态宿主：同 [`list_signal`](Self::list_signal)，但容器是**普通列容器**（非滚动）——
+    /// 子元素按正常 col 布局，`weight`/`fill` 能拿到确定高度。适合"信号变化时整体重建一段
+    /// 结构随状态变化的子树"（如列集随类别切换的表格），且内容自带滚动或无需滚动的场景。
+    /// （滚动容器按无限高度测量子元素，内含 `weight` 正文的表格会高度崩塌——此时用本方法。）
+    pub fn host_signal<T>(data: Signal<Vec<T>>, build_fn: impl Fn(T) -> Self + 'static) -> Self
+    where
+        T: Clone + 'static,
+    {
+        let build_fn = std::rc::Rc::new(build_fn);
+        let initial: Vec<Self> = data.get().into_iter().map(|item| build_fn(item)).collect();
+        let build_fn_clone = build_fn.clone();
+        let widget = dyn_list::DynList::new(data, move |item: T| build_fn_clone(item));
+        let mut container = Self::col().fill();
+        container.widget = Box::new(widget);
+        container.reactive = true;
+        for el in initial {
+            container.children.push(el);
+        }
+        container
+    }
+
     /// 带前置图标的单选列表：`items` 为 (标签, 图标内容) 列表。其余同 `list`。
     /// 图标用 `ImageContent`，可链 `.fit()`/状态换图等；行图标随选中/悬停状态调制。
     pub fn list_icons(
@@ -1872,7 +1893,7 @@ impl Element {
         let mut body = Element::col().width_match();
         for (disp, &ri) in order.iter().enumerate() {
             body = body.child(sortable_table::body_row(
-                disp, ri, &data[ri], &weights, None,
+                disp, ri, &data[ri], &weights, None, None,
             ));
         }
         body.widget = Box::new(sortable_table::SortableBody::new(data, weights, sort));
@@ -1932,7 +1953,9 @@ impl Element {
         let initial = rows.get();
         let mut body = Element::col().width_match();
         for (disp, row) in initial.iter().enumerate() {
-            body = body.child(sortable_table::body_row(disp, disp, row, &weights, None));
+            body = body.child(sortable_table::body_row(
+                disp, disp, row, &weights, None, None,
+            ));
         }
         body.widget = Box::new(sortable_table::PagedBody::new(rows, weights));
         body.reactive = true;
@@ -2066,6 +2089,38 @@ impl Element {
         if let Some(scroll) = self.children.last_mut() {
             if let Some(body) = scroll.children.get_mut(0) {
                 sortable_table::set_body_actions(body, &ac);
+            }
+        }
+        self
+    }
+
+    /// 自定义**数据单元格**渲染：`build(行下标, 列下标, 单元格文本)` 返回 `Some` 时该格
+    /// 用自定义控件（徽章/彩色标签/图标等），返回 `None` 回退默认文本渲染。仅对
+    /// [`table_sortable`](Self::table_sortable) / [`table_selectable`](Self::table_selectable) /
+    /// [`table_sortable_server`](Self::table_sortable_server) 返回的元素有效。
+    ///
+    /// 排序仍基于单元格**文本**（渲染与排序键解耦）；自定义格与操作列同款包裹
+    /// （水平内边距 + 垂直居中，不强制 20px 行高，较高控件不被压扁）。行下标语义同
+    /// [`actions`](Self::actions)：客户端表格为原始行下标，服务端表格为页内显示下标。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// Element::table_sortable(cols, rows, sort).cell_render(|_row, col, text| match col {
+    ///     // 编码列渲染为边框徽章；其余列默认文本。
+    ///     0 => Some(Element::label(text).font_size(12.5).padding_xy(6, 2).corner(4.0)
+    ///         .border_role(Role::Border, 1)),
+    ///     _ => None,
+    /// })
+    /// ```
+    pub fn cell_render(
+        mut self,
+        build: impl Fn(usize, usize, &str) -> Option<Element> + 'static,
+    ) -> Self {
+        let render: sortable_table::CellRender = Rc::new(build);
+        // 结构 col[ header, divider, scroll ]：scroll 为末子，其首个子节点挂响应式正文 widget。
+        if let Some(scroll) = self.children.last_mut() {
+            if let Some(body) = scroll.children.get_mut(0) {
+                sortable_table::set_body_cell_render(body, &render);
             }
         }
         self
@@ -2298,6 +2353,77 @@ mod tests {
         tree.root = Some(root);
         tree.layout_root(Size::new(200, 200), &mut crate::text::NullTextEngine);
         tree
+    }
+
+    #[test]
+    fn host_signal_gives_weight_children_real_height_and_rebuilds() {
+        // 回归：list_signal 容器是滚动布局（子元素按无限高度测量），内含 weight 正文的
+        // 表格会高度崩塌为 0。host_signal 用普通 col 容器，weight 子元素应拿到确定高度。
+        let data = signal(vec![1u8]);
+        let mut tree = Tree::new();
+        let host = Element::host_signal(data, |_| {
+            Element::col()
+                .width_match()
+                .fill()
+                .child(Element::label("头").height(20))
+                .child(Element::leaf().weight(1.0)) // 模拟表格正文（weight 撑满剩余）
+        });
+        let root = host.build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(Size::new(200, 200), &mut crate::text::NullTextEngine);
+        let inner = tree.get(root).unwrap().children[0];
+        let body = tree.get(inner).unwrap().children[1];
+        assert_eq!(
+            tree.get(body).unwrap().bounds.h,
+            180,
+            "weight 正文应拿到剩余高度（200 - 20 表头），而非崩塌为 0"
+        );
+        // 信号版本变化 → 下次布局整体重建（子节点替换为新数据的构建结果）。
+        data.set(vec![1, 2]);
+        tree.layout_root(Size::new(200, 200), &mut crate::text::NullTextEngine);
+        assert_eq!(
+            tree.get(root).unwrap().children.len(),
+            2,
+            "信号变化后应按新数据重建子元素"
+        );
+    }
+
+    #[test]
+    fn host_signal_rebuilt_reactive_children_receive_on_update() {
+        // 回归：dispatch_reactive_updates 曾用广播快照的存活集覆盖注册列表，把广播期间
+        //（宿主 on_update 重建子树时）新注册的响应式节点抹掉——重建出的响应式表头/正文
+        // 永远收不到 on_update，表格在宿主重建（如切换类别）后空白。
+        let epoch = signal(vec![0u64]);
+        let rows = signal(vec![vec!["a".to_string()]]);
+        let host = Element::host_signal(epoch, move |_| {
+            Element::table_sortable_server(vec![("列", 1.0)], rows, signal(None), |_, _| {})
+        });
+        let mut tree = Tree::new();
+        let root = host.build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(Size::new(200, 200), &mut crate::text::NullTextEngine);
+
+        // 表格结构 col[header, divider, scroll]；表头单元格由 SortableHeader on_update 构建。
+        let header_cells = |tree: &Tree| {
+            let table = tree.get(tree.root.unwrap()).unwrap().children[0];
+            let header = tree.get(table).unwrap().children[0];
+            tree.get(header).unwrap().children.len()
+        };
+        assert_eq!(header_cells(&tree), 1, "初始表头应有单元格");
+
+        // 触发宿主重建（模拟切换类别）：新表头应在同一帧收到 on_update 并构建单元格。
+        epoch.set(vec![1]);
+        tree.layout_root(Size::new(200, 200), &mut crate::text::NullTextEngine);
+        assert_eq!(
+            header_cells(&tree),
+            1,
+            "重建后的表头应构建出单元格（注册不被抹掉）"
+        );
+
+        // 再次重建仍工作（前一轮的注册清理不误伤新注册）。
+        epoch.set(vec![2]);
+        tree.layout_root(Size::new(200, 200), &mut crate::text::NullTextEngine);
+        assert_eq!(header_cells(&tree), 1, "再次重建仍应正常构建");
     }
 
     #[test]

@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+### Added
+- **表格自定义单元格渲染 `Element::cell_render`**：按 `(行下标, 列下标, 单元格文本)` 逐格询问，
+  返回 `Some(Element)` 用自定义控件（徽章/彩色标签/图标等），`None` 回退默认文本。排序仍基于
+  单元格文本（渲染与排序键解耦）；行下标语义同 `.actions`（客户端表格为原始行下标，服务端表格
+  为页内显示下标）。适用于 `table_sortable` / `table_sortable_server` / `table_selectable`，
+  可与 `.actions` 组合。fullshowcase 表格 tab 新增演示。
+- **`Element::host_signal`**：信号驱动的响应式重建宿主。同 `list_signal` 的重建机制，但容器为
+  普通列容器（非滚动）——子元素 `weight`/`fill` 能拿到确定高度，适合整体重建"结构随状态变化"
+  的子树（如列集随类别切换的表格；滚动容器按无限高度测量会令表格正文高度崩塌）。
+
+### Fixed
+- 响应式广播（`dispatch_reactive_updates`）曾用广播快照的存活集**覆盖**注册列表，把广播期间
+  动态重建子树新注册的响应式节点抹掉——`list_signal`/`host_signal` 重建出的响应式表头/正文
+  永远收不到 `on_update`，表格在宿主重建后空白。现改为按批次迭代到收敛（新注册节点**同帧**
+  收到回调，避免首帧空白），清理阶段基于真实列表 retain。
+
 ## [0.4.0] - 2026-06-26
 
 ### Added

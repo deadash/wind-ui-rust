@@ -668,6 +668,46 @@ fn main() {
             .height(200),
         ))
         .child(card(
+            "自定义单元格 .cell_render（首列边框徽章、末列彩色标签；返回 None 的列走默认文本）",
+            Element::table_sortable(
+                vec![("编码", 1.0), ("词条", 2.0), ("类型", 1.0)],
+                vec![
+                    vec!["bj", "北京", "置顶"],
+                    vec!["sh", "上海", "删除"],
+                    vec!["gz", "广州", "置顶"],
+                ],
+                signal(None),
+            )
+            // 按 (行, 列, 文本) 逐格询问：Some=自定义控件，None=默认文本。排序仍按文本值。
+            .cell_render(|_row, col, text| match col {
+                0 => Some(
+                    Element::label(text)
+                        .font_size(12.5)
+                        .fg_role(Role::TextMuted)
+                        .padding_xy(6, 2)
+                        .corner(4.0)
+                        .border_role(Role::Border, 1),
+                ),
+                2 => {
+                    let role = if text == "置顶" {
+                        Role::Accent
+                    } else {
+                        Role::TextMuted
+                    };
+                    Some(
+                        Element::label(text)
+                            .font_size(11.0)
+                            .fg_role(role)
+                            .padding_xy(6, 2)
+                            .corner(4.0)
+                            .border_role(role, 1),
+                    )
+                }
+                _ => None,
+            })
+            .height(200),
+        ))
+        .child(card(
             "可排序 + 多选 table_selectable（复选框首列 + 全选三态 + 选中行高亮）",
             Element::col()
                 .width_match()
