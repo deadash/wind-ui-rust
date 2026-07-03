@@ -29,7 +29,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_LAYER_PARAMETERS1, D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_PROPERTY_TYPE_FLOAT,
     D2D1_PROPERTY_TYPE_VECTOR4, D2D1_RADIAL_GRADIENT_BRUSH_PROPERTIES, D2D1_ROUNDED_RECT,
     D2D1_SHADOW_PROP_BLUR_STANDARD_DEVIATION, D2D1_SHADOW_PROP_COLOR,
-    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE,
+    D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE, D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL};
 use windows::Win32::Graphics::Direct3D11::{
@@ -1285,20 +1285,48 @@ impl Canvas for D2DCanvas<'_> {
             // 顶对齐（纵向位置由 origin.y 控制），配合下方 (h-th).max(0) 实现"装得下居中、装不下顶对齐"。
             let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         }
-        // 文字色复用 solid brush（取一次→立即绘制，符合 solid 共享约束）。
-        let brush = self.solid_brush(color);
         // 纵向：装得下→垂直居中；装不下→顶对齐（origin 在 rect 顶部，超出部分由上层裁剪收口）。
         // (h-th).max(0)/2 与 SkiaCanvas `oy = y + (h-th).max(0)/2` 完全一致。
         let oy = rect.y as f32 + (rect.h as f32 - th).max(0.0) / 2.0;
         let origin = vec2(rect.x as f32, oy);
+        // 文字色复用 solid brush（取一次→立即绘制，符合 solid 共享约束）。
+        let brush = self.solid_brush(color);
+        let semi = color.a < 255;
         unsafe {
-            // ENABLE_COLOR_FONT：让彩色 emoji（如工具栏 😊）正常渲染而非单色轮廓。
+            if semi {
+                // 半透明文字两个问题同时存在：
+                //   1. ENABLE_COLOR_FONT 路径（颜色 emoji 如 ℹ）绕过 brush alpha，brush 设透明无效。
+                //   2. ClearType 在透明离屏层内无法正确对齐背景，会产生子像素偏色（"更亮"感）。
+                // 修法：PushLayer 承载 opacity，层内切 GRAYSCALE（纯亮度，不依赖背景色）。
+                // ENABLE_COLOR_FONT 保持启用，保证 ℹ 等彩色 emoji 仍以彩色渲染，由层合成 alpha。
+                let opacity = color.a as f32 / 255.0;
+                let params = D2D1_LAYER_PARAMETERS1 {
+                    contentBounds: INFINITE_RECT,
+                    geometricMask: std::mem::ManuallyDrop::new(None),
+                    maskAntialiasMode: D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                    maskTransform: Matrix3x2::identity(),
+                    opacity,
+                    opacityBrush: std::mem::ManuallyDrop::new(None),
+                    layerOptions: D2D1_LAYER_OPTIONS1_NONE,
+                };
+                self.ctx.PushLayer(&params, None);
+                self.pushed_layers += 1;
+                self.ctx
+                    .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            }
+            // ENABLE_COLOR_FONT：让彩色 emoji（如工具栏 😊、toast ℹ）正常渲染而非单色轮廓。
             self.ctx.DrawTextLayout(
                 origin,
                 &layout,
                 &brush,
                 D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT,
             );
+            if semi {
+                self.ctx
+                    .SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+                self.ctx.PopLayer();
+                self.pushed_layers -= 1;
+            }
         }
     }
 
