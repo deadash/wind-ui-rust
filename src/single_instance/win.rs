@@ -16,9 +16,9 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, FindWindowW, IsIconic, RegisterClassExW,
-    SendMessageW, SetForegroundWindow, ShowWindow, HWND_MESSAGE, SW_RESTORE, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_COPYDATA, WNDCLASSEXW,
+    AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW, FindWindowW,
+    GetWindowThreadProcessId, IsIconic, RegisterClassExW, SendMessageW, SetForegroundWindow,
+    ShowWindow, HWND_MESSAGE, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COPYDATA, WNDCLASSEXW,
 };
 
 use super::{class_name, decode_argv, encode_argv, mutex_name};
@@ -68,6 +68,14 @@ pub(crate) fn forward(app_id: &str, argv: &[String]) {
         };
         if hwnd.is_invalid() {
             return;
+        }
+        // 把本进程持有的前台激活权授予首实例：二次实例通常由前台进程（用户点击 →
+        // ShellExecute）启动而持权，首实例仅收到 WM_COPYDATA 并**不**获得权限——
+        // 不显式授权则其 SetForegroundWindow 被系统拒绝，窗口只在任务栏闪烁不到前台。
+        let mut pid = 0u32;
+        let _ = GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        if pid != 0 {
+            let _ = AllowSetForegroundWindow(pid);
         }
         let bytes = encode_argv(argv);
         let cds = COPYDATASTRUCT {
@@ -164,8 +172,8 @@ unsafe extern "system" fn si_wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-/// 激活窗口:取消最小化 + 带到前台。在 SendMessage 上下文(收到二次实例消息时)调用,
-/// 系统允许前台转移,故 SetForegroundWindow 通常生效。
+/// 激活窗口:取消最小化 + 带到前台。SetForegroundWindow 需要前台激活权——本进程在后台
+/// 时默认没有;依赖二次实例在 forward 前 AllowSetForegroundWindow 授权(见 forward)。
 pub(crate) fn activate(main_hwnd: isize) {
     if main_hwnd == 0 {
         return;
