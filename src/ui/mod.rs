@@ -780,6 +780,8 @@ impl Widget for Button {
 pub struct Element {
     width: Dimension,
     height: Dimension,
+    /// 最小宽度下界（None=无）：配合 Wrap 宽实现自适应但不小于该值，见 [`Element::min_width`]。
+    min_width: Option<i32>,
     padding: Insets,
     margin: Insets,
     align: Option<Align>,
@@ -808,6 +810,7 @@ impl Element {
         Self {
             width: Dimension::Wrap,
             height: Dimension::Wrap,
+            min_width: None,
             padding: Insets::default(),
             margin: Insets::default(),
             align: None,
@@ -2179,6 +2182,13 @@ impl Element {
         self.width = Dimension::Match;
         self
     }
+    /// 最小宽度（下界，逻辑 dp）：控件按内容自适应（保持默认 `Wrap` 宽）但不小于 `px`。
+    /// 用于下拉/选择等——短选项对齐到统一基线宽，长选项自动加宽避免文本换行。
+    /// 与固定宽 [`Element::width`] 互斥：若同时设了固定宽，则以固定宽为准、下界不生效。
+    pub fn min_width(mut self, px: i32) -> Self {
+        self.min_width = Some(px);
+        self
+    }
     pub fn height_match(mut self) -> Self {
         self.height = Dimension::Match;
         self
@@ -2329,6 +2339,7 @@ impl Element {
             measured: Default::default(),
             width: self.width,
             height: self.height,
+            min_width: self.min_width.unwrap_or(0),
             padding: self.padding,
             margin: self.margin,
             align: self.align,

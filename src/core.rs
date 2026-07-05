@@ -153,6 +153,10 @@ pub struct Node {
     pub measured: Size,
     pub width: Dimension,
     pub height: Dimension,
+    /// 最小宽度（0=无约束）：measure 收敛后对宽度取下界。配合 `Dimension::Wrap`
+    /// 宽实现「按内容自适应、但不小于此值」——短内容对齐统一基线宽，长内容自动
+    /// 加宽不换行。与固定宽 `Dimension::Px` 互斥（后者已钉死宽度，下界不参与）。
+    pub min_width: i32,
     pub padding: Insets,
     pub margin: Insets,
     /// 自身对齐覆盖：None=继承容器交叉轴对齐；Some(a)=显式覆盖。
@@ -403,8 +407,8 @@ impl Tree {
         hspec: MeasureSpec,
         text: &mut dyn TextEngine,
     ) -> Size {
-        let (layout, padding, visible) = match self.get(id) {
-            Some(n) => (n.layout, n.padding, n.effective_visible()),
+        let (layout, padding, min_width, visible) = match self.get(id) {
+            Some(n) => (n.layout, n.padding, n.min_width, n.effective_visible()),
             None => return Size::ZERO,
         };
         if !visible {
@@ -438,7 +442,10 @@ impl Tree {
 
         let desired_w = content.w + padding.horizontal();
         let desired_h = content.h + padding.vertical();
-        let size = Size::new(wspec.resolve(desired_w), hspec.resolve(desired_h));
+        // min_width：约束收敛后对宽度取下界（0=无）。放在 resolve 之后，使
+        // 「Wrap 自适应宽 < 下界」时抬到下界，而自适应宽更大时保留（避免长文本换行）。
+        let resolved_w = wspec.resolve(desired_w).max(min_width);
+        let size = Size::new(resolved_w, hspec.resolve(desired_h));
         if let Some(n) = self.get_mut(id) {
             n.measured = size;
         }
