@@ -275,13 +275,15 @@ impl Widget for Label {
     }
 }
 
+/// 截断缓存键值：`(text_clone, content_w, fsize_bits, 截断串, 是否发生了截断)`。
+type TruncCacheEntry = (String, i32, u32, String, bool);
+
 /// 动态文本标签：绑定 `Signal<String>`，只读显示，内容随绑定变化而更新。
 pub struct DynLabel {
     text: Signal<String>,
     pub max_lines: Option<usize>,
     pub truncate: Truncate,
-    /// 截断缓存 `(text_clone, content_w, fsize_bits) → (截断串, 是否发生了截断)`。
-    trunc_cache: RefCell<Option<(String, i32, u32, String, bool)>>,
+    trunc_cache: RefCell<Option<TruncCacheEntry>>,
 }
 
 impl DynLabel {
