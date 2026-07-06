@@ -96,8 +96,9 @@ pub struct Label {
     pub max_lines: Option<usize>,
     /// 溢出省略方式（仅 `max_lines = Some(1)` 单行时精确截断；多行仅高度裁剪）。
     pub truncate: Truncate,
-    /// 截断结果缓存 `(content_w, fsize_bits) → 截断串`；text 不可变故不入 key。
-    trunc_cache: RefCell<Option<(i32, u32, String)>>,
+    /// 截断结果缓存 `(content_w, fsize_bits) → (截断串, 是否发生了截断)`；
+    /// text 不可变故不入 key。
+    trunc_cache: RefCell<Option<(i32, u32, String, bool)>>,
 }
 
 impl Label {
@@ -110,17 +111,17 @@ impl Label {
         }
     }
 
-    /// 计算截断后显示串（含省略号）；结果会被 paint 缓存，通常只算一次。
+    /// 计算截断后显示串（含省略号）及是否实际发生了截断；结果会被 paint 缓存，通常只算一次。
     fn compute_truncated(
         &self,
         canvas: &mut dyn Canvas,
         family: Option<&str>,
         fsize: f32,
         avail_w: i32,
-    ) -> String {
+    ) -> (String, bool) {
         let total_w = canvas.measure_text(&self.text, family, fsize).w;
         if total_w <= avail_w {
-            return self.text.clone();
+            return (self.text.clone(), false);
         }
         let ew = canvas.measure_text("…", family, fsize).w;
         let avail = (avail_w - ew).max(0);
@@ -133,7 +134,7 @@ impl Label {
             acc.push(c);
             widths[i + 1] = canvas.measure_text(&acc, family, fsize).w;
         }
-        match self.truncate {
+        let s = match self.truncate {
             Truncate::End => {
                 // partition_point 返回第一个 > avail 的下标，该位置的字符本身已超宽，
                 // 需 -1 取最后一个能放下的字符数。
@@ -163,7 +164,8 @@ impl Label {
                 format!("{left}…{right}")
             }
             Truncate::None => unreachable!(),
-        }
+        };
+        (s, true)
     }
 }
 
@@ -230,22 +232,22 @@ impl Widget for Label {
         if self.truncate != Truncate::None && self.max_lines == Some(1) && !self.text.is_empty() {
             let key_w = content.w;
             let key_f = fsize.to_bits();
-            let cached: Option<String> = {
+            let cached: Option<(String, bool)> = {
                 let c = self.trunc_cache.borrow();
-                c.as_ref().and_then(|(cw, cf, s)| {
+                c.as_ref().and_then(|(cw, cf, s, t)| {
                     if *cw == key_w && *cf == key_f {
-                        Some(s.clone())
+                        Some((s.clone(), *t))
                     } else {
                         None
                     }
                 })
             };
-            let text_str = if let Some(s) = cached {
-                s
+            let (text_str, _truncated) = if let Some(hit) = cached {
+                hit
             } else {
-                let s = self.compute_truncated(canvas, family, fsize, content.w);
-                *self.trunc_cache.borrow_mut() = Some((key_w, key_f, s.clone()));
-                s
+                let (s, t) = self.compute_truncated(canvas, family, fsize, content.w);
+                *self.trunc_cache.borrow_mut() = Some((key_w, key_f, s.clone(), t));
+                (s, t)
             };
             canvas.draw_text(&text_str, paint_rect, fg, style.text_align, family, fsize);
         } else {
@@ -259,6 +261,18 @@ impl Widget for Label {
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
+    fn text_truncated(&self) -> Option<bool> {
+        if self.truncate == Truncate::None || self.max_lines != Some(1) {
+            return None;
+        }
+        Some(
+            self.trunc_cache
+                .borrow()
+                .as_ref()
+                .map(|(_, _, _, t)| *t)
+                .unwrap_or(false),
+        )
+    }
 }
 
 /// 动态文本标签：绑定 `Signal<String>`，只读显示，内容随绑定变化而更新。
@@ -266,8 +280,8 @@ pub struct DynLabel {
     text: Signal<String>,
     pub max_lines: Option<usize>,
     pub truncate: Truncate,
-    /// 截断缓存 `(text_clone, content_w, fsize_bits) → 截断串`。
-    trunc_cache: RefCell<Option<(String, i32, u32, String)>>,
+    /// 截断缓存 `(text_clone, content_w, fsize_bits) → (截断串, 是否发生了截断)`。
+    trunc_cache: RefCell<Option<(String, i32, u32, String, bool)>>,
 }
 
 impl DynLabel {
@@ -287,10 +301,10 @@ impl DynLabel {
         family: Option<&str>,
         fsize: f32,
         avail_w: i32,
-    ) -> String {
+    ) -> (String, bool) {
         let total_w = canvas.measure_text(s, family, fsize).w;
         if total_w <= avail_w {
-            return s.to_string();
+            return (s.to_string(), false);
         }
         let ew = canvas.measure_text("…", family, fsize).w;
         let avail = (avail_w - ew).max(0);
@@ -302,7 +316,7 @@ impl DynLabel {
             acc.push(c);
             widths[i + 1] = canvas.measure_text(&acc, family, fsize).w;
         }
-        match self.truncate {
+        let out = match self.truncate {
             Truncate::End => {
                 let cut = widths
                     .partition_point(|&w| w <= avail)
@@ -328,7 +342,8 @@ impl DynLabel {
                 format!("{left}…{right}")
             }
             Truncate::None => unreachable!(),
-        }
+        };
+        (out, true)
     }
 }
 
@@ -387,22 +402,22 @@ impl Widget for DynLabel {
         if self.truncate != Truncate::None && self.max_lines == Some(1) && !s.is_empty() {
             let key_w = content.w;
             let key_f = fsize.to_bits();
-            let cached: Option<String> = {
+            let cached: Option<(String, bool)> = {
                 let c = self.trunc_cache.borrow();
-                c.as_ref().and_then(|(ks, cw, cf, out)| {
+                c.as_ref().and_then(|(ks, cw, cf, out, t)| {
                     if ks.as_str() == s.as_str() && *cw == key_w && *cf == key_f {
-                        Some(out.clone())
+                        Some((out.clone(), *t))
                     } else {
                         None
                     }
                 })
             };
-            let text_str = if let Some(out) = cached {
-                out
+            let (text_str, _truncated) = if let Some(hit) = cached {
+                hit
             } else {
-                let out = self.compute_truncated(&s, canvas, family, fsize, content.w);
-                *self.trunc_cache.borrow_mut() = Some((s.clone(), key_w, key_f, out.clone()));
-                out
+                let (out, t) = self.compute_truncated(&s, canvas, family, fsize, content.w);
+                *self.trunc_cache.borrow_mut() = Some((s.clone(), key_w, key_f, out.clone(), t));
+                (out, t)
             };
             canvas.draw_text(&text_str, paint_rect, fg, style.text_align, family, fsize);
         } else {
@@ -415,6 +430,18 @@ impl Widget for DynLabel {
     }
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
+    }
+    fn text_truncated(&self) -> Option<bool> {
+        if self.truncate == Truncate::None || self.max_lines != Some(1) {
+            return None;
+        }
+        Some(
+            self.trunc_cache
+                .borrow()
+                .as_ref()
+                .map(|(_, _, _, _, t)| *t)
+                .unwrap_or(false),
+        )
     }
 }
 
@@ -1181,7 +1208,8 @@ impl Element {
     }
     /// 悬停提示：指针在本元素上停留片刻后，于指针附近弹出说明浮层。
     /// **适用于任意控件/容器**（像 `enabled`，挂在节点上）；命中取最深节点的提示。
-    /// 仅支持单行文本（浮层按单行度量；含 `\n` 在 debug 下提示，release 忽略换行测量）。
+    /// 超过 `TOOLTIP_MAX_W`（`app.rs`）自动按宽度换行为多行；调用方仍传一整句
+    /// 不含显式换行的文本（含 `\n` 在 debug 下提示，排版结果未做专门测试）。
     pub fn tooltip(mut self, text: impl Into<String>) -> Self {
         let text = text.into();
         debug_assert!(!text.contains('\n'), "tooltip 仅支持单行文本");
@@ -2550,6 +2578,96 @@ mod tests {
         fn save(&mut self) {}
         fn restore(&mut self) {}
         fn clip_rect(&mut self, _: Rect) {}
+    }
+
+    /// 按字符数估算宽度的 Canvas：用于可控地触发/规避 Label 的单行省略截断。
+    struct WidthCanvas;
+    impl crate::render::Canvas for WidthCanvas {
+        fn dpi_scale(&self) -> f32 {
+            1.0
+        }
+        fn fill_rect(&mut self, _: f32, _: f32, _: f32, _: f32, _: &crate::render::Paint) {}
+        fn fill_round_rect(
+            &mut self,
+            _: f32,
+            _: f32,
+            _: f32,
+            _: f32,
+            _: f32,
+            _: &crate::render::Paint,
+        ) {
+        }
+        fn stroke_round_rect(
+            &mut self,
+            _: f32,
+            _: f32,
+            _: f32,
+            _: f32,
+            _: f32,
+            _: f32,
+            _: &crate::render::Paint,
+        ) {
+        }
+        fn draw_line(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: &crate::render::Paint) {}
+        fn fill_circle(&mut self, _: f32, _: f32, _: f32, _: &crate::render::Paint) {}
+        fn draw_shadow(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32, _: Color) {}
+        fn draw_image(
+            &mut self,
+            _: &crate::render::image::Image,
+            _: Rect,
+            _: crate::render::image::Fit,
+            _: f32,
+            _: f32,
+        ) {
+        }
+        fn draw_text(
+            &mut self,
+            _: &str,
+            _: Rect,
+            _: Color,
+            _: crate::spec::Align,
+            _: Option<&str>,
+            _: f32,
+        ) {
+        }
+        fn measure_text(&mut self, text: &str, _: Option<&str>, size: f32) -> Size {
+            Size::new(
+                (text.chars().count() as f32 * size).ceil() as i32,
+                size.ceil() as i32,
+            )
+        }
+        fn push_layer(&mut self, _: f32) {}
+        fn pop_layer(&mut self) {}
+        fn save(&mut self) {}
+        fn restore(&mut self) {}
+        fn clip_rect(&mut self, _: Rect) {}
+    }
+
+    #[test]
+    fn label_text_truncated_reflects_actual_overflow_and_gates_tooltip() {
+        use crate::core::Widget;
+        let mut label = Label::new("这是一段用来测试截断状态的说明文字".to_string());
+        label.max_lines = Some(1);
+        label.truncate = Truncate::End;
+        let style = Style::default();
+        let mut cv = WidthCanvas;
+
+        // 未绘制过：尚不知道是否溢出，但功能已启用 → Some(false)（保守不弹）。
+        assert_eq!(label.text_truncated(), Some(false));
+
+        // 足够宽：完整显示，未截断。
+        let wide = Rect::new(0, 0, 1000, 20);
+        label.paint(wide, wide, false, true, &mut cv, &style);
+        assert_eq!(label.text_truncated(), Some(false));
+
+        // 变窄后重绘（不同 content.w → 缓存 miss 重新计算）：应判定为已截断。
+        let narrow = Rect::new(0, 0, 40, 20);
+        label.paint(narrow, narrow, false, true, &mut cv, &style);
+        assert_eq!(label.text_truncated(), Some(true));
+
+        // 未配置 truncate/max_lines(1) 的普通 Label：截断概念不适用 → None。
+        let plain = Label::new("短文本".to_string());
+        assert_eq!(plain.text_truncated(), None);
     }
 
     #[test]

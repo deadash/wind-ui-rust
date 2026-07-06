@@ -492,6 +492,29 @@ impl Canvas for SkiaCanvas<'_> {
         }
     }
 
+    fn measure_text_wrapped(
+        &mut self,
+        text: &str,
+        family: Option<&str>,
+        size: f32,
+        max_width: f32,
+    ) -> crate::geometry::Size {
+        // 与 measure_text 同源，仅多传 max_width 触发引擎按宽度换行。
+        match self.engine.as_deref_mut() {
+            Some(engine) => engine.measure(text, family, size, Some(max_width)),
+            None => {
+                // 无引擎的粗略估算：按等宽字符估算每行字数换行，行高按行数累加。
+                let per_line = ((max_width / (size * 0.6)).floor() as usize).max(1);
+                let chars = text.chars().count().max(1);
+                let lines = chars.div_ceil(per_line).max(1);
+                crate::geometry::Size::new(
+                    max_width.ceil() as i32,
+                    (size.ceil() as i32) * lines as i32,
+                )
+            }
+        }
+    }
+
     fn push_layer(&mut self, opacity: f32) {
         let (w, h) = (self.pixmap.width(), self.pixmap.height());
         // 与主缓冲同尺寸的透明层；分配失败时退化为 1×1/0 透明度（不可见但保持栈平衡）。

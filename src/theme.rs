@@ -678,6 +678,8 @@ pub struct TooltipTheme {
     pub bg: Option<Color>,
     pub text: Option<Color>,
     pub corner: Option<f32>,
+    /// 单行超过此宽度（逻辑 px）自动换行；未设置时用库内默认值。
+    pub max_width: Option<f32>,
 }
 
 impl TooltipTheme {
@@ -689,6 +691,10 @@ impl TooltipTheme {
     }
     pub fn corner(&self, m: &Metrics) -> f32 {
         self.corner.unwrap_or(m.corner_sm)
+    }
+    /// 换行宽度上限（逻辑 px）。默认 280，宿主可按窗口宽度/文案长度自行覆盖。
+    pub fn max_width(&self) -> f32 {
+        self.max_width.unwrap_or(280.0)
     }
 }
 

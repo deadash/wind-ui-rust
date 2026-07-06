@@ -109,6 +109,12 @@ pub trait Widget {
     fn hit_opaque(&self) -> bool {
         true
     }
+    /// 单行省略配置下，最近一次绘制的文本是否被实际截断。`None`=本控件不具备
+    /// 该概念（如按钮/容器），`Some(false)`=配了省略但当前完整放得下、未截断。
+    /// 供 [`Tree::node_tooltip`] 判定：仅在文本确被截断时才弹出与其重复的悬浮提示。
+    fn text_truncated(&self) -> Option<bool> {
+        None
+    }
 }
 
 /// 容器/纯样式节点占位控件。
@@ -1151,8 +1157,18 @@ impl Tree {
     }
 
     /// 节点的悬停提示文本（无则 None）。宿主据此在悬停延时后绘制浮层。
+    ///
+    /// 若节点挂载的控件具备"文本截断"概念（如配了单行省略的 `Label`）且报告
+    /// 当前**未**截断（`Some(false)`），视为原文已完整可见，不再弹出与其重复的
+    /// 提示——避免"短文案也弹一模一样的浮层"。不具备该概念的控件（`None`）按
+    /// 原语义正常返回，不受影响。
     pub fn node_tooltip(&self, id: NodeId) -> Option<String> {
-        self.get(id).and_then(|n| n.tooltip.clone())
+        let n = self.get(id)?;
+        let text = n.tooltip.clone()?;
+        if n.widget.text_truncated() == Some(false) {
+            return None;
+        }
+        Some(text)
     }
 
     /// `pos`（逻辑坐标）是否落在交互控件上（可聚焦节点，如自定义标题栏的窗口按钮）。

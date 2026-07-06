@@ -1357,6 +1357,33 @@ impl Canvas for D2DCanvas<'_> {
         crate::geometry::Size::new(m.width.ceil() as i32, m.height.ceil() as i32)
     }
 
+    fn measure_text_wrapped(
+        &mut self,
+        text: &str,
+        family: Option<&str>,
+        size: f32,
+        max_width: f32,
+    ) -> crate::geometry::Size {
+        // 与 measure_text 同源，仅 maxWidth 改传 max_width 触发按宽度换行（纵向仍不限）。
+        if text.is_empty() {
+            return crate::geometry::Size::new(0, size.ceil() as i32);
+        }
+        let fallback = || {
+            let per_line = ((max_width / (size * 0.6)).floor() as usize).max(1);
+            let chars = text.chars().count().max(1);
+            let lines = chars.div_ceil(per_line).max(1);
+            crate::geometry::Size::new(max_width.ceil() as i32, (size.ceil() as i32) * lines as i32)
+        };
+        let Some(layout) = self.text_layout(text, family, size, max_width, f32::MAX) else {
+            return fallback();
+        };
+        let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+        if unsafe { layout.GetMetrics(&mut m) }.is_err() {
+            return fallback();
+        }
+        crate::geometry::Size::new(m.width.ceil() as i32, m.height.ceil() as i32)
+    }
+
     fn push_layer(&mut self, opacity: f32) {
         // 离屏合成层：后续绘制重定向到层，PopLayer 时按 opacity 整体合回父层
         // （子树统一不透明度）。无限 contentBounds 不裁剪层内容（裁剪由 clip 栈负责）。

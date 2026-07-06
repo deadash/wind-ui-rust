@@ -70,6 +70,7 @@ const MENU_TRAIL_GAP: i32 = 18;
 const MENU_EDGE_MARGIN: i32 = 10;
 
 /// 悬停提示：触发延时（ms）、字号、内边距、相对指针的偏移。
+/// 换行宽度上限由宿主经 `Theme.tooltip.max_width` 配置（见 [`crate::theme::TooltipTheme::max_width`]）。
 const TOOLTIP_DELAY_MS: u64 = 500;
 const TOOLTIP_FONT: f32 = 13.0;
 const TOOLTIP_PAD_X: i32 = 8;
@@ -1436,7 +1437,7 @@ impl AppHandler for UiHost {
                     crate::anim::request_repaint();
                 } else {
                     let (pal, tt) = (&self.theme.palette, &self.theme.tooltip);
-                    let ts = canvas.measure_text(&text, None, TOOLTIP_FONT);
+                    let ts = canvas.measure_text_wrapped(&text, None, TOOLTIP_FONT, tt.max_width());
                     let (w, h) = (ts.w + 2 * TOOLTIP_PAD_X, ts.h + 2 * TOOLTIP_PAD_Y);
                     let ws = self.logical_size;
                     let mut x = self.hover_pos.x + TOOLTIP_CURSOR_DX;
@@ -1607,7 +1608,7 @@ impl AppHandler for UiHost {
         let old_hover = self.hover;
         let mut hover = self.hover;
         let mut capture = self.capture;
-        let res = self.tree.dispatch_pointer(ev, &mut hover, &mut capture);
+        let mut res = self.tree.dispatch_pointer(ev, &mut hover, &mut capture);
         self.hover = hover;
         self.capture = capture;
         // 悬停提示：记录指针位置；悬停节点变化时重新计时（隐藏旧提示、对新节点计时）。
@@ -1617,6 +1618,15 @@ impl AppHandler for UiHost {
         if hover != old_hover {
             self.hover_since_ms = now_ms;
             self.tooltip_suppressed = false;
+            // tooltip 浮层画在控件自身范围之外（指针旁），普通 Label 又没有 hover
+            // 视觉、不会主动上报 repaint——若不在此强制请求一次重绘，移出后旧提示
+            // 残留不消失、移入后也要等到别的事件凑巧触发重绘才会出现（不稳定）。
+            let node_has_tooltip = |id: Option<NodeId>| {
+                id.is_some_and(|h| self.tree.get(h).is_some_and(|n| n.tooltip.is_some()))
+            };
+            if node_has_tooltip(old_hover) || node_has_tooltip(hover) {
+                res.repaint = true;
+            }
         }
         match ev.kind {
             PointerKind::Down => self.tooltip_suppressed = true,

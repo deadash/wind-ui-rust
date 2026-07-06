@@ -159,6 +159,20 @@ pub trait Canvas {
         size: f32,
     ) -> crate::geometry::Size;
 
+    /// 测量在 `max_width` 内自动换行后的文字尺寸（用于 tooltip 等超宽自动换行场景）。
+    /// 默认退化为单行测量，实现需覆盖以启用真正的换行度量（与 [`Self::draw_text`]
+    /// 传入同宽 rect 时的换行结果一致，方可先测量定容器再绘制）。
+    fn measure_text_wrapped(
+        &mut self,
+        text: &str,
+        family: Option<&str>,
+        size: f32,
+        max_width: f32,
+    ) -> crate::geometry::Size {
+        let _ = max_width;
+        self.measure_text(text, family, size)
+    }
+
     /// 压入一层离屏合成层：后续绘制重定向到该层；`pop_layer` 时以 `opacity`
     /// 整体合成回父层。用于子树统一不透明度（避免逐节点 alpha 导致的重叠错叠）。
     fn push_layer(&mut self, opacity: f32);
