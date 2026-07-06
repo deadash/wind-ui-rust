@@ -217,7 +217,12 @@ impl TextEngine for DWriteEngine {
         };
         let mut m = DWRITE_TEXT_METRICS::default();
         unsafe { layout.GetMetrics(&mut m).ok() };
-        let sz = Size::new((m.width / s).ceil() as i32, (m.height / s).ceil() as i32);
+        // width 不含尾随空白宽度，连续空格会被折叠为同一测量值，导致光标定位到
+        // 尾随空格处时 x 坐标不再前进；改用 widthIncludingTrailingWhitespace。
+        let sz = Size::new(
+            (m.widthIncludingTrailingWhitespace / s).ceil() as i32,
+            (m.height / s).ceil() as i32,
+        );
         // 容量上限：满则清空（稳定 UI 下命中率仍极高）。
         if self.measure_cache.len() >= MEASURE_CACHE_CAP {
             self.measure_cache.clear();

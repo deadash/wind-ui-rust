@@ -1354,7 +1354,12 @@ impl Canvas for D2DCanvas<'_> {
         if unsafe { layout.GetMetrics(&mut m) }.is_err() {
             return fallback();
         }
-        crate::geometry::Size::new(m.width.ceil() as i32, m.height.ceil() as i32)
+        // DWRITE_TEXT_METRICS::width 不含尾随空白宽度（连续空格会被折叠为同一宽度），
+        // 导致光标定位到尾随空格处时 x 坐标不再前进；改用 widthIncludingTrailingWhitespace。
+        crate::geometry::Size::new(
+            m.widthIncludingTrailingWhitespace.ceil() as i32,
+            m.height.ceil() as i32,
+        )
     }
 
     fn measure_text_wrapped(
