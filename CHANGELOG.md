@@ -5,6 +5,22 @@
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-07-06
+
+### Fixed
+- **连续空格中光标无法移动**：`DWRITE_TEXT_METRICS::width` 不含尾随空白宽度，导致以
+  空格结尾的子串测量宽度被折叠为同一值——文本框光标索引在连续空格中正确递增，但换算出的
+  视觉 x 坐标不再前进，表现为"光标卡在第一个非空格字符处"。改用
+  `widthIncludingTrailingWhitespace` 字段（`src/text/dwrite.rs`、`src/platform/win32/d2d.rs`）。
+- **输入法组合态期间自绘光标位置错误**：拼音等未上屏组合期间，`TextInput`/`Stepper` 自绘的
+  光标条停留在组合开始前的位置不动，与系统组合浮层里跟随合成进度前进的光标同时存在，视觉上
+  像卡住。新增 `Widget::set_composing`，由平台层在 Windows 的
+  `WM_IME_STARTCOMPOSITION`/`WM_IME_ENDCOMPOSITION`、macOS 的
+  `setMarkedText`/`unmarkText`/`insertText:` 时通知焦点控件，组合期间跳过自绘光标绘制，
+  交由系统浮层呈现。
+- **输入法组合串字体与正文不一致**：Windows 合成串 `LOGFONTW.lfFaceName` 之前留空，系统常
+  回退到陈旧的宋体；现显式指定为与正文渲染同族的 `Microsoft YaHei UI`。
+
 ## [0.8.1] - 2026-07-06
 
 ### Added
