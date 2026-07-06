@@ -315,6 +315,12 @@ pub trait AppHandler {
     fn take_window_op(&mut self) -> Option<WindowOp> {
         None
     }
+
+    /// 取出并清除待执行的原生文件对话框请求。平台在事件分发**完全返回**（OS 侧鼠标
+    /// 捕获已同步）之后才调用，避免在事件回调栈内重入阻塞式模态对话框。
+    fn take_dialog_request(&mut self) -> Option<DialogRequest> {
+        None
+    }
 }
 
 // ── 文件 / 目录选择对话框 ────────────────────────────────────────────────────
@@ -442,5 +448,41 @@ impl PickDialog {
     /// 打开**保存文件**对话框；用户取消返回 `None`。
     pub fn save_file(self) -> Option<PathBuf> {
         self.into_dialog().save_file()
+    }
+}
+
+/// 由 `EventCtx::request_pick_file` 等方法产生，经 `DispatchResult` 上交宿主。
+///
+/// **不要**在控件事件回调里直接调用 `PickDialog::pick_file()` 等同步方法——那会在事件
+/// 分发的调用栈深处同步进入模态对话框自己的消息泵，而此时本窗口的 OS 鼠标捕获
+/// （`SetCapture`）可能还未来得及释放，导致对话框与主窗口抢鼠标输入，多次开关后
+/// 会让内部捕获状态与 OS 实际状态错位，表现为鼠标彻底失灵。应改用 `EventCtx` 上的
+/// `request_*` 方法：把对话框配置和拿到结果后的延续回调打包成请求，交给宿主在事件
+/// 分发彻底返回、OS 输入状态已同步之后再真正弹出。
+pub enum DialogRequest {
+    PickFile(PickDialog, Box<dyn FnOnce(Option<PathBuf>)>),
+    PickFiles(PickDialog, Box<dyn FnOnce(Option<Vec<PathBuf>>)>),
+    PickFolder(PickDialog, Box<dyn FnOnce(Option<PathBuf>)>),
+    PickFolders(PickDialog, Box<dyn FnOnce(Option<Vec<PathBuf>>)>),
+    SaveFile(PickDialog, Box<dyn FnOnce(Option<PathBuf>)>),
+    /// 逃生舱：任意一段包含若干阻塞式原生调用的流程（如"选文件→校验→选目录→确认"，
+    /// 中间还要穿插 `MessageBoxW` 之类的系统模态框）。当单个 `PickFile`/`SaveFile`
+    /// 装不下这种多步序列时用这个——闭包在事件分发完全返回之后运行，此时已不在
+    /// 事件回调栈内，闭包内可以放心直接同步调用任意数量的阻塞式原生 API。
+    Custom(Box<dyn FnOnce()>),
+}
+
+impl DialogRequest {
+    /// 真正执行阻塞的原生对话框调用并触发延续回调。调用方须保证此时事件分发已
+    /// 完全返回（OS 鼠标捕获等已同步），不会与对话框自身的模态消息泵冲突。
+    pub fn run(self) {
+        match self {
+            DialogRequest::PickFile(d, cb) => cb(d.pick_file()),
+            DialogRequest::PickFiles(d, cb) => cb(d.pick_files()),
+            DialogRequest::PickFolder(d, cb) => cb(d.pick_folder()),
+            DialogRequest::PickFolders(d, cb) => cb(d.pick_folders()),
+            DialogRequest::SaveFile(d, cb) => cb(d.save_file()),
+            DialogRequest::Custom(f) => f(),
+        }
     }
 }

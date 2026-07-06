@@ -1075,6 +1075,22 @@ unsafe fn apply_window_op(hwnd: HWND) {
     }
 }
 
+/// 事件分发后执行待处理的原生文件对话框请求。此时 OS 鼠标捕获已在
+/// `dispatch_pointer_event`/`dispatch_key_event` 里同步完毕，才轮到这个可能长时间
+/// 阻塞、自带消息泵的调用——避免对话框存续期间本窗口仍持有 `SetCapture` 与其抢
+/// 鼠标输入（见 `DialogRequest` 文档）。
+///
+/// 两段式：`state_from` 的借用在取出请求的那条语句结束后即释放，`req.run()` 触发的
+/// 重入（对话框消息泵期间本窗口 WM_PAINT/WM_TIMER 等会重新进入 wnd_proc）不会与之
+/// 产生 `&mut` 别名。
+unsafe fn apply_dialog_request(hwnd: HWND) {
+    let req = state_from(hwnd).and_then(|s| s.handler.take_dialog_request());
+    let Some(req) = req else { return };
+    req.run();
+    // 延续回调多半间接改了 Signal 状态而不经过脏区系统，保守整窗重绘。
+    let _ = InvalidateRect(Some(hwnd), None, false);
+}
+
 /// 用系统默认程序打开 URL/路径（`ShellExecuteW` 的 "open" 动词）。fire-and-forget，忽略结果。
 pub fn open_url(url: &str) {
     let verb = w!("open");
@@ -1251,6 +1267,8 @@ unsafe fn dispatch_pointer_event(hwnd: HWND, ev: PointerEvent) {
     }
     // 自定义标题栏按钮请求的窗口操作（最小化/最大化）；在可能的关窗之前执行。
     apply_window_op(hwnd);
+    // 原生文件对话框请求：此时 OS 捕获已在上面同步完毕，才轮到这个阻塞调用。
+    apply_dialog_request(hwnd);
     if close {
         let _ = DestroyWindow(hwnd);
     }
@@ -1606,6 +1624,7 @@ unsafe fn dispatch_key_event(hwnd: HWND, ev: KeyEvent) {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
     apply_window_op(hwnd);
+    apply_dialog_request(hwnd);
     if close {
         let _ = DestroyWindow(hwnd);
     }

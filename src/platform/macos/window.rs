@@ -720,11 +720,15 @@ impl ContentView {
         self.after_event();
     }
 
-    /// 事件分发后：执行待处理窗口操作、应用光标、必要时关窗。
+    /// 事件分发后：执行待处理窗口操作、原生对话框请求、应用光标、必要时关窗。
     fn after_event(&self) {
-        let (op, close) = {
+        let (op, dialog, close) = {
             let mut st = self.ivars().borrow_mut();
-            (st.handler.take_window_op(), st.handler.wants_close())
+            (
+                st.handler.take_window_op(),
+                st.handler.take_dialog_request(),
+                st.handler.wants_close(),
+            )
         };
         if let Some(op) = op {
             if let Some(win) = self.window() {
@@ -733,6 +737,12 @@ impl ContentView {
                     WindowOp::ToggleMaximize => win.zoom(None),
                 }
             }
+        }
+        // 此时 borrow_mut 已释放：对话框自带模态消息泵，运行期间会重入本视图的事件
+        // 回调，须先放开借用再调用，避免与 RefCell 形成重入 panic（同 win32 两段式）。
+        if let Some(req) = dialog {
+            req.run();
+            self.setNeedsDisplay(true);
         }
         self.apply_cursor();
         if close {

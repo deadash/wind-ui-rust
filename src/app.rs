@@ -19,7 +19,7 @@ use crate::event::{
     WindowOp,
 };
 use crate::geometry::{Color, Point, Rect, Size};
-use crate::platform::{self, AppHandler, WindowConfig};
+use crate::platform::{self, AppHandler, DialogRequest, WindowConfig};
 use crate::render::{Paint, SkiaCanvas};
 use crate::signal::Signal;
 use crate::text::{PlatformTextEngine, TextEngine};
@@ -592,6 +592,8 @@ struct UiHost {
     fling: Option<Fling>,
     /// 待执行的窗口操作（自定义标题栏按钮触发，平台分发后轮询执行）。
     pending_window_op: Option<WindowOp>,
+    /// 待执行的原生文件对话框请求（平台在事件分发完全返回、OS 捕获同步后再执行）。
+    pending_dialog: Option<DialogRequest>,
     /// 最近一次指针位置（逻辑坐标），用于悬停提示浮层定位。
     hover_pos: Point,
     /// 当前悬停起始时刻（ms，单调时钟）。悬停节点变化或点击时复位；
@@ -674,6 +676,7 @@ impl UiHost {
             pan_residual: 0.0,
             fling: None,
             pending_window_op: None,
+            pending_dialog: None,
             hover_pos: Point::new(0, 0),
             hover_since_ms: 0,
             tooltip_suppressed: false,
@@ -1662,6 +1665,11 @@ impl AppHandler for UiHost {
         if res.window_op.is_some() {
             self.pending_window_op = res.window_op;
         }
+        // 原生文件对话框请求：暂存，待本次事件分发完全返回、OS 捕获同步后再执行，
+        // 避免在事件回调栈内重入阻塞式模态对话框（见 DialogRequest 文档）。
+        if res.dialog.is_some() {
+            self.pending_dialog = res.dialog;
+        }
         // 控件请求轻提示：居中浮层 + 淡入淡出 + 定时消失（强制整窗重绘以叠加浮层）。
         if let Some(req) = res.toast {
             self.show_toast(req);
@@ -1703,6 +1711,9 @@ impl AppHandler for UiHost {
         }
         if res.window_op.is_some() {
             self.pending_window_op = res.window_op;
+        }
+        if res.dialog.is_some() {
+            self.pending_dialog = res.dialog;
         }
         if let Some(req) = res.toast {
             self.show_toast(req);
@@ -1822,6 +1833,10 @@ impl AppHandler for UiHost {
 
     fn take_window_op(&mut self) -> Option<WindowOp> {
         self.pending_window_op.take()
+    }
+
+    fn take_dialog_request(&mut self) -> Option<DialogRequest> {
+        self.pending_dialog.take()
     }
 
     fn cursor(&self) -> CursorShape {

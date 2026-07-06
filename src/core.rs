@@ -14,6 +14,7 @@ use crate::event::{
     ToastKind, ToastRequest, WindowOp,
 };
 use crate::geometry::{Color, Insets, Point, Rect, Size};
+use crate::platform::{DialogRequest, PickDialog};
 use crate::render::{Canvas, Paint};
 use crate::spec::{Align, Axis, Dimension, MeasureMode, MeasureSpec};
 use crate::style::Style;
@@ -934,6 +935,8 @@ pub(crate) struct EventOutcome {
     window_op: Option<WindowOp>,
     /// 控件请求弹出的轻提示（宿主接管居中浮层渲染与定时消失）。
     toast: Option<ToastRequest>,
+    /// 控件请求弹出的原生文件对话框（宿主待事件分发完全返回后再执行，见 `DialogRequest`）。
+    dialog: Option<DialogRequest>,
 }
 
 /// 传给 `Widget::on_event` 的受控句柄：在不暴露裸 arena 的前提下操作本节点与请求副作用。
@@ -993,6 +996,56 @@ impl EventCtx<'_> {
     /// 请求把焦点移到本节点。
     pub fn request_focus(&mut self) {
         self.out.focus = Some(self.self_id);
+    }
+    /// 请求打开**单文件**选择对话框；`on_result` 在对话框关闭、事件分发完全返回后
+    /// 收到用户选择结果（取消为 `None`）。**不要**在回调里直接调用 `PickDialog::pick_file()`
+    /// 等同步方法，见 [`DialogRequest`] 文档。
+    pub fn request_pick_file(
+        &mut self,
+        dialog: PickDialog,
+        on_result: impl FnOnce(Option<PathBuf>) + 'static,
+    ) {
+        self.out.dialog = Some(DialogRequest::PickFile(dialog, Box::new(on_result)));
+    }
+    /// 请求打开**多文件**选择对话框，语义同 [`EventCtx::request_pick_file`]。
+    pub fn request_pick_files(
+        &mut self,
+        dialog: PickDialog,
+        on_result: impl FnOnce(Option<Vec<PathBuf>>) + 'static,
+    ) {
+        self.out.dialog = Some(DialogRequest::PickFiles(dialog, Box::new(on_result)));
+    }
+    /// 请求打开**单目录**选择对话框，语义同 [`EventCtx::request_pick_file`]。
+    pub fn request_pick_folder(
+        &mut self,
+        dialog: PickDialog,
+        on_result: impl FnOnce(Option<PathBuf>) + 'static,
+    ) {
+        self.out.dialog = Some(DialogRequest::PickFolder(dialog, Box::new(on_result)));
+    }
+    /// 请求打开**多目录**选择对话框，语义同 [`EventCtx::request_pick_file`]。
+    pub fn request_pick_folders(
+        &mut self,
+        dialog: PickDialog,
+        on_result: impl FnOnce(Option<Vec<PathBuf>>) + 'static,
+    ) {
+        self.out.dialog = Some(DialogRequest::PickFolders(dialog, Box::new(on_result)));
+    }
+    /// 请求打开**保存文件**对话框，语义同 [`EventCtx::request_pick_file`]。
+    pub fn request_save_file(
+        &mut self,
+        dialog: PickDialog,
+        on_result: impl FnOnce(Option<PathBuf>) + 'static,
+    ) {
+        self.out.dialog = Some(DialogRequest::SaveFile(dialog, Box::new(on_result)));
+    }
+    /// 逃生舱：把一段包含**任意数量**阻塞式原生调用（文件对话框、`MessageBoxW` 等）
+    /// 的流程延迟到事件分发完全返回之后执行。适用于"选文件→校验→选目录→确认"这类
+    /// 需要连续弹多个原生模态框、`request_pick_file` 等单对话框便捷方法表达不了的
+    /// 场景。闭包运行时已经不在事件回调栈内、OS 输入状态已同步，可以放心在里面
+    /// 直接同步调用 `PickDialog::pick_file()` 等方法或系统 `MessageBox`。
+    pub fn defer_blocking(&mut self, f: impl FnOnce() + 'static) {
+        self.out.dialog = Some(DialogRequest::Custom(Box::new(f)));
     }
     /// 本节点绝对矩形（判断指针是否仍在控件内）。
     pub fn bounds(&self) -> Rect {
@@ -1103,7 +1156,7 @@ impl EventCtx<'_> {
 }
 
 /// 指针/键盘分发的对外结果。
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct DispatchResult {
     pub repaint: bool,
     /// 本次分发累积的失效区域（宿主据此选择局部/整窗重绘）。
@@ -1120,6 +1173,8 @@ pub struct DispatchResult {
     pub window_op: Option<WindowOp>,
     /// 控件请求弹出的轻提示（宿主接管居中浮层渲染与定时消失）。
     pub toast: Option<ToastRequest>,
+    /// 控件请求弹出的原生文件对话框（宿主待事件分发完全返回后再执行）。
+    pub dialog: Option<DialogRequest>,
 }
 
 impl Tree {
@@ -1628,6 +1683,9 @@ impl Tree {
                 if o.toast.is_some() {
                     res.toast = o.toast;
                 }
+                if o.dialog.is_some() {
+                    res.dialog = o.dialog;
+                }
                 // 右键上下文菜单：节点设了 context_menu 且 widget 未自行弹菜单时，
                 // 构建项并请求级联浮层（沿父链冒泡，命中一个即止）。
                 if secondary && matches!(ev.kind, PointerKind::Down) && res.menu.is_none() {
@@ -1679,6 +1737,7 @@ impl Tree {
             res.open_url = o.open_url;
             res.window_op = o.window_op;
             res.toast = o.toast;
+            res.dialog = o.dialog;
         }
         res
     }
@@ -1721,6 +1780,9 @@ impl Tree {
             }
             if out.toast.is_some() {
                 res.toast = out.toast;
+            }
+            if out.dialog.is_some() {
+                res.dialog = out.dialog;
             }
             break; // 命中一个拖放处理者即止
         }
