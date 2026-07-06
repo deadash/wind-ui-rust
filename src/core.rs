@@ -89,6 +89,9 @@ pub trait Widget {
     fn ime_caret(&self) -> Option<(i32, i32, i32)> {
         None
     }
+    /// 输入法组合态变化（拼音等未上屏文字开始/结束合成）时由框架通知焦点节点。
+    /// 文本控件借此在组合期间暂不绘制自绘光标（系统组合浮层自带光标）。默认无操作。
+    fn set_composing(&mut self, _composing: bool) {}
     /// layout 前由框架向**已注册的响应式节点**调用（见 `Tree::register_reactive`）。
     /// 响应式控件在此检测绑定信号的版本变化，若有变化则通过 `ctx.tree_mut()` 重建子节点。
     /// 默认无操作；普通控件无需实现。
@@ -1351,6 +1354,16 @@ impl Tree {
         let (lx, ly, h) = n.widget.ime_caret()?;
         let abs = self.abs_bounds(id);
         Some((Point::new(abs.x + lx, abs.y + ly), h))
+    }
+
+    /// 把输入法组合态变化通知给节点（见 `Widget::set_composing`）。
+    /// 返回 true 表示节点存在且已通知（调用方据此判断是否需要重绘）。
+    pub fn set_composing(&mut self, id: NodeId, composing: bool) -> bool {
+        let Some(n) = self.get_mut(id) else {
+            return false;
+        };
+        n.widget.set_composing(composing);
+        true
     }
 
     /// 找 `p`（逻辑坐标）下最近的滚动容器节点（命中点向上找首个 `Layout::Scroll`）。

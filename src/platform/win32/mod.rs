@@ -62,10 +62,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
     SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST,
-    WM_NCMOUSEMOVE, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
-    WM_TIMER, WM_TOUCH, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
+    WM_NCCREATE, WM_NCHITTEST, WM_NCMOUSEMOVE, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SETCURSOR, WM_SIZE, WM_TIMER, WM_TOUCH, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
+    WS_THICKFRAME,
 };
 
 use super::{AppHandler, WindowConfig};
@@ -879,11 +880,32 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
-        // 输入法开始合成 / 合成中：把候选窗定位到焦点控件的光标处，再交默认处理。
-        // 合成期间光标不移动，重复定位到同一点是幂等的；兼顾"候选窗在合成中才出现"
-        // 的输入法（仅 STARTCOMPOSITION 可能错过候选窗放置时机）。
-        WM_IME_STARTCOMPOSITION | WM_IME_COMPOSITION => {
+        // 输入法开始合成：通知焦点控件进入组合态（自绘光标隐藏，让系统组合浮层
+        // 自带的、随组合进度前进的光标成为唯一可见光标），再定位候选窗。
+        WM_IME_STARTCOMPOSITION => {
+            let repaint = state_from(hwnd)
+                .map(|s| s.handler.set_ime_composing(true))
+                .unwrap_or(false);
+            if repaint {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
             handle_ime_position(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // 合成中：把候选窗重新定位到焦点控件的光标处，再交默认处理。重复定位到
+        // 同一点是幂等的；兼顾"候选窗在合成中才出现"的输入法。
+        WM_IME_COMPOSITION => {
+            handle_ime_position(hwnd);
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        // 输入法结束合成（提交上屏或取消）：通知焦点控件退出组合态，恢复自绘光标。
+        WM_IME_ENDCOMPOSITION => {
+            let repaint = state_from(hwnd)
+                .map(|s| s.handler.set_ime_composing(false))
+                .unwrap_or(false);
+            if repaint {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_CLOSE => {
@@ -1488,12 +1510,21 @@ unsafe fn handle_ime_position(hwnd: HWND) {
     }
     // 合成串字体：按 caret 物理高度设字高（h 已含 DPI scale），使 IME 内联绘制的
     // 合成串与我们自绘、已缩放的上屏文字大小一致。不设则 IME 用默认未缩放字体，
-    // 高 DPI 下合成串明显偏小（上屏后正常）。空 lfFaceName = 用系统默认字体族。
-    let lf = LOGFONTW {
+    // 高 DPI 下合成串明显偏小（上屏后正常）。lfFaceName 显式指定为与正文渲染同族的
+    // "Microsoft YaHei UI"（见 text::dwrite::DEFAULT_FAMILY），否则留空时系统常回退到
+    // 陈旧的 SimSun/宋体，与我们自绘文字观感不一致。
+    let mut lf = LOGFONTW {
         lfHeight: h,
         lfCharSet: DEFAULT_CHARSET,
         ..Default::default()
     };
+    for (dst, src) in lf
+        .lfFaceName
+        .iter_mut()
+        .zip("Microsoft YaHei UI".encode_utf16())
+    {
+        *dst = src;
+    }
     let _ = ImmSetCompositionFontW(himc, &lf);
     // 合成串定位在光标处。
     let cf = COMPOSITIONFORM {

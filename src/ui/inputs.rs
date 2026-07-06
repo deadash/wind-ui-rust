@@ -719,6 +719,9 @@ pub struct TextInput {
     hover_in_scrollbar: Cell<bool>,
     /// 最近一帧 paint 用的字号快照：供无 style 的命中路径换算前置图标左偏移。
     font_size_hint: Cell<f32>,
+    /// 输入法组合态（拼音等未上屏）：为 true 时暂不绘制自绘光标条，避免与系统
+    /// 组合浮层里跟随组合进度的光标重叠、显得"卡在组合开始前"。
+    composing: Cell<bool>,
 }
 
 impl TextInput {
@@ -740,6 +743,7 @@ impl TextInput {
             follow_cursor: Cell::new(true),
             hover_in_scrollbar: Cell::new(false),
             font_size_hint: Cell::new(14.0),
+            composing: Cell::new(false),
         }
     }
 
@@ -1447,7 +1451,9 @@ impl Widget for TextInput {
         // 记录光标局部位置（相对节点左上角）供输入法候选窗定位。
         self.caret_local
             .set(Some((cxx - bounds.x, ly - bounds.y, line_h)));
-        if focused {
+        // 组合态期间不画自绘光标：系统组合浮层自带随组合进度前进的光标，
+        // 两者并存会显得我们的光标"卡在组合开始前"。
+        if focused && !self.composing.get() {
             canvas.draw_line(
                 cxx as f32,
                 (ly + 2) as f32,
@@ -1758,6 +1764,9 @@ impl Widget for TextInput {
     }
     fn ime_caret(&self) -> Option<(i32, i32, i32)> {
         self.caret_local.get()
+    }
+    fn set_composing(&mut self, composing: bool) {
+        self.composing.set(composing);
     }
     fn wants_right_click(&self) -> bool {
         true // 右键弹出上下文菜单（剪切/复制/粘贴/全选）

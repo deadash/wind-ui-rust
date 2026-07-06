@@ -1929,6 +1929,13 @@ impl AppHandler for UiHost {
         ))
     }
 
+    fn set_ime_composing(&mut self, composing: bool) -> bool {
+        let Some(focus) = self.focus else {
+            return false;
+        };
+        self.tree.set_composing(focus, composing)
+    }
+
     fn on_capture_lost(&mut self) -> bool {
         self.needs_full = true;
         // 给捕获节点派发一个远处坐标的合成 Up，复用 Up 语义让其收尾

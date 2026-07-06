@@ -284,6 +284,12 @@ pub trait AppHandler {
         None
     }
 
+    /// 输入法组合态开始/结束（拼音等未上屏文字合成中）时由平台层调用，转发给
+    /// 当前焦点控件（见 `Widget::set_composing`）。返回 true 表示需要重绘。
+    fn set_ime_composing(&mut self, _composing: bool) -> bool {
+        false
+    }
+
     /// 本帧是否有控件请求持续动画。平台层据此在阻塞空闲与按帧驱动之间切换。
     fn wants_animation(&self) -> bool {
         false

@@ -220,12 +220,15 @@ define_class!(
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
         fn set_marked_text(&self, string: &AnyObject, _selected: NSRange, _replacement: NSRange) {
             // 合成态 = 还有未提交的 marked text。
-            self.ivars().borrow_mut().composing = !anyobject_to_string(string).is_empty();
+            let composing = !anyobject_to_string(string).is_empty();
+            self.ivars().borrow_mut().composing = composing;
+            self.dispatch_composing(composing);
         }
 
         #[unsafe(method(unmarkText))]
         fn unmark_text(&self) {
             self.ivars().borrow_mut().composing = false;
+            self.dispatch_composing(false);
         }
 
         #[unsafe(method(selectedRange))]
@@ -658,6 +661,7 @@ impl ContentView {
     fn ime_insert(&self, string: &AnyObject) {
         let text = anyobject_to_string(string);
         self.ivars().borrow_mut().composing = false;
+        self.dispatch_composing(false);
         for c in text.chars() {
             if c.is_control() {
                 continue;
@@ -727,6 +731,20 @@ impl ContentView {
             self.setNeedsDisplay(true);
         }
         self.after_event();
+    }
+
+    /// 通知焦点控件输入法组合态变化（见 win32 的 `WM_IME_START/ENDCOMPOSITION`）。
+    fn dispatch_composing(&self, composing: bool) {
+        let repaint = {
+            let _guard = crate::platform::EventDispatchGuard::enter();
+            self.ivars()
+                .borrow_mut()
+                .handler
+                .set_ime_composing(composing)
+        };
+        if repaint {
+            self.setNeedsDisplay(true);
+        }
     }
 
     /// 事件分发后：执行待处理窗口操作、原生对话框请求、应用光标、必要时关窗。

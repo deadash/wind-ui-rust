@@ -69,6 +69,8 @@ pub struct Stepper {
     edit_cursor: Cell<usize>,
     /// paint 中记录的光标局部坐标（相对控件左上角），供平台层定位 IME 候选窗。
     caret_local: Cell<Option<(i32, i32, i32)>>,
+    /// 输入法组合态：见 `TextInput::composing`，语义一致。
+    composing: Cell<bool>,
     /// 长按方向：0=未按 / -1=减 / +1=加。
     press_dir: Cell<i8>,
     /// 按下时的帧时钟（ms），用于计算等待/加速阶段。
@@ -100,6 +102,7 @@ impl Stepper {
             edit_buf: RefCell::new(String::new()),
             edit_cursor: Cell::new(0),
             caret_local: Cell::new(None),
+            composing: Cell::new(false),
             press_dir: Cell::new(0),
             press_start_ms: Cell::new(0),
             last_step_ms: Cell::new(0),
@@ -298,14 +301,16 @@ impl Widget for Stepper {
             let before_w = canvas.measure_text(&edit_buf[..cursor], family, fsize).w;
             let text_start_x = mid.x + (mid.w - full_w) / 2;
             let cursor_x = text_start_x + before_w;
-            canvas.draw_line(
-                cursor_x as f32,
-                (mid.y + 2) as f32,
-                cursor_x as f32,
-                (mid.y + mid.h - 2) as f32,
-                1.0,
-                &Paint::fill(pal.accent),
-            );
+            if !self.composing.get() {
+                canvas.draw_line(
+                    cursor_x as f32,
+                    (mid.y + 2) as f32,
+                    cursor_x as f32,
+                    (mid.y + mid.h - 2) as f32,
+                    1.0,
+                    &Paint::fill(pal.accent),
+                );
+            }
             // 记录局部坐标供平台层定位 IME 候选窗。
             self.caret_local
                 .set(Some((cursor_x - bounds.x, mid.y - bounds.y, mid.h)));
@@ -492,5 +497,9 @@ impl Widget for Stepper {
 
     fn ime_caret(&self) -> Option<(i32, i32, i32)> {
         self.caret_local.get()
+    }
+
+    fn set_composing(&mut self, composing: bool) {
+        self.composing.set(composing);
     }
 }
