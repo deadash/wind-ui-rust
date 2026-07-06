@@ -29,6 +29,7 @@ pub use macos::{open_url, Tray, TrayCtx, TrayMenuItem};
 #[cfg(not(any(windows, target_os = "macos")))]
 compile_error!("windui 目前仅支持 Windows 与 macOS 平台");
 
+use std::cell::Cell;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -36,6 +37,34 @@ use tiny_skia::Pixmap;
 
 use crate::event::{CursorShape, KeyEvent, MouseButton, PointerEvent, PointerKind, WindowOp};
 use crate::geometry::{Color, Point, Size};
+
+thread_local! {
+    /// 本线程是否正处于"风险事件分发窗口"内：控件 `on_pointer`/`on_key` 回调正在栈上运行，
+    /// OS 鼠标捕获尚未同步（见 win32/macos 后端 `dispatch_pointer`/`dispatch_key` 的两段式
+    /// 实现）。`PickDialog` 的阻塞方法据此在 debug 下检测误用。
+    static IN_EVENT_DISPATCH: Cell<bool> = const { Cell::new(false) };
+}
+
+/// RAII 标记：进入风险事件分发窗口，`Drop` 时自动清除（含回调 panic 时的展开路径）。
+/// 各平台后端在调用 `handler.on_pointer`/`on_key` 前后台此持有。
+pub(crate) struct EventDispatchGuard(());
+
+impl EventDispatchGuard {
+    pub(crate) fn enter() -> Self {
+        IN_EVENT_DISPATCH.with(|f| f.set(true));
+        Self(())
+    }
+}
+
+impl Drop for EventDispatchGuard {
+    fn drop(&mut self) {
+        IN_EVENT_DISPATCH.with(|f| f.set(false));
+    }
+}
+
+fn in_event_dispatch() -> bool {
+    IN_EVENT_DISPATCH.with(|f| f.get())
+}
 
 /// `Color`（非预乘 RGBA8）→ tiny-skia 颜色。各后端清屏/填底共用。
 pub(crate) fn to_skia_color(c: Color) -> tiny_skia::Color {
@@ -422,6 +451,14 @@ impl PickDialog {
     }
 
     fn into_dialog(self) -> rfd::FileDialog {
+        debug_assert!(
+            !in_event_dispatch(),
+            "PickDialog::pick_file()/pick_files()/pick_folder()/pick_folders()/save_file() \
+             不能在控件事件回调（on_click/on_event）里直接调用——此时 OS 鼠标捕获尚未同步，\
+             会与对话框自身的模态消息泵抢鼠标输入，反复开关几次就会让鼠标彻底失灵。回调里请改用 \
+             EventCtx::request_pick_file()/request_pick_files()/request_pick_folder()/\
+             request_pick_folders()/request_save_file()，多步流程用 EventCtx::defer_blocking()。"
+        );
         inject_parent(self.0)
     }
 
@@ -484,5 +521,30 @@ impl DialogRequest {
             DialogRequest::SaveFile(d, cb) => cb(d.save_file()),
             DialogRequest::Custom(f) => f(),
         }
+    }
+}
+
+#[cfg(test)]
+mod dispatch_guard_tests {
+    use super::*;
+
+    #[test]
+    fn event_dispatch_guard_tracks_state_and_clears_on_drop() {
+        assert!(!in_event_dispatch());
+        let guard = EventDispatchGuard::enter();
+        assert!(in_event_dispatch());
+        drop(guard);
+        assert!(!in_event_dispatch());
+    }
+
+    // debug_assert! 在 release 构建里被剔除——只在 debug_assertions 开启时验证 panic，
+    // 避免 release 测试构建真的跑进 into_dialog() 之后的阻塞 rfd 调用。
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "不能在控件事件回调")]
+    fn pick_dialog_panics_when_called_inside_event_dispatch() {
+        let _guard = EventDispatchGuard::enter();
+        // debug_assert! 在 into_dialog() 里先触发 panic，不会真正调用阻塞的 rfd 接口。
+        let _ = PickDialog::new().pick_folder();
     }
 }

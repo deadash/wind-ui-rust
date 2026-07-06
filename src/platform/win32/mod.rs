@@ -964,11 +964,13 @@ unsafe fn handle_drop_files(hwnd: HWND, wparam: WPARAM) {
         let Some(state) = state_from(hwnd) else {
             return;
         };
+        let _guard = super::EventDispatchGuard::enter();
         state.handler.on_drop_files(Point::new(pt.x, pt.y), paths)
     };
     if repaint {
         let _ = InvalidateRect(Some(hwnd), None, false);
     }
+    apply_dialog_request(hwnd);
     if state_from(hwnd)
         .map(|s| s.handler.wants_close())
         .unwrap_or(false)
@@ -1242,6 +1244,8 @@ unsafe fn dispatch_pointer_event(hwnd: HWND, ev: PointerEvent) {
         let Some(state) = state_from(hwnd) else {
             return;
         };
+        // 风险窗口：on_pointer 回调栈内 OS 捕获尚未同步，见 EventDispatchGuard 文档。
+        let _guard = super::EventDispatchGuard::enter();
         let repaint = state.handler.on_pointer(ev);
         (
             repaint,
@@ -1618,6 +1622,7 @@ unsafe fn dispatch_key_event(hwnd: HWND, ev: KeyEvent) {
         let Some(state) = state_from(hwnd) else {
             return;
         };
+        let _guard = super::EventDispatchGuard::enter();
         (state.handler.on_key(ev), state.handler.wants_close())
     };
     if repaint {

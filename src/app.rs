@@ -1799,6 +1799,9 @@ impl AppHandler for UiHost {
         if let Some(req) = res.toast {
             self.show_toast(req);
         }
+        if res.dialog.is_some() {
+            self.pending_dialog = res.dialog;
+        }
         res.repaint
     }
 

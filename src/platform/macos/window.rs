@@ -369,7 +369,10 @@ impl ContentView {
             (view_pt.x as f32 * scale).round() as i32,
             (view_pt.y as f32 * scale).round() as i32,
         );
-        let repaint = self.ivars().borrow_mut().handler.on_drop_files(pos, paths);
+        let repaint = {
+            let _guard = crate::platform::EventDispatchGuard::enter();
+            self.ivars().borrow_mut().handler.on_drop_files(pos, paths)
+        };
         if repaint {
             self.setNeedsDisplay(true);
         }
@@ -705,7 +708,10 @@ impl ContentView {
 
     /// 两段式分发指针事件：借用内运行 handler，释放后再做可能重入的 OS 调用。
     fn dispatch_pointer(&self, ev: PointerEvent) {
-        let repaint = self.ivars().borrow_mut().handler.on_pointer(ev);
+        let repaint = {
+            let _guard = crate::platform::EventDispatchGuard::enter();
+            self.ivars().borrow_mut().handler.on_pointer(ev)
+        };
         if repaint {
             self.setNeedsDisplay(true);
         }
@@ -713,7 +719,10 @@ impl ContentView {
     }
 
     fn dispatch_key(&self, ev: KeyEvent) {
-        let repaint = self.ivars().borrow_mut().handler.on_key(ev);
+        let repaint = {
+            let _guard = crate::platform::EventDispatchGuard::enter();
+            self.ivars().borrow_mut().handler.on_key(ev)
+        };
         if repaint {
             self.setNeedsDisplay(true);
         }
