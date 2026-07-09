@@ -1982,6 +1982,11 @@ impl AppHandler for UiHost {
                 return true;
             }
         }
+        // toast 浮层同理：面板范围内判为客户区。否则无边框窗口的自绘标题栏拖动区
+        // 会把落在其上的 toast 点击（✕ 关闭 / 右键复制菜单）当 HTCAPTION 吞掉。
+        if self.toast_rects.iter().any(|(panel, _)| panel.contains(p)) {
+            return true;
+        }
         self.tree.interactive_hit_at(p)
     }
 
