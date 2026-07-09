@@ -1131,21 +1131,26 @@ impl EventCtx<'_> {
         self.out.window_op = Some(WindowOp::ToggleMaximize);
     }
 
-    /// 默认时长（毫秒）：约 1.8s，含淡入淡出。
-    const TOAST_DEFAULT_MS: u64 = 1800;
-
     /// 弹出轻提示（中性信息）。居中浮层 + 淡入淡出 + 定时自动消失，由宿主接管。
     /// **脱离布局树**——不绑定任何节点，任意控件回调内 `ctx.toast("…")` 即可。
     pub fn toast(&mut self, text: impl Into<String>) {
-        self.toast_with(text, ToastKind::Info, Self::TOAST_DEFAULT_MS);
+        self.toast_with(text, ToastKind::Info, ToastKind::Info.default_duration_ms());
     }
     /// 弹出成功轻提示（✓ 图标），如"已添加到剪贴板"。
     pub fn toast_ok(&mut self, text: impl Into<String>) {
-        self.toast_with(text, ToastKind::Success, Self::TOAST_DEFAULT_MS);
+        self.toast_with(
+            text,
+            ToastKind::Success,
+            ToastKind::Success.default_duration_ms(),
+        );
     }
     /// 弹出错误轻提示（✕ 图标）。
     pub fn toast_err(&mut self, text: impl Into<String>) {
-        self.toast_with(text, ToastKind::Error, Self::TOAST_DEFAULT_MS);
+        self.toast_with(
+            text,
+            ToastKind::Error,
+            ToastKind::Error.default_duration_ms(),
+        );
     }
     /// 弹出轻提示（完全指定语义与时长）。`duration_ms` 含淡入淡出。
     pub fn toast_with(&mut self, text: impl Into<String>, kind: ToastKind, duration_ms: u64) {

@@ -244,6 +244,14 @@ impl ToastKind {
             ToastKind::Error => "\u{2715}",   // ✕
         }
     }
+
+    /// 该语义的默认显示时长（毫秒）。错误更持久，便于阅读/复制。
+    pub fn default_duration_ms(self) -> u64 {
+        match self {
+            ToastKind::Error => 5000,
+            ToastKind::Info | ToastKind::Success => 3000,
+        }
+    }
 }
 
 /// 控件经 `EventCtx::toast*` 发起的轻提示请求。宿主接管居中浮层渲染、淡入淡出与定时消失。
@@ -253,4 +261,15 @@ pub struct ToastRequest {
     pub kind: ToastKind,
     /// 完整显示时长（毫秒，含淡入淡出）。
     pub duration_ms: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn kind_default_durations() {
+        assert_eq!(ToastKind::Error.default_duration_ms(), 5000);
+        assert_eq!(ToastKind::Success.default_duration_ms(), 3000);
+        assert_eq!(ToastKind::Info.default_duration_ms(), 3000);
+    }
 }
