@@ -87,6 +87,8 @@ const TOAST_ICON_GAP: i32 = 12;
 const TOAST_MIN_W: i32 = 132;
 const TOAST_FADE_IN_MS: u64 = 140;
 const TOAST_FADE_OUT_MS: u64 = 280;
+/// 同屏最多堆叠的轻提示条数：超过丢最旧。
+const TOAST_MAX: usize = 4;
 
 /// 活动轻提示：内容 + 起始时刻 + 悬停暂停累计。淡入淡出/过期均按「有效流逝」推算。
 struct ToastState {
@@ -624,8 +626,8 @@ struct UiHost {
     hover_since_ms: u64,
     /// 点击后抑制提示，直到指针再次移动（避免点完控件原地又弹出盖住它）。
     tooltip_suppressed: bool,
-    /// 活动的轻提示浮层（None=无）：居中显示、淡入淡出、定时消失。
-    toast: Option<ToastState>,
+    /// 活动的轻提示浮层堆栈（先进先出，超过 `TOAST_MAX` 丢最旧）：居中显示、淡入淡出、定时消失。
+    toasts: Vec<ToastState>,
     /// 窗口背景色（与平台 fill 同色）：局部重绘的子缓冲按此填底，重建脏区与全窗一致。
     bg: Color,
     /// 持久后备缓冲（物理像素，整窗）：保留上一全窗帧，供局部帧重建未变区域。
@@ -703,7 +705,7 @@ impl UiHost {
             hover_pos: Point::new(0, 0),
             hover_since_ms: 0,
             tooltip_suppressed: false,
-            toast: None,
+            toasts: Vec::new(),
             bg,
             back: None,
             pending_damage: None,
@@ -988,14 +990,25 @@ impl UiHost {
     /// 弹出/替换轻提示：以当前单调时钟为起点，强制整窗重绘叠加浮层。
     /// 后续帧会持续推进淡入淡出并在过期后自动清除（见 render 中的浮层段）。
     fn show_toast(&mut self, req: ToastRequest) {
+        self.push_toast(req);
+        self.needs_full = true;
+    }
+    /// 压入一条 toast；超过上限丢最旧。
+    fn push_toast(&mut self, req: ToastRequest) {
         let now_ms = self.start.elapsed().as_millis() as u64;
-        self.toast = Some(ToastState {
+        if self.toasts.len() >= TOAST_MAX {
+            self.toasts.remove(0);
+        }
+        self.toasts.push(ToastState {
             req,
             shown_at_ms: now_ms,
             paused_at_ms: None,
             paused_total_ms: 0,
         });
-        self.needs_full = true;
+    }
+    /// 移除已过期（Task 3 先提供，供 render 调用）。
+    fn retain_live_toasts(&mut self, now_ms: u64) {
+        self.toasts.retain(|t| !t.expired(now_ms));
     }
 
     /// 按指针位置更新悬停路径：设置所在层悬停项，并按需展开/收起其级联子菜单。
@@ -1236,7 +1249,7 @@ impl AppHandler for UiHost {
             .map(|b| b.width() == size.w as u32 && b.height() == size.h as u32)
             .unwrap_or(false);
         let overlay = self.menu.is_some()
-            || self.toast.is_some()
+            || !self.toasts.is_empty()
             || (!self.tooltip_suppressed
                 && self.hover.and_then(|h| self.tree.node_tooltip(h)).is_some());
         // 下一帧脏区 = 动画脏区（上帧遗留）∪ 交互脏区（事件累积）。
@@ -1301,6 +1314,8 @@ impl AppHandler for UiHost {
             }
         }
         self.tree.focus_ring_visible = self.focus_visible;
+        // 过期 toast 先清除（需要 &mut self，必须在借用 self.engine 生成 canvas 之前完成）。
+        self.retain_live_toasts(now_ms);
         let mut canvas = target.make_canvas(&mut self.engine, s);
         self.tree.paint(&mut *canvas);
         // 上下文菜单浮层绘制在控件树之上（self.menu 与 self.engine 为不相交字段，借用安全）。
@@ -1497,16 +1512,8 @@ impl AppHandler for UiHost {
                 }
             }
         }
-        // 轻提示浮层：居中深色面板 + 语义图标 + 文字，淡入淡出；过期帧先清除再正常重绘。
-        if self
-            .toast
-            .as_ref()
-            .map(|t| t.expired(now_ms))
-            .unwrap_or(false)
-        {
-            self.toast = None;
-        }
-        if let Some(toast) = self.toast.as_ref() {
+        // 轻提示浮层：居中深色面板 + 语义图标 + 文字，淡入淡出（过期条已在上方清除）。
+        for toast in &self.toasts {
             let alpha = toast.alpha(now_ms);
             let pal = &self.theme.palette;
             let tt = &self.theme.toast;
@@ -2106,6 +2113,25 @@ mod tests {
     fn on_interval_registers() {
         let app = App::new("t", 100, 100).on_interval(std::time::Duration::from_millis(100), || {});
         assert_eq!(app.intervals.len(), 1);
+    }
+
+    #[test]
+    fn toast_stack_caps_at_max_and_drops_oldest() {
+        let app = App::new("t", 100, 100).content(Element::col());
+        let mut app = app.into_handler_for_test();
+        for i in 0..(TOAST_MAX + 2) {
+            app.push_toast(ToastRequest {
+                text: format!("t{i}"),
+                kind: crate::event::ToastKind::Info,
+                duration_ms: 3000,
+            });
+        }
+        assert_eq!(app.toasts.len(), TOAST_MAX, "不超过上限");
+        assert_eq!(app.toasts.first().unwrap().req.text, "t2", "最旧两条被丢弃");
+        assert_eq!(
+            app.toasts.last().unwrap().req.text,
+            format!("t{}", TOAST_MAX + 1)
+        );
     }
 
     #[test]
