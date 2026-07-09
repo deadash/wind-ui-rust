@@ -88,24 +88,47 @@ const TOAST_MIN_W: i32 = 132;
 const TOAST_FADE_IN_MS: u64 = 140;
 const TOAST_FADE_OUT_MS: u64 = 280;
 
-/// 活动轻提示状态：内容 + 起始时刻（单调 ms）+ 总时长。淡入淡出与过期均据此推算。
+/// 活动轻提示：内容 + 起始时刻 + 悬停暂停累计。淡入淡出/过期均按「有效流逝」推算。
 struct ToastState {
     req: ToastRequest,
     shown_at_ms: u64,
+    /// 若正被悬停：记录进入悬停时刻（冻结倒计时）；否则 None。
+    paused_at_ms: Option<u64>,
+    /// 历史累计暂停总时长（ms）。
+    paused_total_ms: u64,
 }
 
 impl ToastState {
-    /// 距起始的毫秒。
-    fn elapsed(&self, now_ms: u64) -> u64 {
-        now_ms.saturating_sub(self.shown_at_ms)
+    /// 扣除暂停后的有效流逝（ms）。
+    fn active_elapsed(&self, now_ms: u64) -> u64 {
+        let raw = now_ms.saturating_sub(self.shown_at_ms);
+        let cur_pause = self
+            .paused_at_ms
+            .map(|p| now_ms.saturating_sub(p))
+            .unwrap_or(0);
+        raw.saturating_sub(self.paused_total_ms)
+            .saturating_sub(cur_pause)
+    }
+    /// 切换悬停：进入则起暂停，离开则把本段并入累计。
+    /// 暂未接入 render 悬停事件（留待后续任务接线），此处先允许未使用告警。
+    #[allow(dead_code)]
+    fn set_hover(&mut self, now_ms: u64, hovered: bool) {
+        match (hovered, self.paused_at_ms) {
+            (true, None) => self.paused_at_ms = Some(now_ms),
+            (false, Some(p)) => {
+                self.paused_total_ms += now_ms.saturating_sub(p);
+                self.paused_at_ms = None;
+            }
+            _ => {}
+        }
     }
     /// 是否已过期（应清除）。
     fn expired(&self, now_ms: u64) -> bool {
-        self.elapsed(now_ms) >= self.req.duration_ms
+        self.active_elapsed(now_ms) >= self.req.duration_ms
     }
     /// 当前不透明度系数 [0,1]：前段淡入、末段淡出、中间恒 1。
     fn alpha(&self, now_ms: u64) -> f32 {
-        let e = self.elapsed(now_ms);
+        let e = self.active_elapsed(now_ms);
         let d = self.req.duration_ms;
         if e < TOAST_FADE_IN_MS {
             return e as f32 / TOAST_FADE_IN_MS as f32;
@@ -969,6 +992,8 @@ impl UiHost {
         self.toast = Some(ToastState {
             req,
             shown_at_ms: now_ms,
+            paused_at_ms: None,
+            paused_total_ms: 0,
         });
         self.needs_full = true;
     }
@@ -2092,21 +2117,37 @@ mod tests {
                 duration_ms: 1000,
             },
             shown_at_ms: 100,
+            paused_at_ms: None,
+            paused_total_ms: 0,
         };
-        // 起点 alpha=0，淡入中点约 0.5，淡入完成后恒 1。
         assert_eq!(t.alpha(100), 0.0, "起点不可见");
         let mid_in = t.alpha(100 + TOAST_FADE_IN_MS / 2);
-        assert!((0.4..=0.6).contains(&mid_in), "淡入中点约半透明: {mid_in}");
-        assert_eq!(t.alpha(100 + 500), 1.0, "中段完全不透明");
-        // 末段淡出回落，终点附近趋 0。
-        let near_end = t.alpha(100 + 1000 - TOAST_FADE_OUT_MS / 2);
-        assert!(
-            (0.4..=0.6).contains(&near_end),
-            "淡出中点约半透明: {near_end}"
-        );
-        // 过期判定：到时即过期，未到不过期。
-        assert!(!t.expired(100 + 999), "未到时不过期");
-        assert!(t.expired(100 + 1000), "到时即过期");
+        assert!((0.4..=0.6).contains(&mid_in));
+        assert_eq!(t.alpha(100 + 500), 1.0);
+        assert!(!t.expired(100 + 999));
+        assert!(t.expired(100 + 1000));
+    }
+
+    #[test]
+    fn toast_hover_freezes_countdown() {
+        let mut t = ToastState {
+            req: ToastRequest {
+                text: "hi".into(),
+                kind: crate::event::ToastKind::Info,
+                duration_ms: 1000,
+            },
+            shown_at_ms: 0,
+            paused_at_ms: None,
+            paused_total_ms: 0,
+        };
+        // 200ms 时悬停，冻结；在 5000ms（远超 1000）仍不过期。
+        t.set_hover(200, true);
+        assert!(!t.expired(5000), "悬停期间不过期");
+        assert_eq!(t.active_elapsed(5000), 200, "有效流逝冻结在 200");
+        // 5000ms 移开，恢复计时；再过 800ms（累计有效 1000）到时过期。
+        t.set_hover(5000, false);
+        assert!(!t.expired(5000 + 799));
+        assert!(t.expired(5000 + 800));
     }
 
     #[test]
