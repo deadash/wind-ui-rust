@@ -82,7 +82,7 @@ const TOOLTIP_CURSOR_DY: i32 = 20;
 const TOAST_FONT: f32 = 14.0;
 const TOAST_ICON_FONT: f32 = 18.0;
 const TOAST_PAD_X: i32 = 16;
-const TOAST_PAD_Y: i32 = 20;
+const TOAST_PAD_Y: i32 = 11;
 const TOAST_ICON_GAP: i32 = 12;
 const TOAST_MIN_W: i32 = 132;
 const TOAST_FADE_IN_MS: u64 = 140;
@@ -93,7 +93,6 @@ const TOAST_MAX: usize = 4;
 const TOAST_TOP_MARGIN: i32 = 16;
 const TOAST_GAP: i32 = 10;
 const TOAST_CLOSE_W: i32 = 22;
-const TOAST_ACCENT_W: i32 = 4;
 /// 文字换行区最小宽度：即便窗口极窄，也保留基本可读宽度（宁可面板贴边也不塌缩为 0）。
 const TOAST_TEXT_MIN_W: i32 = 60;
 
@@ -1395,8 +1394,152 @@ impl AppHandler for UiHost {
         self.retain_live_toasts(now_ms);
         let mut canvas = target.make_canvas(&mut self.engine, s);
         self.tree.paint(&mut *canvas);
+        // 悬停提示浮层（菜单激活时不显示）：悬停节点带 tooltip 且停留超过延时则弹出；
+        // 未到延时则请求下一帧——鼠标静止后无事件，需靠 anim 续帧推进计时（与不确定进度条同源）。
+        if self.menu.is_none() && !self.tooltip_suppressed {
+            if let Some(text) = self.hover.and_then(|h| self.tree.node_tooltip(h)) {
+                if now_ms.saturating_sub(self.hover_since_ms) < TOOLTIP_DELAY_MS {
+                    crate::anim::request_repaint();
+                } else {
+                    let (pal, tt) = (&self.theme.palette, &self.theme.tooltip);
+                    let ts = canvas.measure_text_wrapped(&text, None, TOOLTIP_FONT, tt.max_width());
+                    let (w, h) = (ts.w + 2 * TOOLTIP_PAD_X, ts.h + 2 * TOOLTIP_PAD_Y);
+                    let ws = self.logical_size;
+                    let mut x = self.hover_pos.x + TOOLTIP_CURSOR_DX;
+                    let mut y = self.hover_pos.y + TOOLTIP_CURSOR_DY;
+                    if ws.w > 0 && x + w > ws.w {
+                        x = (ws.w - w).max(0);
+                    }
+                    if ws.h > 0 && y + h > ws.h {
+                        y = (self.hover_pos.y - h - 4).max(0); // 下方放不下则翻到指针上方
+                    }
+                    let corner = tt.corner(&self.theme.metrics);
+                    canvas.fill_round_rect(
+                        x as f32,
+                        y as f32,
+                        w as f32,
+                        h as f32,
+                        corner,
+                        &Paint::fill(tt.bg(pal)),
+                    );
+                    let tr = Rect::new(x + TOOLTIP_PAD_X, y, w - 2 * TOOLTIP_PAD_X, h);
+                    canvas.draw_text(
+                        &text,
+                        tr,
+                        tt.text(pal),
+                        crate::spec::Align::Start,
+                        None,
+                        TOOLTIP_FONT,
+                    );
+                }
+            }
+        }
+        // 轻提示浮层：顶部居中堆叠，单条横向 [图标][文字][✕关闭]，淡入淡出
+        // （过期条已在上方清除）。命中矩形逐帧重算写入 toast_rects，供点击测试使用。
+        self.toast_rects.clear();
+        let ws = self.logical_size;
+        let mut y = TOAST_TOP_MARGIN;
+        for toast in &self.toasts {
+            let alpha = toast.alpha(now_ms);
+            let pal = &self.theme.palette;
+            let tt = &self.theme.toast;
+            let glyph = toast.req.kind.glyph();
+            let icon_color = match toast.req.kind {
+                crate::event::ToastKind::Info => tt.info(pal),
+                crate::event::ToastKind::Success => tt.success(pal),
+                crate::event::ToastKind::Error => tt.error(pal),
+            };
+            let icon_sz = canvas.measure_text(glyph, None, TOAST_ICON_FONT);
+            // 面板宽度上限：两侧各留 TOAST_TOP_MARGIN，保证不越窗口边界。
+            let panel_max_w = (ws.w - 2 * TOAST_TOP_MARGIN).max(TOAST_MIN_W);
+            // 文字最大宽度＝面板上限减去强调条/内边距/图标/图标间距/✕区/右内边距。
+            let text_max_w = (panel_max_w
+                - TOAST_PAD_X
+                - icon_sz.w
+                - TOAST_ICON_GAP
+                - TOAST_ICON_GAP
+                - TOAST_CLOSE_W
+                - TOAST_PAD_X)
+                .max(TOAST_TEXT_MIN_W);
+            // 按 text_max_w 换行测量：短文本一行内即可测完，长文本自动折成多行。
+            let ts =
+                canvas.measure_text_wrapped(&toast.req.text, None, TOAST_FONT, text_max_w as f32);
+            let panel_w = (TOAST_PAD_X
+                + icon_sz.w
+                + TOAST_ICON_GAP
+                + ts.w
+                + TOAST_ICON_GAP
+                + TOAST_CLOSE_W
+                + TOAST_PAD_X)
+                .max(TOAST_MIN_W)
+                .min(panel_max_w);
+            let panel_h = TOAST_PAD_Y + ts.h.max(icon_sz.h) + TOAST_PAD_Y;
+            let x = ((ws.w - panel_w) / 2).max(0);
+            let corner = tt.corner(&self.theme.metrics);
+            // 柔和投影（透明度跟随淡入淡出）。
+            canvas.draw_shadow(
+                x as f32,
+                (y + 6) as f32,
+                panel_w as f32,
+                panel_h as f32,
+                corner,
+                22.0,
+                Color::rgba(0, 0, 0, 90).scale_alpha(alpha),
+            );
+            canvas.fill_round_rect(
+                x as f32,
+                y as f32,
+                panel_w as f32,
+                panel_h as f32,
+                corner,
+                &Paint::fill(tt.bg(pal).scale_alpha(alpha)),
+            );
+            // 图标：面板左侧，垂直居中。
+            let icon_x = x + TOAST_PAD_X;
+            let icon_rect = Rect::new(icon_x, y, icon_sz.w, panel_h);
+            canvas.draw_text(
+                glyph,
+                icon_rect,
+                icon_color.scale_alpha(alpha),
+                crate::spec::Align::Center,
+                None,
+                TOAST_ICON_FONT,
+            );
+            // 文字：图标右侧，垂直居中、左对齐；rect 宽用 text_max_w（而非 ts.w）
+            // 以保证绘制时的换行宽度与测量时一致（长文本才需要换行，短文本本就不超）。
+            let text_x = icon_x + icon_sz.w + TOAST_ICON_GAP;
+            let text_rect = Rect::new(text_x, y, text_max_w, panel_h);
+            canvas.draw_text(
+                &toast.req.text,
+                text_rect,
+                tt.text(pal).scale_alpha(alpha),
+                crate::spec::Align::Start,
+                None,
+                TOAST_FONT,
+            );
+            // ✕ 关闭：面板右侧固定宽区域。
+            let close = Rect::new(
+                x + panel_w - TOAST_CLOSE_W - TOAST_PAD_X / 2,
+                y,
+                TOAST_CLOSE_W,
+                panel_h,
+            );
+            canvas.draw_text(
+                "\u{2715}",
+                close,
+                pal.text_muted.scale_alpha(alpha),
+                crate::spec::Align::Center,
+                None,
+                TOAST_FONT,
+            );
+            let panel = Rect::new(x, y, panel_w, panel_h);
+            self.toast_rects.push((panel, close));
+            y += panel_h + TOAST_GAP;
+            // 持续推进淡入淡出与过期：请求下一帧。
+            crate::anim::request_repaint();
+        }
         // 上下文菜单浮层绘制在控件树之上（self.menu 与 self.engine 为不相交字段，借用安全）。
-        // 级联：从根到子菜单逐级绘制（子菜单覆盖在上）。
+        // 级联：从根到子菜单逐级绘制（子菜单覆盖在上）。绘制在 toast 之后，确保菜单不被 toast 遮挡。
         if let Some(menu) = self.menu.as_ref() {
             let (pal, mt) = (&self.theme.palette, &self.theme.menu);
             for (li, level) in menu.levels.iter().enumerate() {
@@ -1548,161 +1691,6 @@ impl AppHandler for UiHost {
                     );
                 }
             }
-        }
-        // 悬停提示浮层（菜单激活时不显示）：悬停节点带 tooltip 且停留超过延时则弹出；
-        // 未到延时则请求下一帧——鼠标静止后无事件，需靠 anim 续帧推进计时（与不确定进度条同源）。
-        if self.menu.is_none() && !self.tooltip_suppressed {
-            if let Some(text) = self.hover.and_then(|h| self.tree.node_tooltip(h)) {
-                if now_ms.saturating_sub(self.hover_since_ms) < TOOLTIP_DELAY_MS {
-                    crate::anim::request_repaint();
-                } else {
-                    let (pal, tt) = (&self.theme.palette, &self.theme.tooltip);
-                    let ts = canvas.measure_text_wrapped(&text, None, TOOLTIP_FONT, tt.max_width());
-                    let (w, h) = (ts.w + 2 * TOOLTIP_PAD_X, ts.h + 2 * TOOLTIP_PAD_Y);
-                    let ws = self.logical_size;
-                    let mut x = self.hover_pos.x + TOOLTIP_CURSOR_DX;
-                    let mut y = self.hover_pos.y + TOOLTIP_CURSOR_DY;
-                    if ws.w > 0 && x + w > ws.w {
-                        x = (ws.w - w).max(0);
-                    }
-                    if ws.h > 0 && y + h > ws.h {
-                        y = (self.hover_pos.y - h - 4).max(0); // 下方放不下则翻到指针上方
-                    }
-                    let corner = tt.corner(&self.theme.metrics);
-                    canvas.fill_round_rect(
-                        x as f32,
-                        y as f32,
-                        w as f32,
-                        h as f32,
-                        corner,
-                        &Paint::fill(tt.bg(pal)),
-                    );
-                    let tr = Rect::new(x + TOOLTIP_PAD_X, y, w - 2 * TOOLTIP_PAD_X, h);
-                    canvas.draw_text(
-                        &text,
-                        tr,
-                        tt.text(pal),
-                        crate::spec::Align::Start,
-                        None,
-                        TOOLTIP_FONT,
-                    );
-                }
-            }
-        }
-        // 轻提示浮层：顶部居中堆叠，单条横向 [左强调色条][图标][文字][✕关闭]，淡入淡出
-        // （过期条已在上方清除）。命中矩形逐帧重算写入 toast_rects，供点击测试使用。
-        self.toast_rects.clear();
-        let ws = self.logical_size;
-        let mut y = TOAST_TOP_MARGIN;
-        for toast in &self.toasts {
-            let alpha = toast.alpha(now_ms);
-            let pal = &self.theme.palette;
-            let tt = &self.theme.toast;
-            let glyph = toast.req.kind.glyph();
-            let icon_color = match toast.req.kind {
-                crate::event::ToastKind::Info => tt.info(pal),
-                crate::event::ToastKind::Success => tt.success(pal),
-                crate::event::ToastKind::Error => tt.error(pal),
-            };
-            let icon_sz = canvas.measure_text(glyph, None, TOAST_ICON_FONT);
-            // 面板宽度上限：两侧各留 TOAST_TOP_MARGIN，保证不越窗口边界。
-            let panel_max_w = (ws.w - 2 * TOAST_TOP_MARGIN).max(TOAST_MIN_W);
-            // 文字最大宽度＝面板上限减去强调条/内边距/图标/图标间距/✕区/右内边距。
-            let text_max_w = (panel_max_w
-                - TOAST_ACCENT_W
-                - TOAST_PAD_X
-                - icon_sz.w
-                - TOAST_ICON_GAP
-                - TOAST_ICON_GAP
-                - TOAST_CLOSE_W
-                - TOAST_PAD_X)
-                .max(TOAST_TEXT_MIN_W);
-            // 按 text_max_w 换行测量：短文本一行内即可测完，长文本自动折成多行。
-            let ts =
-                canvas.measure_text_wrapped(&toast.req.text, None, TOAST_FONT, text_max_w as f32);
-            let panel_w = (TOAST_ACCENT_W
-                + TOAST_PAD_X
-                + icon_sz.w
-                + TOAST_ICON_GAP
-                + ts.w
-                + TOAST_ICON_GAP
-                + TOAST_CLOSE_W
-                + TOAST_PAD_X)
-                .max(TOAST_MIN_W)
-                .min(panel_max_w);
-            let panel_h = TOAST_PAD_Y + ts.h.max(icon_sz.h) + TOAST_PAD_Y;
-            let x = ((ws.w - panel_w) / 2).max(0);
-            let corner = tt.corner(&self.theme.metrics);
-            // 柔和投影（透明度跟随淡入淡出）。
-            canvas.draw_shadow(
-                x as f32,
-                (y + 6) as f32,
-                panel_w as f32,
-                panel_h as f32,
-                corner,
-                22.0,
-                Color::rgba(0, 0, 0, 90).scale_alpha(alpha),
-            );
-            canvas.fill_round_rect(
-                x as f32,
-                y as f32,
-                panel_w as f32,
-                panel_h as f32,
-                corner,
-                &Paint::fill(tt.bg(pal).scale_alpha(alpha)),
-            );
-            // 左强调色条：按 kind 取语义色，标出面板全高。
-            canvas.fill_round_rect(
-                x as f32,
-                y as f32,
-                TOAST_ACCENT_W as f32,
-                panel_h as f32,
-                0.0,
-                &Paint::fill(icon_color.scale_alpha(alpha)),
-            );
-            // 图标：强调条右侧，垂直居中。
-            let icon_x = x + TOAST_ACCENT_W + TOAST_PAD_X;
-            let icon_rect = Rect::new(icon_x, y, icon_sz.w, panel_h);
-            canvas.draw_text(
-                glyph,
-                icon_rect,
-                icon_color.scale_alpha(alpha),
-                crate::spec::Align::Center,
-                None,
-                TOAST_ICON_FONT,
-            );
-            // 文字：图标右侧，垂直居中、左对齐；rect 宽用 text_max_w（而非 ts.w）
-            // 以保证绘制时的换行宽度与测量时一致（长文本才需要换行，短文本本就不超）。
-            let text_x = icon_x + icon_sz.w + TOAST_ICON_GAP;
-            let text_rect = Rect::new(text_x, y, text_max_w, panel_h);
-            canvas.draw_text(
-                &toast.req.text,
-                text_rect,
-                tt.text(pal).scale_alpha(alpha),
-                crate::spec::Align::Start,
-                None,
-                TOAST_FONT,
-            );
-            // ✕ 关闭：面板右侧固定宽区域。
-            let close = Rect::new(
-                x + panel_w - TOAST_CLOSE_W - TOAST_PAD_X / 2,
-                y,
-                TOAST_CLOSE_W,
-                panel_h,
-            );
-            canvas.draw_text(
-                "\u{2715}",
-                close,
-                pal.text_muted.scale_alpha(alpha),
-                crate::spec::Align::Center,
-                None,
-                TOAST_FONT,
-            );
-            let panel = Rect::new(x, y, panel_w, panel_h);
-            self.toast_rects.push((panel, close));
-            y += panel_h + TOAST_GAP;
-            // 持续推进淡入淡出与过期：请求下一帧。
-            crate::anim::request_repaint();
         }
         // 帧耗时浮层（WINDUI_FPS=1）：左上角显示本帧渲染耗时与估算 fps，用于排查卡顿。
         if self.show_fps {
