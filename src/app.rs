@@ -94,6 +94,8 @@ const TOAST_TOP_MARGIN: i32 = 16;
 const TOAST_GAP: i32 = 10;
 const TOAST_CLOSE_W: i32 = 22;
 const TOAST_ACCENT_W: i32 = 4;
+/// 文字换行区最小宽度：即便窗口极窄，也保留基本可读宽度（宁可面板贴边也不塌缩为 0）。
+const TOAST_TEXT_MIN_W: i32 = 60;
 
 /// 活动轻提示：内容 + 起始时刻 + 悬停暂停累计。淡入淡出/过期均按「有效流逝」推算。
 struct ToastState {
@@ -1535,8 +1537,22 @@ impl AppHandler for UiHost {
                 crate::event::ToastKind::Success => tt.success(pal),
                 crate::event::ToastKind::Error => tt.error(pal),
             };
-            let ts = canvas.measure_text(&toast.req.text, None, TOAST_FONT);
             let icon_sz = canvas.measure_text(glyph, None, TOAST_ICON_FONT);
+            // 面板宽度上限：两侧各留 TOAST_TOP_MARGIN，保证不越窗口边界。
+            let panel_max_w = (ws.w - 2 * TOAST_TOP_MARGIN).max(TOAST_MIN_W);
+            // 文字最大宽度＝面板上限减去强调条/内边距/图标/图标间距/✕区/右内边距。
+            let text_max_w = (panel_max_w
+                - TOAST_ACCENT_W
+                - TOAST_PAD_X
+                - icon_sz.w
+                - TOAST_ICON_GAP
+                - TOAST_ICON_GAP
+                - TOAST_CLOSE_W
+                - TOAST_PAD_X)
+                .max(TOAST_TEXT_MIN_W);
+            // 按 text_max_w 换行测量：短文本一行内即可测完，长文本自动折成多行。
+            let ts =
+                canvas.measure_text_wrapped(&toast.req.text, None, TOAST_FONT, text_max_w as f32);
             let panel_w = (TOAST_ACCENT_W
                 + TOAST_PAD_X
                 + icon_sz.w
@@ -1545,7 +1561,8 @@ impl AppHandler for UiHost {
                 + TOAST_ICON_GAP
                 + TOAST_CLOSE_W
                 + TOAST_PAD_X)
-                .max(TOAST_MIN_W);
+                .max(TOAST_MIN_W)
+                .min(panel_max_w);
             let panel_h = TOAST_PAD_Y + ts.h.max(icon_sz.h) + TOAST_PAD_Y;
             let x = ((ws.w - panel_w) / 2).max(0);
             let corner = tt.corner(&self.theme.metrics);
@@ -1587,9 +1604,10 @@ impl AppHandler for UiHost {
                 None,
                 TOAST_ICON_FONT,
             );
-            // 文字：图标右侧，垂直居中、左对齐。
+            // 文字：图标右侧，垂直居中、左对齐；rect 宽用 text_max_w（而非 ts.w）
+            // 以保证绘制时的换行宽度与测量时一致（长文本才需要换行，短文本本就不超）。
             let text_x = icon_x + icon_sz.w + TOAST_ICON_GAP;
-            let text_rect = Rect::new(text_x, y, ts.w, panel_h);
+            let text_rect = Rect::new(text_x, y, text_max_w, panel_h);
             canvas.draw_text(
                 &toast.req.text,
                 text_rect,
