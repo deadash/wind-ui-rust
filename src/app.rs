@@ -119,8 +119,6 @@ impl ToastState {
             .saturating_sub(cur_pause)
     }
     /// 切换悬停：进入则起暂停，离开则把本段并入累计。
-    /// 暂未接入 render 悬停事件（留待后续任务接线），此处先允许未使用告警。
-    #[allow(dead_code)]
     fn set_hover(&mut self, now_ms: u64, hovered: bool) {
         match (hovered, self.paused_at_ms) {
             (true, None) => self.paused_at_ms = Some(now_ms),
@@ -1198,6 +1196,75 @@ impl UiHost {
         self.focus = nf;
         true
     }
+
+    /// toast 面板命中测试（逻辑坐标）→ 命中条的下标。
+    fn toast_hit(&self, p: Point) -> Option<usize> {
+        self.toast_rects
+            .iter()
+            .position(|(panel, _)| panel.contains(p))
+    }
+    /// toast ✕ 关闭按钮命中测试（逻辑坐标）→ 命中条的下标。
+    fn toast_close_hit(&self, p: Point) -> Option<usize> {
+        self.toast_rects
+            .iter()
+            .position(|(_, close)| close.contains(p))
+    }
+
+    /// toast 浮层指针交互：命中则消费（悬停暂停 / ✕关闭 / 右键复制）。
+    fn handle_toast_pointer(&mut self, ev: crate::event::PointerEvent) -> bool {
+        use crate::event::{MenuAction, MenuItem, MouseButton, PointerKind};
+        let now_ms = self.start.elapsed().as_millis() as u64;
+        // 悬停暂停：逐条按是否命中切换（未命中该条则恢复计时）。
+        let hit = self.toast_hit(ev.pos);
+        for (i, t) in self.toasts.iter_mut().enumerate() {
+            t.set_hover(now_ms, Some(i) == hit);
+        }
+        if hit.is_some() {
+            self.needs_full = true; // 冻结/恢复需重绘
+        }
+        // 主键按下命中 ✕：移除该条。
+        if ev.kind == PointerKind::Down && ev.button == MouseButton::Left {
+            if let Some(i) = self.toast_close_hit(ev.pos) {
+                self.toasts.remove(i);
+                self.needs_full = true;
+                self.swallow_up = true; // 吞掉配对 Up
+                return true;
+            }
+        }
+        // 右键命中面板：弹「复制内容」菜单。
+        if ev.kind == PointerKind::Down && ev.button == MouseButton::Right {
+            if let Some(i) = hit {
+                let text = self.toasts[i].req.text.clone();
+                let item = MenuItem {
+                    label: "复制内容".to_string(),
+                    action: MenuAction::Run(std::rc::Rc::new(move || {
+                        use crate::core::ClipboardProvider;
+                        crate::platform::Clipboard.set_text(&text);
+                    })),
+                    enabled: true,
+                    checked: false,
+                    icon: None,
+                    shortcut: None,
+                    separator: false,
+                    submenu: Vec::new(),
+                };
+                if let Some(target) = self.focus.or(self.tree.root) {
+                    self.open_menu(
+                        crate::event::MenuRequest {
+                            pos: ev.pos,
+                            items: vec![item],
+                            min_width: 0,
+                            anchor_top: None,
+                        },
+                        target,
+                    );
+                }
+                return true;
+            }
+        }
+        // 命中面板（非✕、非右键）：吞掉，避免点穿到下方控件。
+        hit.is_some()
+    }
 }
 
 impl AppHandler for UiHost {
@@ -1689,6 +1756,10 @@ impl AppHandler for UiHost {
         // 菜单激活时独占指针：命中项/点外关闭，不下发到控件树。
         if self.menu.is_some() {
             return self.handle_menu_pointer(ev);
+        }
+        // toast 浮层在控件树之上：命中则独占该事件。
+        if !self.toasts.is_empty() && self.handle_toast_pointer(ev) {
+            return true;
         }
         // 关闭浮层的那次点击：Down 已关菜单，配对的 Up 在此吞掉（不重新激活下方控件）。
         // 新的一次按下（非关闭浮层）清掉标记，确保只吞紧随关闭的那一个 Up。
@@ -2234,6 +2305,26 @@ mod tests {
         t.set_hover(5000, false);
         assert!(!t.expired(5000 + 799));
         assert!(t.expired(5000 + 800));
+    }
+
+    #[test]
+    fn toast_hit_and_close_hit() {
+        use crate::geometry::Point;
+        let app = App::new("t", 400, 300).content(Element::col());
+        let mut app = app.into_handler_for_test();
+        app.toast_rects = vec![
+            (Rect::new(100, 16, 200, 44), Rect::new(280, 16, 22, 44)),
+            (Rect::new(100, 70, 200, 44), Rect::new(280, 70, 22, 44)),
+        ];
+        assert_eq!(app.toast_hit(Point::new(150, 30)), Some(0));
+        assert_eq!(app.toast_hit(Point::new(150, 84)), Some(1));
+        assert_eq!(app.toast_hit(Point::new(10, 10)), None);
+        assert_eq!(app.toast_close_hit(Point::new(285, 30)), Some(0));
+        assert_eq!(
+            app.toast_close_hit(Point::new(150, 30)),
+            None,
+            "面板内非✕区不算关闭"
+        );
     }
 
     #[test]
