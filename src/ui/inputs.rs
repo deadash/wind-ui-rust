@@ -37,6 +37,8 @@ pub struct CheckBox {
     state: Signal<bool>,
     /// 勾选填充补间（0=未选、1=选中）：驱动方框底色 white↔accent + 对勾淡入。
     fill: Cell<Transition<f32>>,
+    /// 显隐翻转经 `reset_interaction` 复位；复显时首帧靠 `primed` 瞬时落定填充，不回放动画。
+    primed: Cell<bool>,
     /// 点击拦截回调（受控模式）。设了它，点击/键盘激活只调回调、不自动翻转 `state`，
     /// 渲染完全跟随 `state` 当前值——app 可在翻转前弹确认、确认后再 `state.set(..)`。
     on_toggle: Option<ClickFn>,
@@ -52,6 +54,7 @@ impl CheckBox {
             label,
             state,
             fill: Cell::new(Transition::new(init)),
+            primed: Cell::new(false),
             on_toggle: None,
             intent: Intent::Primary,
             size: CheckBoxSize::Normal,
@@ -130,7 +133,11 @@ impl Widget for CheckBox {
         // 勾选填充补间：据状态改向，amount 驱动底色渐变 + 边框淡出 + 对勾淡入。
         let mut fill = self.fill.get();
         let target = if self.state.get() { 1.0 } else { 0.0 };
-        if fill.target() != target {
+        if !self.primed.get() {
+            // 首帧/对话框复显：瞬时落定到当前状态，不回放动画。
+            fill = Transition::new(target);
+            self.primed.set(true);
+        } else if fill.target() != target {
             fill.retarget(target, th.anim.fast(), Easing::EaseOut);
         }
         let amount = fill.animate();
@@ -219,6 +226,9 @@ impl Widget for CheckBox {
     fn take_click(&mut self, f: ClickFn) {
         self.on_toggle = Some(f);
     }
+    fn reset_interaction(&mut self) {
+        self.primed.set(false); // 下次显示瞬时落定填充，不回放旧的勾选动画
+    }
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
         Some(self)
     }
@@ -255,6 +265,8 @@ pub struct Switch {
     state: Signal<bool>,
     /// 滑块位置补间（0=关、1=开）；同时驱动轨道色 off↔on 渐变。retarget-in-paint。
     pos: Cell<Transition<f32>>,
+    /// 显隐翻转经 `reset_interaction` 复位；复显时首帧靠 `primed` 瞬时落定位置，不回放动画。
+    primed: Cell<bool>,
     size: SwitchSize,
 }
 
@@ -264,6 +276,7 @@ impl Switch {
         Self {
             state,
             pos: Cell::new(Transition::new(init)),
+            primed: Cell::new(false),
             size: SwitchSize::Normal,
         }
     }
@@ -302,7 +315,11 @@ impl Widget for Switch {
         // 滑块位置补间：据当前状态改向，取动画值（0..1）同时驱动 knob 平移与轨道色渐变。
         let mut pos = self.pos.get();
         let target = if on { 1.0 } else { 0.0 };
-        if pos.target() != target {
+        if !self.primed.get() {
+            // 首帧/对话框复显：瞬时落定到当前状态，不回放动画。
+            pos = Transition::new(target);
+            self.primed.set(true);
+        } else if pos.target() != target {
             pos.retarget(target, th.anim.normal(), Easing::EaseInOut);
         }
         let amount = pos.animate();
@@ -345,6 +362,9 @@ impl Widget for Switch {
             _ => false,
         }
     }
+    fn reset_interaction(&mut self) {
+        self.primed.set(false); // 下次显示瞬时落定位置，不回放旧的开关滑动动画
+    }
     fn focusable(&self) -> bool {
         true
     }
@@ -361,6 +381,8 @@ pub struct RadioButton {
     index: usize,
     /// 选中补间（0=未选、1=选中）：驱动外环色 + 环厚 + 中心点半径。
     sel: Cell<Transition<f32>>,
+    /// 显隐翻转经 `reset_interaction` 复位；复显时首帧靠 `primed` 瞬时落定选中态，不回放动画。
+    primed: Cell<bool>,
 }
 
 impl RadioButton {
@@ -371,6 +393,7 @@ impl RadioButton {
             group,
             index,
             sel: Cell::new(Transition::new(init)),
+            primed: Cell::new(false),
         }
     }
     fn selected(&self) -> bool {
@@ -417,7 +440,11 @@ impl Widget for RadioButton {
         // 选中补间：amount 驱动外环色(track→accent)、环厚(1.5→5)、中心点半径(0→outer-8)。
         let mut sel = self.sel.get();
         let target = if self.selected() { 1.0 } else { 0.0 };
-        if sel.target() != target {
+        if !self.primed.get() {
+            // 首帧/对话框复显：瞬时落定到当前选中态，不回放动画。
+            sel = Transition::new(target);
+            self.primed.set(true);
+        } else if sel.target() != target {
             sel.retarget(target, th.anim.fast(), Easing::EaseOut);
         }
         let amount = sel.animate();
@@ -471,6 +498,9 @@ impl Widget for RadioButton {
             }
             _ => false,
         }
+    }
+    fn reset_interaction(&mut self) {
+        self.primed.set(false); // 下次显示瞬时落定选中态，不回放旧的单选动画
     }
     fn focusable(&self) -> bool {
         true
@@ -1768,6 +1798,15 @@ impl Widget for TextInput {
     fn set_composing(&mut self, composing: bool) {
         self.composing.set(composing);
     }
+    fn reset_interaction(&mut self) {
+        // 复用同一对话框切换编辑目标时（隐藏→再显示），清掉上一条残留的选区/拖选状态，
+        // 光标落到（新填充文本的）文末，避免带着旧选区进入下一次编辑。
+        self.anchor = None;
+        self.cursor = self.char_count();
+        self.dragging = false;
+        self.goal_x.set(None);
+        self.follow_cursor.set(true);
+    }
     fn wants_right_click(&self) -> bool {
         true // 右键弹出上下文菜单（剪切/复制/粘贴/全选）
     }
@@ -1789,6 +1828,21 @@ mod tests {
     fn run(s: &str, idx: usize) -> (usize, usize) {
         let chars: Vec<char> = s.chars().collect();
         word_run(&chars, idx)
+    }
+
+    #[test]
+    fn reset_interaction_clears_selection() {
+        use crate::core::Widget;
+        // 复用同一对话框切换编辑目标：隐藏时框架调 reset_interaction 应清掉残留选区。
+        let text = signal(String::from("hello"));
+        let mut ti = TextInput::new(text, String::new());
+        ti.anchor = Some(0);
+        ti.cursor = 5;
+        assert!(ti.selection().is_some(), "前置：应存在选区");
+        ti.reset_interaction();
+        assert_eq!(ti.anchor, None, "复位后不应残留选区锚点");
+        assert!(ti.selection().is_none(), "复位后选区应清空");
+        assert_eq!(ti.cursor, ti.char_count(), "光标应落到文末");
     }
 
     // 每字符宽 10 的合成前缀，用于纯函数换行测试。
@@ -1996,5 +2050,21 @@ mod anim_tests {
         assert_eq!(sw.pos.get().value(), 1.0, "关闭动画应瞬时到 on");
         assert!(!sw.pos.get().is_active());
         crate::anim::set_enabled(true);
+    }
+
+    #[test]
+    fn reopen_after_reset_snaps_without_anim() {
+        // 回归：对话框第二次弹出仍应无动画。动画开启下，reset_interaction（隐藏时框架调用）
+        // 后即便复显时绑定的新状态与残留值不同，也应瞬时落定、不进入过渡。
+        crate::anim::set_enabled(true);
+        let state = signal(true);
+        let mut sw = Switch::new(state);
+        paint_at(&sw, 0); // 首帧 primed，落定在 on(1.0)
+        assert_eq!(sw.pos.get().value(), 1.0);
+        sw.reset_interaction(); // 模拟对话框隐藏
+        state.set(false); // 再打开时绑定另一条 off 记录
+        paint_at(&sw, 0);
+        assert_eq!(sw.pos.get().value(), 0.0, "复显应瞬时落定到新状态");
+        assert!(!sw.pos.get().is_active(), "复显不应进入动画过渡");
     }
 }
