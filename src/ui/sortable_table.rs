@@ -322,11 +322,26 @@ fn action_header_cell(title: &str, weight: f32) -> Element {
 }
 
 /// 构建一个数据单元格：有自定义渲染且返回 `Some` 时用自定义控件（垂直居中、不强制行高，
-/// 同操作单元格），否则默认文本渲染（统一内边距 + 20px 行高）。
-fn data_cell(orig: usize, ci: usize, cell: &str, w: f32, render: Option<&CellRender>) -> Element {
+/// 同操作单元格），否则默认文本渲染。`lines` 为该格文本最多显示行数（≥1）：文本按列宽折行，
+/// 行随内容长高至多 `lines` 行、内容不足则更矮，超出部分由 `max_lines` 精确裁切（避免溢出到邻行）。
+fn data_cell(
+    orig: usize,
+    ci: usize,
+    cell: &str,
+    w: f32,
+    render: Option<&CellRender>,
+    lines: usize,
+) -> Element {
     match render.and_then(|r| r(orig, ci, cell)) {
         Some(custom) => action_cell(custom, w),
-        None => Element::table_cell_pad(Element::label(cell.to_string()).font_size(13.0)).weight(w),
+        None => Element::table_cell_pad_lines(
+            Element::label(cell.to_string())
+                .font_size(13.0)
+                .max_lines(lines.max(1))
+                .truncate(Truncate::End),
+            lines.max(1),
+        )
+        .weight(w),
     }
 }
 
@@ -341,6 +356,7 @@ pub(super) fn body_row(
     weights: &[f32],
     actions: Option<&ActionCol>,
     render: Option<&CellRender>,
+    lines: usize,
 ) -> Element {
     let mut tr = Element::row().width_match().cross(Align::Stretch);
     // 斑马纹随显示位置交替（而非原始行号），排序后视觉仍规整。
@@ -349,7 +365,7 @@ pub(super) fn body_row(
     }
     for (ci, cell) in cells.iter().enumerate() {
         let w = weights.get(ci).copied().unwrap_or(1.0);
-        tr = tr.child(data_cell(orig, ci, cell, w, render));
+        tr = tr.child(data_cell(orig, ci, cell, w, render, lines));
     }
     if let Some(a) = actions {
         tr = tr.child(action_cell((a.build)(orig), a.weight));
@@ -477,7 +493,9 @@ pub(super) struct SortableBody {
     actions: Option<ActionCol>,
     /// 自定义单元格渲染（由 `Element::cell_render` 设置）。
     render: Option<CellRender>,
-    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render` 置位——初始 eager 行不含它们，需重建一次）。
+    /// 默认文本格最多显示行数（由 `Element::cell_lines` 设置，默认 1）。
+    cell_lines: usize,
+    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render`/`set_cell_lines` 置位——初始 eager 行不含它们，需重建一次）。
     force: bool,
     last_version: u64,
 }
@@ -491,6 +509,7 @@ impl SortableBody {
             sort,
             actions: None,
             render: None,
+            cell_lines: 1,
             force: false,
         }
     }
@@ -504,6 +523,12 @@ impl SortableBody {
     /// 设置自定义单元格渲染；置 `force` 令首次 on_update 重建（把自定义格纳入）。
     pub(super) fn set_cell_render(&mut self, render: CellRender) {
         self.render = Some(render);
+        self.force = true;
+    }
+
+    /// 设置默认文本格最多行数；置 `force` 令首次 on_update 按新行数重建。
+    pub(super) fn set_cell_lines(&mut self, lines: usize) {
+        self.cell_lines = lines.max(1);
         self.force = true;
     }
 }
@@ -528,6 +553,7 @@ impl Widget for SortableBody {
                 &self.weights,
                 self.actions.as_ref(),
                 self.render.as_ref(),
+                self.cell_lines,
             );
             let id = el.build(tree);
             tree.add_child(self_id, id);
@@ -564,7 +590,9 @@ pub(super) struct PagedBody {
     actions: Option<ActionCol>,
     /// 自定义单元格渲染（由 `Element::cell_render` 设置）。生成器收到当前页内显示下标。
     render: Option<CellRender>,
-    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render` 置位）。
+    /// 默认文本格最多显示行数（由 `Element::cell_lines` 设置，默认 1）。
+    cell_lines: usize,
+    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render`/`set_cell_lines` 置位）。
     force: bool,
     last_version: u64,
 }
@@ -577,6 +605,7 @@ impl PagedBody {
             weights,
             actions: None,
             render: None,
+            cell_lines: 1,
             force: false,
         }
     }
@@ -590,6 +619,12 @@ impl PagedBody {
     /// 设置自定义单元格渲染；置 `force` 令首次 on_update 重建。
     pub(super) fn set_cell_render(&mut self, render: CellRender) {
         self.render = Some(render);
+        self.force = true;
+    }
+
+    /// 设置默认文本格最多行数；置 `force` 令首次 on_update 按新行数重建。
+    pub(super) fn set_cell_lines(&mut self, lines: usize) {
+        self.cell_lines = lines.max(1);
         self.force = true;
     }
 }
@@ -614,6 +649,7 @@ impl Widget for PagedBody {
                 &self.weights,
                 self.actions.as_ref(),
                 self.render.as_ref(),
+                self.cell_lines,
             );
             let id = el.build(tree);
             tree.add_child(self_id, id);
@@ -670,6 +706,7 @@ pub(super) fn select_body_row(
     row_sel: Signal<bool>,
     actions: Option<&ActionCol>,
     render: Option<&CellRender>,
+    lines: usize,
 ) -> Element {
     let mut tr = Element::row().width_match().cross(Align::Stretch);
     if disp % 2 == 1 {
@@ -678,7 +715,7 @@ pub(super) fn select_body_row(
     tr = tr.child(select_cell(row_sel));
     for (ci, cell) in cells.iter().enumerate() {
         let w = weights.get(ci).copied().unwrap_or(1.0);
-        tr = tr.child(data_cell(orig, ci, cell, w, render));
+        tr = tr.child(data_cell(orig, ci, cell, w, render, lines));
     }
     if let Some(a) = actions {
         tr = tr.child(action_cell((a.build)(orig), a.weight));
@@ -909,6 +946,8 @@ pub(super) struct SelectableBody {
     actions: Option<ActionCol>,
     /// 自定义单元格渲染（由 `Element::cell_render` 设置）。生成器收到原始行下标。
     render: Option<CellRender>,
+    /// 默认文本格最多显示行数（由 `Element::cell_lines` 设置，默认 1）。
+    cell_lines: usize,
     built: bool,
     last_version: u64,
 }
@@ -928,6 +967,7 @@ impl SelectableBody {
             sort,
             actions: None,
             render: None,
+            cell_lines: 1,
             built: false,
         }
     }
@@ -941,6 +981,12 @@ impl SelectableBody {
     /// 设置自定义单元格渲染；置 `built=false` 令首次 on_update 把自定义格纳入。
     pub(super) fn set_cell_render(&mut self, render: CellRender) {
         self.render = Some(render);
+        self.built = false;
+    }
+
+    /// 设置默认文本格最多行数；置 `built=false` 令首次 on_update 按新行数重建。
+    pub(super) fn set_cell_lines(&mut self, lines: usize) {
+        self.cell_lines = lines.max(1);
         self.built = false;
     }
 }
@@ -970,6 +1016,7 @@ impl Widget for SelectableBody {
                 row_sel,
                 self.actions.as_ref(),
                 self.render.as_ref(),
+                self.cell_lines,
             );
             let id = el.build(tree);
             tree.add_child(self_id, id);
@@ -1066,6 +1113,26 @@ pub(super) fn set_body_cell_render(el: &mut Element, render: &CellRender) -> boo
     false
 }
 
+/// 若 `el` 挂的是任一响应式正文（Sortable/Paged/Selectable）则设入默认文本格最多行数并返回 true。
+pub(super) fn set_body_cell_lines(el: &mut Element, lines: usize) -> bool {
+    let Some(a) = el.widget.as_any_mut() else {
+        return false;
+    };
+    if let Some(b) = a.downcast_mut::<SortableBody>() {
+        b.set_cell_lines(lines);
+        return true;
+    }
+    if let Some(b) = a.downcast_mut::<PagedBody>() {
+        b.set_cell_lines(lines);
+        return true;
+    }
+    if let Some(b) = a.downcast_mut::<SelectableBody>() {
+        b.set_cell_lines(lines);
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1133,6 +1200,56 @@ mod tests {
         tree.root = Some(root);
         tree.layout_root(Size::new(400, 300), &mut crate::text::NullTextEngine);
         tree
+    }
+
+    /// 取正文首行首个「默认文本」数据格 label 的 `max_lines`（裁切围栏是否安装 + 限几行）。
+    /// 结构：col[header, divider, scroll] → scroll 首子 body col → 首行 col[row, divider]
+    /// → row 首格 stack（table_cell_pad）→ label 叶子。
+    fn first_text_cell_max_lines(tree: &mut Tree) -> Option<usize> {
+        let root = tree.root.unwrap();
+        let scroll = *tree.get(root).unwrap().children.last().unwrap();
+        let body = tree.get(scroll).unwrap().children[0];
+        let row_wrap = tree.get(body).unwrap().children[0];
+        let row = tree.get(row_wrap).unwrap().children[0];
+        let cell = tree.get(row).unwrap().children[0];
+        let label = tree.get(cell).unwrap().children[0];
+        tree.get_mut(label)
+            .unwrap()
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<crate::ui::Label>())
+            .and_then(|l| l.max_lines)
+    }
+
+    #[test]
+    fn data_cell_installs_clip_fence_and_respects_cell_lines() {
+        // 回归：正文默认文本格必须给 label 装裁切围栏（max_lines），否则多行文本溢出到下方行。
+        // 默认单行；.cell_lines(2) 后为 2 行。修复前 label 无 max_lines（None），本测试即失败。
+        let long = vec![vec![
+            "很长很长很长很长很长很长很长很长很长的系统词条内容".to_string()
+        ]];
+        let mut tree = layout(
+            Element::table_sortable(vec![("词条", 1.0)], long.clone(), signal(None))
+                .width(200)
+                .height(300),
+        );
+        assert_eq!(
+            first_text_cell_max_lines(&mut tree),
+            Some(1),
+            "默认数据格应安装单行裁切围栏（max_lines=1）"
+        );
+
+        let mut tree2 = layout(
+            Element::table_sortable(vec![("词条", 1.0)], long, signal(None))
+                .cell_lines(2)
+                .width(200)
+                .height(300),
+        );
+        assert_eq!(
+            first_text_cell_max_lines(&mut tree2),
+            Some(2),
+            "cell_lines(2) 后数据格裁切围栏应为 2 行"
+        );
     }
 
     /// 合成一次完整点击（Down→Up）于 `at`。

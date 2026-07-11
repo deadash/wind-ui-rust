@@ -1815,11 +1815,23 @@ impl Element {
     }
 
     /// 表格单元格统一内边距包裹（文字内缩、单元格本身占满整格——便于整格背景/高亮）。
-    /// 内边距在单元格**内部**而非行上，故可点击单元格的 hover 高亮能覆盖整格。
+    /// 内边距在单元格**内部**而非行上，故可点击单元格的 hover 高亮能覆盖整格。单行盒（20px）。
     fn table_cell_pad(content: Element) -> Self {
+        Self::table_cell_pad_lines(content, 1)
+    }
+
+    /// 同 [`table_cell_pad`](Self::table_cell_pad)，但允许多行：`lines <= 1` 时锁定 20px 单行盒
+    /// （现状不变）；`lines > 1` 时 label 用 Wrap 高度，随文本折行长高——配合 `max_lines(lines)`
+    /// 由绘制层精确裁到 `lines` 行（内容不足则更矮，超出裁切不溢出邻行）。
+    fn table_cell_pad_lines(content: Element, lines: usize) -> Self {
+        let inner = if lines <= 1 {
+            content.width_match().height(20)
+        } else {
+            content.width_match()
+        };
         Element::stack()
             .padding_xy(TABLE_CELL_PAD_X, TABLE_CELL_PAD_Y)
-            .child(content.width_match().height(20))
+            .child(inner)
     }
 
     /// 数据表格（自定义单元格）：同 [`Element::table`]，但每个单元格是任意 `Element`
@@ -1957,7 +1969,7 @@ impl Element {
         let mut body = Element::col().width_match();
         for (disp, &ri) in order.iter().enumerate() {
             body = body.child(sortable_table::body_row(
-                disp, ri, &data[ri], &weights, None, None,
+                disp, ri, &data[ri], &weights, None, None, 1,
             ));
         }
         body.widget = Box::new(sortable_table::SortableBody::new(data, weights, sort));
@@ -2018,7 +2030,7 @@ impl Element {
         let mut body = Element::col().width_match();
         for (disp, row) in initial.iter().enumerate() {
             body = body.child(sortable_table::body_row(
-                disp, disp, row, &weights, None, None,
+                disp, disp, row, &weights, None, None, 1,
             ));
         }
         body.widget = Box::new(sortable_table::PagedBody::new(rows, weights));
@@ -2185,6 +2197,26 @@ impl Element {
         if let Some(scroll) = self.children.last_mut() {
             if let Some(body) = scroll.children.get_mut(0) {
                 sortable_table::set_body_cell_render(body, &render);
+            }
+        }
+        self
+    }
+
+    /// 设置**默认文本单元格**最多显示行数（`lines >= 1`，默认 1）：文本按列宽折行，行随内容
+    /// 长高至多 `lines` 行、内容不足则更矮，超出部分精确裁切（不再溢出到相邻行）。仅影响走默认
+    /// 文本渲染的格；自定义渲染格（`cell_render` 返回 `Some`）与操作列不受影响。仅对
+    /// [`table_sortable`](Self::table_sortable) / [`table_selectable`](Self::table_selectable) /
+    /// [`table_sortable_server`](Self::table_sortable_server) 返回的元素有效。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// Element::table_sortable_server(cols, rows, sort, on_sort).cell_lines(2)
+    /// ```
+    pub fn cell_lines(mut self, lines: usize) -> Self {
+        // 结构 col[ header, divider, scroll ]：scroll 为末子，其首个子节点挂响应式正文 widget。
+        if let Some(scroll) = self.children.last_mut() {
+            if let Some(body) = scroll.children.get_mut(0) {
+                sortable_table::set_body_cell_lines(body, lines);
             }
         }
         self
