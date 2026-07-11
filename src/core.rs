@@ -228,6 +228,10 @@ pub struct Tree {
     pub clipboard: Option<Box<dyn ClipboardProvider>>,
     /// 响应式节点列表：每次 `layout_root` 前广播 `on_update`，允许控件重建子节点。
     reactive_nodes: Vec<NodeId>,
+    /// on_update（响应式相位）里控件请求的 toast 暂存区。该相位在 `call_on_update` 后
+    /// 丢弃整个 `EventOutcome`，其中的 toast 无处上交宿主；单独在此累积，由宿主在
+    /// layout 后 `take_pending_toasts` 取走上屏（否则 `toast_sink` 等经信号触发的提示全被吞）。
+    pending_toasts: Vec<ToastRequest>,
 }
 
 impl Default for Tree {
@@ -245,7 +249,13 @@ impl Tree {
             focus_ring_visible: false,
             clipboard: None,
             reactive_nodes: Vec::new(),
+            pending_toasts: Vec::new(),
         }
+    }
+
+    /// 取走 on_update 相位累积的 toast 请求（宿主在 layout 后调用上屏），并清空暂存。
+    pub fn take_pending_toasts(&mut self) -> Vec<ToastRequest> {
+        std::mem::take(&mut self.pending_toasts)
     }
 
     // ---- arena ----
@@ -330,9 +340,15 @@ impl Tree {
             out: EventOutcome::default(),
         };
         widget.on_update(&mut ctx);
-        // EventOutcome 丢弃：update 后紧接着全量 layout，damage 信息无意义
+        // EventOutcome 大多可弃：update 后紧接着全量 layout，damage 等信息无意义。
+        // 唯 toast 需上交宿主——on_update 相位不经 DispatchResult，若一并丢弃则 toast_sink
+        // 等在此发的提示永不上屏，故先取出暂存（见 pending_toasts / take_pending_toasts）。
+        let requested_toast = ctx.out.toast.take();
         if let Some(n) = self.get_mut(id) {
             n.widget = widget;
+        }
+        if let Some(req) = requested_toast {
+            self.pending_toasts.push(req);
         }
     }
 
@@ -3107,5 +3123,29 @@ mod tests {
         };
         tree.dispatch_key(key, Some(input));
         assert_eq!(txt.get(), "Z world", "双击应选中首词并被输入替换");
+    }
+
+    #[test]
+    fn on_update_toast_is_captured_for_host() {
+        // 回归：on_update（响应式相位）里发的 toast 曾随 EventOutcome 一起被丢弃，
+        // 导致 toast_sink 等经信号触发的提示永不上屏。此处确认其被暂存供宿主取走。
+        struct ToastOnUpdate;
+        impl Widget for ToastOnUpdate {
+            fn on_update(&mut self, ctx: &mut EventCtx) {
+                ctx.toast_ok("已保存");
+            }
+        }
+        let mut tree = Tree::new();
+        let id = Element::leaf()
+            .reactive()
+            .widget(ToastOnUpdate)
+            .build(&mut tree);
+        tree.root = Some(id);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(100, 100), &mut te);
+        let toasts = tree.take_pending_toasts();
+        assert_eq!(toasts.len(), 1, "on_update 发出的 toast 应被暂存供宿主上屏");
+        assert_eq!(toasts[0].text, "已保存");
+        assert!(tree.take_pending_toasts().is_empty(), "取走后应清空暂存");
     }
 }

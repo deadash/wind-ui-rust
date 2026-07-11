@@ -1000,6 +1000,13 @@ impl UiHost {
         self.push_toast(req);
         self.needs_full = true;
     }
+    /// 上屏 on_update（响应式相位）里累积的 toast——该相位不经 DispatchResult，
+    /// 由 `Tree` 暂存、宿主在每次 layout 后取走（否则 toast_sink 等发的提示被吞）。
+    fn flush_pending_toasts(&mut self) {
+        for req in self.tree.take_pending_toasts() {
+            self.show_toast(req);
+        }
+    }
     /// 压入一条 toast；超过上限丢最旧。
     fn push_toast(&mut self, req: ToastRequest) {
         let now_ms = self.start.elapsed().as_millis() as u64;
@@ -1315,6 +1322,10 @@ impl AppHandler for UiHost {
             self.sig_valid = true;
             self.needs_relayout = false;
         }
+        // 响应式相位（本帧 layout 内）可能发出 toast（如 toast_sink 监听 feedback 信号）。
+        // 须在重绘决策前上屏：show_toast 置 needs_full 并使 overlay 成立，令新 toast 被绘制，
+        // 否则会走局部重绘的 early-return 而漏画。
+        self.flush_pending_toasts();
 
         // 全窗 vs 局部重绘决策：
         // - needs_full（输入/结构/尺寸变更）、后备缓冲缺失/尺寸不符、有浮层、无脏区 → 全窗。
@@ -1380,6 +1391,9 @@ impl AppHandler for UiHost {
             self.last_layout_sig = self.tree.layout_signature();
             self.sig_valid = true;
         }
+        // 全窗路径的这次 layout 也可能有响应式 toast（上面 needs_relayout 未触发时）；
+        // 本就走全窗重绘，取走后随本帧 paint 上屏即可。
+        self.flush_pending_toasts();
         // 布局后结构稳定，刷新 Tab 焦点顺序。
         self.focus_order = self.tree.focusable_order();
         // 若当前焦点已不在可聚焦集合中（结构变更），归一化为无焦点。
