@@ -1824,14 +1824,19 @@ impl Element {
     /// （现状不变）；`lines > 1` 时 label 用 Wrap 高度，随文本折行长高——配合 `max_lines(lines)`
     /// 由绘制层精确裁到 `lines` 行（内容不足则更矮，超出裁切不溢出邻行）。
     fn table_cell_pad_lines(content: Element, lines: usize) -> Self {
-        let inner = if lines <= 1 {
-            content.width_match().height(20)
+        if lines <= 1 {
+            // 单行：锁定 20px 单行盒（现状不变）。
+            Element::stack()
+                .padding_xy(TABLE_CELL_PAD_X, TABLE_CELL_PAD_Y)
+                .child(content.width_match().height(20))
         } else {
-            content.width_match()
-        };
-        Element::stack()
-            .padding_xy(TABLE_CELL_PAD_X, TABLE_CELL_PAD_Y)
-            .child(inner)
+            // 多行：行随同行最高单元格拉伸；文本竖直居中，内容不足一行时不再顶部对齐。
+            // 用 row + cross(Center) 与自定义单元格（action_cell）保持一致的竖直居中。
+            Element::row()
+                .cross(Align::Center)
+                .padding_xy(TABLE_CELL_PAD_X, TABLE_CELL_PAD_Y)
+                .child(content.width_match())
+        }
     }
 
     /// 数据表格（自定义单元格）：同 [`Element::table`]，但每个单元格是任意 `Element`
