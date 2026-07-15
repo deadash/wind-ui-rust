@@ -17,8 +17,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, BringWindowToTop, CreateWindowExW, DefWindowProcW, FindWindowW,
-    GetWindowThreadProcessId, IsIconic, RegisterClassExW, SendMessageW, SetForegroundWindow,
-    ShowWindow, HWND_MESSAGE, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COPYDATA, WNDCLASSEXW,
+    GetWindowThreadProcessId, IsIconic, RegisterClassExW, SendMessageTimeoutW, SetForegroundWindow,
+    ShowWindow, HWND_MESSAGE, SMTO_ABORTIFHUNG, SW_RESTORE, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_COPYDATA, WNDCLASSEXW,
 };
 
 use super::{class_name, decode_argv, encode_argv, mutex_name};
@@ -60,14 +61,17 @@ pub(crate) fn acquire(app_id: &str) -> bool {
 }
 
 /// 二次实例:把 argv 发给首实例的 message 窗口(WM_COPYDATA 系统跨进程 marshal)。
-pub(crate) fn forward(app_id: &str, argv: &[String]) {
+///
+/// 返回是否成功送达。首实例正处于退出中(消息泵已停但进程未死)时送达会失败,
+/// 调用方据此回退为正常启动,避免二次实例被一个僵死的首实例永久挡在门外。
+pub(crate) fn forward(app_id: &str, argv: &[String]) -> bool {
     let cls = wide(&class_name(app_id));
     unsafe {
         let Ok(hwnd) = FindWindowW(PCWSTR(cls.as_ptr()), PCWSTR::null()) else {
-            return;
+            return false;
         };
         if hwnd.is_invalid() {
-            return;
+            return false;
         }
         // 把本进程持有的前台激活权授予首实例：二次实例通常由前台进程（用户点击 →
         // ShellExecute）启动而持权，首实例仅收到 WM_COPYDATA 并**不**获得权限——
@@ -83,12 +87,20 @@ pub(crate) fn forward(app_id: &str, argv: &[String]) {
             cbData: bytes.len() as u32,
             lpData: bytes.as_ptr() as *mut std::ffi::c_void,
         };
-        let _ = SendMessageW(
+        // 用带超时的发送而非同步 SendMessageW:首实例可能已停消息泵但进程未死,
+        // 同步发送会把二次实例一起挂住(表现为"再进入无响应")。SMTO_ABORTIFHUNG
+        // 在目标线程无响应时立即返回;返回值为 0 表示未送达,交由调用方回退。
+        let mut result: usize = 0;
+        let ret = SendMessageTimeoutW(
             hwnd,
             WM_COPYDATA,
-            Some(WPARAM(0)),
-            Some(LPARAM(&cds as *const _ as isize)),
+            WPARAM(0),
+            LPARAM(&cds as *const _ as isize),
+            SMTO_ABORTIFHUNG,
+            3000,
+            Some(&mut result as *mut usize),
         );
+        ret.0 != 0
     }
 }
 

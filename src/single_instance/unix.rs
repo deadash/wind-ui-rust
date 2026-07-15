@@ -7,7 +7,10 @@ pub(crate) fn acquire(_app_id: &str) -> bool {
     true
 }
 
-pub(crate) fn forward(_app_id: &str, _argv: &[String]) {}
+pub(crate) fn forward(_app_id: &str, _argv: &[String]) -> bool {
+    // acquire 恒为 true,forward 实际不会被调用;返回 true 保持"已送达"语义。
+    true
+}
 
 pub(crate) fn install_listener(
     _app_id: &str,

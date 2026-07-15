@@ -71,9 +71,9 @@ pub(crate) fn acquire(app_id: &str) -> bool {
     }
 }
 
-/// 二次实例:把 argv 转发给首实例。
+/// 二次实例:把 argv 转发给首实例。返回是否成功送达(失败时调用方应回退为正常启动)。
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) fn forward(app_id: &str, argv: &[String]) {
+pub(crate) fn forward(app_id: &str, argv: &[String]) -> bool {
     #[cfg(windows)]
     {
         win::forward(app_id, argv)
