@@ -129,6 +129,14 @@ pub struct MenuItem {
     pub separator: bool,
     /// 级联子菜单项（非空 → 悬停展开下一级，行尾显示 ›）。
     pub submenu: Vec<MenuItem>,
+    /// 第二行小字说明（Some → 该项渲染为两行，行高变高）。
+    pub subtitle: Option<String>,
+    /// 尾随徽章胶囊：纯展示，(文本, 意图色)。
+    pub badge: Option<(String, crate::theme::Intent)>,
+    /// 尾随可独立点击的图标（字符/emoji，None=无图标）。
+    pub trailing_icon: Option<String>,
+    /// 点击尾随图标的回调，与主项 `action` 完全独立；`None` 则图标不可点击（仅展示）。
+    pub on_trailing_click: Option<std::rc::Rc<dyn Fn()>>,
 }
 
 /// 空动作（分隔线/子菜单父项占位，永不执行）。
@@ -148,6 +156,10 @@ impl MenuItem {
             shortcut: None,
             separator: false,
             submenu: Vec::new(),
+            subtitle: None,
+            badge: None,
+            trailing_icon: None,
+            on_trailing_click: None,
         }
     }
     /// 便捷构造：标签 + 闭包动作。
@@ -161,6 +173,10 @@ impl MenuItem {
             shortcut: None,
             separator: false,
             submenu: Vec::new(),
+            subtitle: None,
+            badge: None,
+            trailing_icon: None,
+            on_trailing_click: None,
         }
     }
     /// 分隔线项。
@@ -174,6 +190,10 @@ impl MenuItem {
             shortcut: None,
             separator: true,
             submenu: Vec::new(),
+            subtitle: None,
+            badge: None,
+            trailing_icon: None,
+            on_trailing_click: None,
         }
     }
     /// 级联子菜单父项：悬停展开 `items`。
@@ -187,6 +207,10 @@ impl MenuItem {
             shortcut: None,
             separator: false,
             submenu: items,
+            subtitle: None,
+            badge: None,
+            trailing_icon: None,
+            on_trailing_click: None,
         }
     }
     /// 设置前置图标（字符/emoji）。
@@ -202,6 +226,26 @@ impl MenuItem {
     /// 设置选中勾。
     pub fn with_check(mut self, checked: bool) -> Self {
         self.checked = checked;
+        self
+    }
+    /// 设置第二行小字说明（该项渲染为两行，行高变高）。
+    pub fn with_subtitle(mut self, s: impl Into<String>) -> Self {
+        self.subtitle = Some(s.into());
+        self
+    }
+    /// 设置尾随徽章胶囊（纯展示，不参与命中）。
+    pub fn with_badge(mut self, text: impl Into<String>, intent: crate::theme::Intent) -> Self {
+        self.badge = Some((text.into(), intent));
+        self
+    }
+    /// 设置尾随可独立点击的图标：点击只触发 `on_click`，不触发本项的 `action`。
+    pub fn with_trailing_icon(
+        mut self,
+        icon: impl Into<String>,
+        on_click: impl Fn() + 'static,
+    ) -> Self {
+        self.trailing_icon = Some(icon.into());
+        self.on_trailing_click = Some(std::rc::Rc::new(on_click));
         self
     }
     /// 是否可点击执行（非分隔、无子菜单、启用）。

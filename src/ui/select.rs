@@ -2,8 +2,12 @@
 //!
 //! 复用宿主层浮层机制（与右键菜单同源）：点击经 `EventCtx::show_menu` 请求弹出，
 //! 每个选项的动作是设置绑定的 `Rc<Cell<usize>>` 选中索引（`MenuAction::Run` 闭包）。
+//!
+//! 富内容（副标题/徽章/可点击尾随图标）走 [`DropdownItem`] + `with_items`/`with_items_reactive`；
+//! 纯文本场景仍用原有 `Vec<String>` 入口，两者内部分别存储、互不影响。
 
 use std::cell::Cell;
+use std::rc::Rc;
 
 use crate::anim::{Easing, Transition};
 use crate::core::{EventCtx, Widget};
@@ -14,14 +18,69 @@ use crate::signal::Signal;
 use crate::spec::Align;
 use crate::style::Style;
 use crate::text::TextEngine;
+use crate::theme::Intent;
 
 const PAD_X: i32 = 12;
 const CHEVRON_W: i32 = 18;
+/// 收起态徽章胶囊左右内边距/高度/与文本间距（与 `app.rs` 菜单尾随徽章同规格）。
+const BADGE_PAD_X: i32 = 8;
+const BADGE_H: i32 = 20;
+const BADGE_GAP: i32 = 8;
+
+/// 富内容选项：主文本 + 可选第二行说明 + 可选尾随徽章（纯展示）+ 可选尾随可点击图标。
+#[derive(Clone)]
+pub struct DropdownItem {
+    pub label: String,
+    pub subtitle: Option<String>,
+    pub badge: Option<(String, Intent)>,
+    pub trailing_icon: Option<(String, Rc<dyn Fn()>)>,
+}
+
+impl DropdownItem {
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            subtitle: None,
+            badge: None,
+            trailing_icon: None,
+        }
+    }
+    /// 第二行小字说明（展开态渲染为两行）。
+    pub fn subtitle(mut self, s: impl Into<String>) -> Self {
+        self.subtitle = Some(s.into());
+        self
+    }
+    /// 尾随徽章胶囊（纯展示，展开态与收起态当前项均显示）。
+    pub fn badge(mut self, text: impl Into<String>, intent: Intent) -> Self {
+        self.badge = Some((text.into(), intent));
+        self
+    }
+    /// 尾随可独立点击的图标（仅展开态列表项）：点击只触发 `on_click`，不选中该项。
+    pub fn trailing_icon(mut self, icon: impl Into<String>, on_click: impl Fn() + 'static) -> Self {
+        self.trailing_icon = Some((icon.into(), Rc::new(on_click)));
+        self
+    }
+}
+
+impl From<String> for DropdownItem {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
+impl From<&str> for DropdownItem {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+
+/// 选项存储：纯文本（原有 `Vec<String>` 入口）或富内容（`DropdownItem`）。
+enum OptionSource {
+    Plain(Signal<Vec<String>>),
+    Rich(Signal<Vec<DropdownItem>>),
+}
 
 pub struct Dropdown {
-    /// 选项绑定 `Signal<Vec<String>>`：静态构造时包一层定值信号；响应式构造直接传入，
-    /// 选项随信号变更自动刷新（异步加载的主题/字体列表到达后下拉即填充）。
-    options: Signal<Vec<String>>,
+    options: OptionSource,
     selected: Signal<usize>,
     hover: bool,
     /// 边框色补间（hover/focus 高亮淡变）；首帧靠 `primed` 落定。
@@ -31,17 +90,37 @@ pub struct Dropdown {
 
 impl Dropdown {
     pub fn new(options: Vec<String>, selected: Signal<usize>) -> Self {
-        Self::with_signal(crate::signal::signal(options), selected)
+        Self::with_plain_signal(crate::signal::signal(options), selected)
     }
 
     /// 响应式选项：选项列表绑定外部 `Signal<Vec<String>>`，变更即重新测量/渲染。
     pub fn new_reactive(options: Signal<Vec<String>>, selected: Signal<usize>) -> Self {
-        Self::with_signal(options, selected)
+        Self::with_plain_signal(options, selected)
     }
 
-    fn with_signal(options: Signal<Vec<String>>, selected: Signal<usize>) -> Self {
+    /// 富内容选项（副标题/徽章/尾随图标）。
+    pub fn with_items(items: Vec<DropdownItem>, selected: Signal<usize>) -> Self {
+        Self::with_rich_signal(crate::signal::signal(items), selected)
+    }
+
+    /// 响应式富内容选项：绑定外部 `Signal<Vec<DropdownItem>>`。
+    pub fn with_items_reactive(items: Signal<Vec<DropdownItem>>, selected: Signal<usize>) -> Self {
+        Self::with_rich_signal(items, selected)
+    }
+
+    fn with_plain_signal(options: Signal<Vec<String>>, selected: Signal<usize>) -> Self {
         Self {
-            options,
+            options: OptionSource::Plain(options),
+            selected,
+            hover: false,
+            border_anim: Cell::new(Transition::new(Color::rgba(0, 0, 0, 0))),
+            primed: Cell::new(false),
+        }
+    }
+
+    fn with_rich_signal(options: Signal<Vec<DropdownItem>>, selected: Signal<usize>) -> Self {
+        Self {
+            options: OptionSource::Rich(options),
             selected,
             hover: false,
             border_anim: Cell::new(Transition::new(Color::rgba(0, 0, 0, 0))),
@@ -50,28 +129,71 @@ impl Dropdown {
     }
 
     fn current(&self) -> String {
-        self.options.with(|opts| {
-            let i = self.selected.get().min(opts.len().saturating_sub(1));
-            opts.get(i).cloned().unwrap_or_default()
-        })
+        match &self.options {
+            OptionSource::Plain(opts) => opts.with(|list| {
+                let i = self.selected.get().min(list.len().saturating_sub(1));
+                list.get(i).cloned().unwrap_or_default()
+            }),
+            OptionSource::Rich(items) => items.with(|list| {
+                let i = self.selected.get().min(list.len().saturating_sub(1));
+                list.get(i).map(|it| it.label.clone()).unwrap_or_default()
+            }),
+        }
+    }
+
+    /// 当前选中项的尾随徽章（仅富内容来源；纯文本来源恒为 `None`）。
+    fn current_badge(&self) -> Option<(String, Intent)> {
+        match &self.options {
+            OptionSource::Plain(_) => None,
+            OptionSource::Rich(items) => items.with(|list| {
+                let i = self.selected.get().min(list.len().saturating_sub(1));
+                list.get(i).and_then(|it| it.badge.clone())
+            }),
+        }
     }
 
     /// 弹出浮层列表：宽度对齐控件，每项点击设置选中索引。
     fn open(&self, ctx: &mut EventCtx) {
-        let opts = self.options.get();
-        if opts.is_empty() {
-            return;
-        }
         let b = ctx.bounds();
         let cur = self.selected.get();
-        let items: Vec<MenuItem> = opts
-            .into_iter()
-            .enumerate()
-            .map(|(i, o)| {
-                let sel = self.selected;
-                MenuItem::run(o, move || sel.set(i), i == cur)
-            })
-            .collect();
+        let items: Vec<MenuItem> = match &self.options {
+            OptionSource::Plain(opts) => {
+                let list = opts.get();
+                if list.is_empty() {
+                    return;
+                }
+                list.into_iter()
+                    .enumerate()
+                    .map(|(i, o)| {
+                        let sel = self.selected;
+                        MenuItem::run(o, move || sel.set(i), i == cur)
+                    })
+                    .collect()
+            }
+            OptionSource::Rich(items_sig) => {
+                let list = items_sig.get();
+                if list.is_empty() {
+                    return;
+                }
+                list.into_iter()
+                    .enumerate()
+                    .map(|(i, it)| {
+                        let sel = self.selected;
+                        let mut mi = MenuItem::run(it.label, move || sel.set(i), i == cur);
+                        if let Some(sub) = it.subtitle {
+                            mi = mi.with_subtitle(sub);
+                        }
+                        if let Some((text, intent)) = it.badge {
+                            mi = mi.with_badge(text, intent);
+                        }
+                        if let Some((icon, cb)) = it.trailing_icon {
+                            mi = mi.with_trailing_icon(icon, move || (*cb)());
+                        }
+                        mi
+                    })
+                    .collect()
+            }
+        };
         ctx.show_dropdown_menu(b, items);
     }
 }
@@ -79,14 +201,32 @@ impl Dropdown {
 impl Widget for Dropdown {
     fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
         let mut w = 0;
-        self.options.with(|opts| {
-            for o in opts {
-                w = w.max(
-                    text.measure(o, style.font_family.as_deref(), style.font_size, None)
-                        .w,
-                );
-            }
-        });
+        match &self.options {
+            OptionSource::Plain(opts) => opts.with(|list| {
+                for o in list {
+                    w = w.max(
+                        text.measure(o, style.font_family.as_deref(), style.font_size, None)
+                            .w,
+                    );
+                }
+            }),
+            OptionSource::Rich(items) => items.with(|list| {
+                for it in list {
+                    let mut iw = text
+                        .measure(
+                            &it.label,
+                            style.font_family.as_deref(),
+                            style.font_size,
+                            None,
+                        )
+                        .w;
+                    if let Some((btext, _)) = &it.badge {
+                        iw += text.measure(btext, None, 12.0, None).w + 2 * BADGE_PAD_X + BADGE_GAP;
+                    }
+                    w = w.max(iw);
+                }
+            }),
+        }
         Size::new(w + 2 * PAD_X + CHEVRON_W, (style.font_size as i32) + 16)
     }
 
@@ -143,11 +283,40 @@ impl Widget for Dropdown {
         };
         canvas.stroke_round_rect(x, y, w, h, corner, bw, &Paint::fill(border));
 
-        // 当前选项文本（左侧，留出右侧 chevron）。
+        // 当前选中项的尾随徽章（若有）：贴 chevron 左侧，文本区相应收窄。
+        let badge = self.current_badge();
+        let badge_w = badge
+            .as_ref()
+            .map(|(text, _)| canvas.measure_text(text, None, 12.0).w + 2 * BADGE_PAD_X)
+            .unwrap_or(0);
+        if let Some((text, intent)) = &badge {
+            let base = match intent {
+                Intent::Primary => pal.accent,
+                other => other.colors(pal).bg,
+            };
+            let br = Rect::new(
+                bounds.x + bounds.w - PAD_X - CHEVRON_W - badge_w,
+                bounds.y + (bounds.h - BADGE_H) / 2,
+                badge_w,
+                BADGE_H,
+            );
+            canvas.fill_round_rect(
+                br.x as f32,
+                br.y as f32,
+                br.w as f32,
+                br.h as f32,
+                999.0,
+                &Paint::fill(base.scale_alpha(0.15)),
+            );
+            canvas.draw_text(text, br, base, Align::Center, None, 12.0);
+        }
+
+        // 当前选项文本（左侧，留出右侧 chevron 与徽章）。
+        let badge_reserve = if badge_w > 0 { badge_w + BADGE_GAP } else { 0 };
         let tr = Rect::new(
             bounds.x + PAD_X,
             bounds.y,
-            bounds.w - 2 * PAD_X - CHEVRON_W,
+            bounds.w - 2 * PAD_X - CHEVRON_W - badge_reserve,
             bounds.h,
         );
         let cur = self.current();

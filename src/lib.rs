@@ -35,7 +35,7 @@ pub mod prelude {
     pub use crate::sync::Sender;
     pub use crate::theme::{Intent, Len, TableTheme, Theme};
     pub use crate::ui::{
-        Element, ImageContent, ImageView, Link, SortOrder, SortStyle, Truncate, WindowButton,
-        WindowButtonKind,
+        DropdownItem, Element, ImageContent, ImageView, Link, SortOrder, SortStyle, Truncate,
+        WindowButton, WindowButtonKind,
     };
 }

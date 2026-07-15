@@ -40,7 +40,7 @@ pub use list::ListRow;
 pub use nav::{AccordionHeader, CollapsibleHeader, ExpandState, NavRow};
 pub use progress::ProgressBar;
 pub use segmented::SegmentedControl;
-pub use select::Dropdown;
+pub use select::{Dropdown, DropdownItem};
 pub use sortable_table::SortStyle;
 pub use stepper::Stepper;
 pub use window_buttons::{WindowButton, WindowButtonKind};
@@ -1376,6 +1376,20 @@ impl Element {
     /// 自动重新测量/渲染。选中索引仍由 `selected` 绑定。
     pub fn dropdown_reactive(options: Signal<Vec<String>>, selected: Signal<usize>) -> Self {
         Self::base(Layout::None).widget(select::Dropdown::new_reactive(options, selected))
+    }
+
+    /// 富内容下拉：选项支持副标题（两行）、尾随徽章（收起态当前项与展开态列表项均显示）、
+    /// 尾随可独立点击图标（如删除该项）。见 [`select::DropdownItem`]。
+    pub fn dropdown_items(items: Vec<select::DropdownItem>, selected: Signal<usize>) -> Self {
+        Self::base(Layout::None).widget(select::Dropdown::with_items(items, selected))
+    }
+
+    /// 响应式富内容下拉：选项列表绑定外部 `Signal<Vec<DropdownItem>>`。
+    pub fn dropdown_items_reactive(
+        items: Signal<Vec<select::DropdownItem>>,
+        selected: Signal<usize>,
+    ) -> Self {
+        Self::base(Layout::None).widget(select::Dropdown::with_items_reactive(items, selected))
     }
 
     /// 数字步进（绑定 `Signal<f64>`，带范围与步长；小数位由步长推断）。

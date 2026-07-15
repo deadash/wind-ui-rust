@@ -52,6 +52,8 @@ use crate::ui::Element;
 // ---- 上下文菜单（宿主层自绘浮层）----
 
 const MENU_ITEM_H: i32 = 30;
+/// 两行项（带 subtitle）行高。
+const MENU_ITEM_H_TALL: i32 = 46;
 const MENU_SEP_H: i32 = 9;
 const MENU_PAD_X: i32 = 12;
 const MENU_VPAD: i32 = 6;
@@ -59,15 +61,30 @@ const MENU_MIN_W: i32 = 140;
 /// 下拉菜单面板最大可视高度（超出后启用滚动）。
 const MENU_MAX_H: i32 = 320;
 const MENU_FONT: f32 = 13.5;
-/// 图标列宽（有图标项时预留）。
+/// 图标列宽（有图标项时预留），也用作尾随可点击图标的命中/绘制列宽。
 const MENU_ICON_W: i32 = 18;
 /// 图标与标签间距。
 const MENU_GAP: i32 = 8;
 /// 标签与尾随（快捷键/箭头）间最小间距。
 const MENU_TRAIL_GAP: i32 = 18;
+/// 尾随徽章胶囊左右内边距。
+const BADGE_PAD_X: i32 = 8;
+/// 尾随徽章胶囊高度。
+const BADGE_H: i32 = 20;
 /// 菜单弹层距窗口四边最小留白（逻辑像素）：与 resize 边框区域宽度对齐，
 /// 确保弹层滚动条不会覆盖到缩放操作区域，无需修改 WM_NCHITTEST 优先级。
 const MENU_EDGE_MARGIN: i32 = 10;
+
+/// 单项行高：分隔线固定细线高；带 subtitle 的项两行更高；否则单行标准高。
+fn menu_item_height(it: &MenuItem) -> i32 {
+    if it.separator {
+        MENU_SEP_H
+    } else if it.subtitle.is_some() {
+        MENU_ITEM_H_TALL
+    } else {
+        MENU_ITEM_H
+    }
+}
 
 /// 悬停提示：触发延时（ms）、字号、内边距、相对指针的偏移。
 /// 换行宽度上限由宿主经 `Theme.tooltip.max_width` 配置（见 [`crate::theme::TooltipTheme::max_width`]）。
@@ -167,11 +184,7 @@ impl MenuLevel {
         let mut y = self.rect.y + MENU_VPAD - self.scroll;
         let mut rows = Vec::with_capacity(self.items.len());
         for it in &self.items {
-            let h = if it.separator {
-                MENU_SEP_H
-            } else {
-                MENU_ITEM_H
-            };
+            let h = menu_item_height(it);
             rows.push((y, h));
             y += h;
         }
@@ -193,6 +206,24 @@ impl MenuLevel {
                 } else {
                     Some(i)
                 };
+            }
+        }
+        None
+    }
+    /// 命中尾随可点击图标 → 项下标。图标固定贴右绘制（`r.right()-MENU_PAD_X-MENU_ICON_W`
+    /// 起始），与 badge 是否存在无关，故命中矩形无需重算 badge 宽度即可复刻绘制位置。
+    fn trailing_icon_at(&self, p: Point) -> Option<usize> {
+        if !self.rect.contains(p) {
+            return None;
+        }
+        let icon_left = self.rect.right() - MENU_PAD_X - MENU_ICON_W;
+        let icon_right = self.rect.right() - MENU_PAD_X;
+        if p.x < icon_left || p.x >= icon_right {
+            return None;
+        }
+        for (i, (top, h)) in self.item_rows().into_iter().enumerate() {
+            if p.y >= top && p.y < top + h && self.items[i].trailing_icon.is_some() {
+                return Some(i);
             }
         }
         None
@@ -845,6 +876,9 @@ impl UiHost {
                 continue;
             }
             max_label = max_label.max(self.engine.measure(&it.label, None, MENU_FONT, None).w);
+            if let Some(sub) = &it.subtitle {
+                max_label = max_label.max(self.engine.measure(sub, None, MENU_FONT - 2.5, None).w);
+            }
             let tw = if !it.submenu.is_empty() {
                 10
             } else if let Some(s) = &it.shortcut {
@@ -854,7 +888,15 @@ impl UiHost {
             } else {
                 0
             };
-            max_trail = max_trail.max(tw);
+            let mut total = tw;
+            if let Some((text, _)) = &it.badge {
+                let bw = self.engine.measure(text, None, 12.0, None).w + 2 * BADGE_PAD_X;
+                total += if total > 0 { MENU_GAP } else { 0 } + bw;
+            }
+            if it.trailing_icon.is_some() {
+                total += if total > 0 { MENU_GAP } else { 0 } + MENU_ICON_W;
+            }
+            max_trail = max_trail.max(total);
         }
         let icon_w = if has_icons { MENU_ICON_W + MENU_GAP } else { 0 };
         let trail_w = if max_trail > 0 {
@@ -881,16 +923,7 @@ impl UiHost {
         anchor_top: Option<i32>,
     ) -> MenuLevel {
         let (w, has_icons) = self.level_width(&items, min_width);
-        let body: i32 = items
-            .iter()
-            .map(|it| {
-                if it.separator {
-                    MENU_SEP_H
-                } else {
-                    MENU_ITEM_H
-                }
-            })
-            .sum();
+        let body: i32 = items.iter().map(menu_item_height).sum();
         let content_h = body + 2 * MENU_VPAD;
         // 面板可视高度：不超过 MENU_MAX_H，也不超过窗口高的 3/4。
         let ws = self.logical_size;
@@ -933,11 +966,7 @@ impl UiHost {
             let mut offset = MENU_VPAD;
             let mut result = 0i32;
             for it in &items {
-                let ih = if it.separator {
-                    MENU_SEP_H
-                } else {
-                    MENU_ITEM_H
-                };
+                let ih = menu_item_height(it);
                 if it.checked {
                     result = offset + ih / 2 - h / 2;
                     break;
@@ -1140,6 +1169,22 @@ impl UiHost {
                 };
                 // 同步悬停路径（保证子菜单按当前指针展开）。
                 self.menu_hover_update(ev.pos);
+                // 尾随可点击图标优先命中：独立于主项 action，点击只触发图标自己的回调
+                // （如"删除该项"），不触发本项被选中。
+                let trailing_hit = self
+                    .menu
+                    .as_ref()
+                    .and_then(|m| m.levels[k].trailing_icon_at(ev.pos))
+                    .and_then(|i| {
+                        self.menu.as_ref().unwrap().levels[k].items[i]
+                            .on_trailing_click
+                            .clone()
+                    });
+                if let Some(f) = trailing_hit {
+                    self.menu = None;
+                    f();
+                    return true;
+                }
                 // 命中项：叶子执行并关闭；子菜单父项/禁用项保持展开。
                 let hit = self.menu.as_ref().and_then(|m| {
                     let lvl = &m.levels[k];
@@ -1253,6 +1298,10 @@ impl UiHost {
                     shortcut: None,
                     separator: false,
                     submenu: Vec::new(),
+                    subtitle: None,
+                    badge: None,
+                    trailing_icon: None,
+                    on_trailing_click: None,
                 };
                 if let Some(target) = self.focus.or(self.tree.root) {
                     self.open_menu(
@@ -1645,18 +1694,73 @@ impl AppHandler for UiHost {
                             MENU_FONT,
                         );
                     }
-                    // 标签。
-                    let lr = Rect::new(label_x, top, (r.right() - MENU_PAD_X - label_x).max(0), h);
-                    canvas.draw_text(
-                        &it.label,
-                        lr,
-                        color,
-                        crate::spec::Align::Start,
-                        None,
-                        MENU_FONT,
-                    );
-                    // 尾随：子菜单箭头 › / 快捷键 / 勾选。
-                    let tr = Rect::new(r.x, top, r.w - MENU_PAD_X, h);
+                    // 尾随区域从右向左依次收窄：可点击图标 → 徽章胶囊 → 剩余内容右边界。
+                    let mut content_right = r.right() - MENU_PAD_X;
+                    if let Some(icon) = &it.trailing_icon {
+                        let ir = Rect::new(content_right - MENU_ICON_W, top, MENU_ICON_W, h);
+                        canvas.draw_text(
+                            icon,
+                            ir,
+                            color,
+                            crate::spec::Align::Center,
+                            None,
+                            MENU_FONT,
+                        );
+                        content_right -= MENU_ICON_W + MENU_GAP;
+                    }
+                    if let Some((text, intent)) = &it.badge {
+                        let base = match intent {
+                            crate::theme::Intent::Primary => pal.accent,
+                            other => other.colors(pal).bg,
+                        };
+                        let bw = canvas.measure_text(text, None, 12.0).w + 2 * BADGE_PAD_X;
+                        let br =
+                            Rect::new(content_right - bw, top + (h - BADGE_H) / 2, bw, BADGE_H);
+                        canvas.fill_round_rect(
+                            br.x as f32,
+                            br.y as f32,
+                            br.w as f32,
+                            br.h as f32,
+                            999.0,
+                            &Paint::fill(base.scale_alpha(0.15)),
+                        );
+                        canvas.draw_text(text, br, base, crate::spec::Align::Center, None, 12.0);
+                        content_right -= bw + MENU_GAP;
+                    }
+                    // 标签（+ 可选第二行小字说明）。
+                    let label_w = (content_right - label_x).max(0);
+                    if let Some(sub) = &it.subtitle {
+                        let lr = Rect::new(label_x, top, label_w, h / 2);
+                        canvas.draw_text(
+                            &it.label,
+                            lr,
+                            color,
+                            crate::spec::Align::Start,
+                            None,
+                            MENU_FONT,
+                        );
+                        let sr = Rect::new(label_x, top + h / 2, label_w, h - h / 2);
+                        canvas.draw_text(
+                            sub,
+                            sr,
+                            mt.text_disabled(pal),
+                            crate::spec::Align::Start,
+                            None,
+                            MENU_FONT - 2.5,
+                        );
+                    } else {
+                        let lr = Rect::new(label_x, top, label_w, h);
+                        canvas.draw_text(
+                            &it.label,
+                            lr,
+                            color,
+                            crate::spec::Align::Start,
+                            None,
+                            MENU_FONT,
+                        );
+                    }
+                    // 尾随：子菜单箭头 › / 快捷键 / 勾选（收窄到 content_right，避免与徽章/图标重叠）。
+                    let tr = Rect::new(r.x, top, (content_right - r.x).max(0), h);
                     if !it.submenu.is_empty() {
                         canvas.draw_text(
                             "\u{203A}",
@@ -2332,6 +2436,53 @@ mod tests {
             None,
             "面板内非✕区不算关闭"
         );
+    }
+
+    #[test]
+    fn trailing_icon_click_fires_independently_of_item_selection() {
+        // 回归：菜单项的尾随可点击图标（如"删除该项"）点击只应触发它自己的回调，
+        // 不应选中该项——验证 trailing_icon_at 命中 + handle_menu_pointer 优先分支。
+        use crate::event::{MenuItem, MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+
+        let app = App::new("t", 400, 300).content(Element::col());
+        let mut app = app.into_handler_for_test();
+        let target = app.tree.root.unwrap();
+
+        let selected = std::rc::Rc::new(std::cell::Cell::new(false));
+        let trashed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let (sel, trash) = (selected.clone(), trashed.clone());
+        let item = MenuItem::run("团队版", move || sel.set(true), false)
+            .with_subtitle("多人协作 + 权限管理")
+            .with_badge("New", crate::theme::Intent::Danger)
+            .with_trailing_icon("🗑", move || trash.set(true));
+
+        let level = app.build_level(vec![item], 20, 20, 0, None, None);
+        app.menu = Some(ContextMenu {
+            levels: vec![level],
+            target,
+        });
+
+        let rect = app.menu.as_ref().unwrap().levels[0].rect;
+        let icon_pos = Point::new(
+            rect.right() - MENU_PAD_X - MENU_ICON_W / 2,
+            rect.y + MENU_VPAD + 5,
+        );
+        assert_eq!(
+            app.menu.as_ref().unwrap().levels[0].trailing_icon_at(icon_pos),
+            Some(0),
+            "尾随图标矩形应命中该项"
+        );
+
+        app.handle_menu_pointer(PointerEvent::single(
+            PointerKind::Down,
+            icon_pos,
+            MouseButton::Left,
+        ));
+
+        assert!(trashed.get(), "点击尾随图标应触发其自身回调");
+        assert!(!selected.get(), "点击尾随图标不应触发主项 action（选中）");
+        assert!(app.menu.is_none(), "点击后菜单应关闭");
     }
 
     #[test]
