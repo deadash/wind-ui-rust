@@ -57,16 +57,16 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
     HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IDC_IBEAM,
     MINMAXINFO, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, QS_ALLINPUT,
-    SM_CXDOUBLECLK, SM_CXFRAME, SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CYDOUBLECLK, SM_CYFRAME,
-    SM_CYSCREEN, SM_REMOTESESSION, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOW,
-    SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE,
-    WM_NCCREATE, WM_NCHITTEST, WM_NCMOUSEMOVE, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SETCURSOR, WM_SIZE, WM_TIMER, WM_TOUCH, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
-    WS_THICKFRAME,
+    SIZE_MINIMIZED, SM_CXDOUBLECLK, SM_CXFRAME, SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CYDOUBLECLK,
+    SM_CYFRAME, SM_CYSCREEN, SM_REMOTESESSION, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
+    SW_SHOW, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST, WM_NCMOUSEMOVE, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER, WM_TOUCH, WNDCLASSEXW, WS_MAXIMIZEBOX,
+    WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 
 use super::{AppHandler, WindowConfig};
@@ -273,6 +273,10 @@ struct WindowState {
     /// 窗口最小客户区尺寸（逻辑 dp，0=不限制）。WM_GETMINMAXINFO 据此换算物理像素下限。
     min_w: i32,
     min_h: i32,
+    /// 是否处于交互式拖拽移动/缩放的模态循环内（WM_ENTERSIZEMOVE..WM_EXITSIZEMOVE）。
+    /// 据此在 WM_SIZE 里分流：拖拽中走异步重绘（免 vsync 节流拖累手感），
+    /// 非拖拽的最大化/还原走同步重绘（避免 DWM 动画采样到旧尺寸缓冲被拉伸变形）。
+    in_size_move: bool,
 }
 
 /// 触摸拖动判定状态。区分"点击"（按下抬起未越阈值）与"滑动滚动"（越阈值后拖动）。
@@ -354,6 +358,7 @@ impl WindowState {
             pending_surrogate: None,
             min_w: 0,
             min_h: 0,
+            in_size_move: false,
         }
     }
 
@@ -763,15 +768,40 @@ unsafe extern "system" fn wnd_proc(
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_SIZE => {
+            // 最小化（客户区 0×0）：无可见内容，跳过 resize/重绘，避免 1×1 无效缓冲。
+            if wparam.0 as u32 == SIZE_MINIMIZED {
+                return LRESULT(0);
+            }
             // 客户区变化：通知后端调整缓冲（D2D 需 ResizeBuffers；Skia 为懒建无副作用），
-            // 再请求重绘。lParam 低/高字为新客户区宽/高（物理像素）。
+            // 再重绘。lParam 低/高字为新客户区宽/高（物理像素）。
             let w = (lparam.0 & 0xffff) as i32;
             let h = ((lparam.0 >> 16) & 0xffff) as i32;
             if let Some(state) = state_from(hwnd) {
                 state.backend.resize(w, h);
+                if state.in_size_move {
+                    // 拖拽缩放中：异步重绘，避免每次 WM_SIZE 都同步等 vsync 拖累拖拽手感。
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                } else {
+                    // 最大化/还原等一次性尺寸变化：ResizeBuffers 后同步出一帧，保证 DWM 动画
+                    // 无论何时采样后备缓冲都是新尺寸的正确内容，不会拉伸旧内容成变形左上角。
+                    // paint 内部会 ValidateRect 整个客户区，不会再触发多余 WM_PAINT。
+                    state.paint(hwnd);
+                }
             }
-            let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
+        }
+        // 进入/退出交互式拖拽移动/缩放模态循环：标记状态，供 WM_SIZE 分流同步/异步重绘。
+        WM_ENTERSIZEMOVE => {
+            if let Some(state) = state_from(hwnd) {
+                state.in_size_move = true;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_EXITSIZEMOVE => {
+            if let Some(state) = state_from(hwnd) {
+                state.in_size_move = false;
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         // 无边框：非客户区计算 → 客户区铺满整窗（去系统标题栏/边框）。
         // 最大化时用默认（含任务栏避让、正确插入边框），非最大化返回 0 即整窗。
