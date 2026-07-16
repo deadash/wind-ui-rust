@@ -1988,7 +1988,7 @@ impl Element {
         let mut body = Element::col().width_match();
         for (disp, &ri) in order.iter().enumerate() {
             body = body.child(sortable_table::body_row(
-                disp, ri, &data[ri], &weights, None, None, 1,
+                disp, ri, &data[ri], &weights, None, None, 1, None,
             ));
         }
         body.widget = Box::new(sortable_table::SortableBody::new(data, weights, sort));
@@ -2049,7 +2049,7 @@ impl Element {
         let mut body = Element::col().width_match();
         for (disp, row) in initial.iter().enumerate() {
             body = body.child(sortable_table::body_row(
-                disp, disp, row, &weights, None, None, 1,
+                disp, disp, row, &weights, None, None, 1, None,
             ));
         }
         body.widget = Box::new(sortable_table::PagedBody::new(rows, weights));
@@ -2236,6 +2236,29 @@ impl Element {
         if let Some(scroll) = self.children.last_mut() {
             if let Some(body) = scroll.children.get_mut(0) {
                 sortable_table::set_body_cell_lines(body, lines);
+            }
+        }
+        self
+    }
+
+    /// 整行**双击激活**回调：双击某数据行（落在数据/自定义单元格上，非操作列按钮）触发
+    /// `on_activate(ctx, 行下标)`，常用于「双击进入编辑」。行下标语义同 [`actions`](Self::actions)：
+    /// 客户端表格（[`table_sortable`](Self::table_sortable)）为原始行下标，服务端表格
+    /// （[`table_sortable_server`](Self::table_sortable_server)）为页内显示下标。
+    /// 仅对上述两类（HoverRow 型正文）有效；可多选表格（[`table_selectable`](Self::table_selectable)）
+    /// 因首列复选框语义冲突不支持。
+    ///
+    /// # 示例
+    /// ```ignore
+    /// Element::table_sortable_server(cols, rows, sort, on_sort)
+    ///     .on_row_activate(move |ctx, disp| open_edit(disp))
+    /// ```
+    pub fn on_row_activate(mut self, on_activate: impl Fn(&mut EventCtx, usize) + 'static) -> Self {
+        let cb: sortable_table::OnRowActivate = Rc::new(on_activate);
+        // 结构 col[ header, divider, scroll ]：scroll 为末子，其首个子节点挂响应式正文 widget。
+        if let Some(scroll) = self.children.last_mut() {
+            if let Some(body) = scroll.children.get_mut(0) {
+                sortable_table::set_body_activate(body, &cb);
             }
         }
         self

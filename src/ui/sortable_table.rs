@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use crate::anim::{Easing, Transition};
 use crate::core::{EventCtx, Widget};
-use crate::event::{Event, Key, PointerKind};
+use crate::event::{Event, Key, MouseButton, PointerKind};
 use crate::geometry::{Color, Rect, Size};
 use crate::render::{Canvas, Paint};
 use crate::signal::Signal;
@@ -109,6 +109,10 @@ pub(super) type OnSort = Rc<RefCell<dyn FnMut(&mut EventCtx, Option<(usize, Sort
 /// 排序仍基于单元格文本（渲染与排序键解耦）。行下标语义与操作列一致：
 /// 客户端表格为原始行下标，服务端表格为页内显示下标。
 pub(super) type CellRender = Rc<dyn Fn(usize, usize, &str) -> Option<Element>>;
+
+/// 行激活回调（双击整行触发）：携带行下标（语义同操作列/单元格渲染——客户端表格为原始
+/// 行下标，服务端表格为页内显示下标）。多行共享。落点在操作列按钮上时不触发（按钮先吃掉 Down）。
+pub(super) type OnRowActivate = Rc<dyn Fn(&mut EventCtx, usize)>;
 
 /// 单元格值比较：两侧都能解析为数值时按数值比，否则按字符串（区分大小写）。
 fn cmp_cells(a: &str, b: &str) -> Ordering {
@@ -217,14 +221,29 @@ pub(super) struct HoverRow {
     /// 叠层不透明度补间（normal=0 / hover）；首帧靠 `primed` 落定。
     overlay: Cell<Transition<f32>>,
     primed: Cell<bool>,
+    /// 行下标（传给激活回调；语义同操作列/单元格渲染）。
+    idx: usize,
+    /// 双击整行激活回调（如进入编辑）；`None` 时整行不可激活（保持纯悬停反馈）。
+    activate: Option<OnRowActivate>,
+    /// 双击已在第二次 Down 上"预备"，等随后的 Up（释放）落在本行内才真正激活——
+    /// 更贴合桌面双击语义（按下不动作、抬起才生效）。任何单击 Down / 离开都会清预备位。
+    armed: bool,
 }
 
 impl HoverRow {
     pub(super) fn new() -> Self {
+        Self::with_activate(0, None)
+    }
+
+    /// 带激活回调的悬停行：双击（`click_count>=2` 的左键）在**释放（Up）**时触发 `activate(ctx, idx)`。
+    pub(super) fn with_activate(idx: usize, activate: Option<OnRowActivate>) -> Self {
         Self {
             hover: false,
             overlay: Cell::new(Transition::new(0.0)),
             primed: Cell::new(false),
+            idx,
+            activate,
+            armed: false,
         }
     }
 }
@@ -280,6 +299,29 @@ impl Widget for HoverRow {
                         self.hover = false;
                         ctx.mark_dirty();
                     }
+                    // 手指移出本行：取消尚未释放的双击预备，避免在别处释放误激活。
+                    self.armed = false;
+                    true
+                }
+                // 双击的第二次 Down 只"预备"，不立即动作；单击 Down 顺带清预备位（避免陈旧误触）。
+                // 命中的子单元格标签不吃 Down，事件沿祖先链冒泡到本行；落在操作列按钮上时
+                // 按钮已先消费 Down，故整行不会被预备。
+                PointerKind::Down => {
+                    let dbl = p.button == MouseButton::Left
+                        && p.click_count >= 2
+                        && self.activate.is_some()
+                        && ctx.bounds().contains(p.pos);
+                    self.armed = dbl;
+                    dbl // 仅在预备成功时消费该 Down
+                }
+                // 已预备且在本行内释放：此刻才真正激活（进入编辑）。
+                PointerKind::Up if self.armed => {
+                    self.armed = false;
+                    if p.button == MouseButton::Left && ctx.bounds().contains(p.pos) {
+                        if let Some(cb) = self.activate.clone() {
+                            (cb)(ctx, self.idx);
+                        }
+                    }
                     true
                 }
                 _ => false,
@@ -290,6 +332,7 @@ impl Widget for HoverRow {
     }
     fn reset_interaction(&mut self) {
         self.hover = false;
+        self.armed = false;
         self.primed.set(false); // 隐藏期不回放 hover 淡出，下次显示瞬时落定
     }
 }
@@ -357,6 +400,7 @@ pub(super) fn body_row(
     actions: Option<&ActionCol>,
     render: Option<&CellRender>,
     lines: usize,
+    activate: Option<&OnRowActivate>,
 ) -> Element {
     let mut tr = Element::row().width_match().cross(Align::Stretch);
     // 斑马纹随显示位置交替（而非原始行号），排序后视觉仍规整。
@@ -370,7 +414,7 @@ pub(super) fn body_row(
     if let Some(a) = actions {
         tr = tr.child(action_cell((a.build)(orig), a.weight));
     }
-    tr.widget = Box::new(HoverRow::new());
+    tr.widget = Box::new(HoverRow::with_activate(orig, activate.cloned()));
     Element::col()
         .width_match()
         .child(tr)
@@ -495,7 +539,9 @@ pub(super) struct SortableBody {
     render: Option<CellRender>,
     /// 默认文本格最多显示行数（由 `Element::cell_lines` 设置，默认 1）。
     cell_lines: usize,
-    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render`/`set_cell_lines` 置位——初始 eager 行不含它们，需重建一次）。
+    /// 整行双击激活回调（由 `Element::on_row_activate` 设置）。
+    activate: Option<OnRowActivate>,
+    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render`/`set_cell_lines`/`set_activate` 置位——初始 eager 行不含它们，需重建一次）。
     force: bool,
     last_version: u64,
 }
@@ -510,8 +556,15 @@ impl SortableBody {
             actions: None,
             render: None,
             cell_lines: 1,
+            activate: None,
             force: false,
         }
+    }
+
+    /// 设置整行双击激活回调；置 `force` 令首次 on_update 重建（把激活能力纳入）。
+    pub(super) fn set_activate(&mut self, activate: OnRowActivate) {
+        self.activate = Some(activate);
+        self.force = true;
     }
 
     /// 设置尾部操作列；置 `force` 令首次 on_update 重建（把操作列纳入，替换初始纯文本行）。
@@ -554,6 +607,7 @@ impl Widget for SortableBody {
                 self.actions.as_ref(),
                 self.render.as_ref(),
                 self.cell_lines,
+                self.activate.as_ref(),
             );
             let id = el.build(tree);
             tree.add_child(self_id, id);
@@ -592,7 +646,9 @@ pub(super) struct PagedBody {
     render: Option<CellRender>,
     /// 默认文本格最多显示行数（由 `Element::cell_lines` 设置，默认 1）。
     cell_lines: usize,
-    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render`/`set_cell_lines` 置位）。
+    /// 整行双击激活回调（由 `Element::on_row_activate` 设置）。生成器收到当前页内显示下标。
+    activate: Option<OnRowActivate>,
+    /// 强制下次 on_update 重建（`set_actions`/`set_cell_render`/`set_cell_lines`/`set_activate` 置位）。
     force: bool,
     last_version: u64,
 }
@@ -606,8 +662,15 @@ impl PagedBody {
             actions: None,
             render: None,
             cell_lines: 1,
+            activate: None,
             force: false,
         }
+    }
+
+    /// 设置整行双击激活回调；置 `force` 令首次 on_update 重建（把激活能力纳入）。
+    pub(super) fn set_activate(&mut self, activate: OnRowActivate) {
+        self.activate = Some(activate);
+        self.force = true;
     }
 
     /// 设置尾部操作列；置 `force` 令首次 on_update 重建（把操作列纳入）。
@@ -650,6 +713,7 @@ impl Widget for PagedBody {
                 self.actions.as_ref(),
                 self.render.as_ref(),
                 self.cell_lines,
+                self.activate.as_ref(),
             );
             let id = el.build(tree);
             tree.add_child(self_id, id);
@@ -1113,6 +1177,23 @@ pub(super) fn set_body_cell_render(el: &mut Element, render: &CellRender) -> boo
     false
 }
 
+/// 若 `el` 挂的是 HoverRow 型响应式正文（Sortable/Paged）则设入整行双击激活回调并返回 true。
+/// 可选表格（SelectableBody/SelectableRow）不支持整行激活（首列复选框语义冲突），返回 false。
+pub(super) fn set_body_activate(el: &mut Element, activate: &OnRowActivate) -> bool {
+    let Some(a) = el.widget.as_any_mut() else {
+        return false;
+    };
+    if let Some(b) = a.downcast_mut::<SortableBody>() {
+        b.set_activate(activate.clone());
+        return true;
+    }
+    if let Some(b) = a.downcast_mut::<PagedBody>() {
+        b.set_activate(activate.clone());
+        return true;
+    }
+    false
+}
+
 /// 若 `el` 挂的是任一响应式正文（Sortable/Paged/Selectable）则设入默认文本格最多行数并返回 true。
 pub(super) fn set_body_cell_lines(el: &mut Element, lines: usize) -> bool {
     let Some(a) = el.widget.as_any_mut() else {
@@ -1494,6 +1575,63 @@ mod tests {
         );
         assert!(res.repaint, "悬停正文行应触发重绘（整行高亮淡入）");
         assert!(hover.is_some(), "应有命中的悬停节点");
+    }
+
+    #[test]
+    fn double_click_body_row_activates_with_row_index() {
+        // 双击整行触发 on_row_activate 并回报行下标；单击不触发。
+        use std::cell::Cell as StdCell;
+        let sort = signal(None);
+        let seen: Rc<StdCell<Option<usize>>> = Rc::new(StdCell::new(None));
+        let seen_c = seen.clone();
+        let mut tree = layout(
+            Element::table_sortable(
+                vec![("名称", 2.0), ("大小", 1.0)],
+                vec![vec!["a", "2"], vec!["b", "1"]],
+                sort,
+            )
+            .on_row_activate(move |_ctx, idx| seen_c.set(Some(idx)))
+            .width(400)
+            .height(300),
+        );
+        // 定位首个正文数据单元格中心。
+        let root = tree.root.unwrap();
+        let scroll = *tree.get(root).unwrap().children.last().unwrap();
+        let body = tree.get(scroll).unwrap().children[0];
+        let first_row = tree.get(body).unwrap().children[0];
+        let tr = tree.get(first_row).unwrap().children[0];
+        let cell = tree.get(tr).unwrap().children[0];
+        let at = abs_center(&tree, cell).unwrap();
+        let mut hover = None;
+        let mut capture = None;
+        let dbl_down = PointerEvent {
+            kind: PointerKind::Down,
+            pos: at,
+            button: MouseButton::Left,
+            click_count: 2,
+        };
+        // 单击（Down cc=1 + Up）不激活。
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Down, at, MouseButton::Left),
+            &mut hover,
+            &mut capture,
+        );
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Up, at, MouseButton::Left),
+            &mut hover,
+            &mut capture,
+        );
+        assert_eq!(seen.get(), None, "单击不应激活整行");
+        // 双击第二次 Down 只预备，不立即激活。
+        tree.dispatch_pointer(dbl_down, &mut hover, &mut capture);
+        assert_eq!(seen.get(), None, "双击按下（Down）时不应立即激活");
+        // 释放（Up）落在本行内 → 此刻才激活，回报首行下标 0。
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Up, at, MouseButton::Left),
+            &mut hover,
+            &mut capture,
+        );
+        assert_eq!(seen.get(), Some(0), "双击释放（Up）时应激活并回报行下标 0");
     }
 
     #[test]
