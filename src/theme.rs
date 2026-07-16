@@ -140,6 +140,19 @@ impl Intent {
             },
         }
     }
+
+    /// 徽章胶囊配色（收起态下拉当前项 / 展开态菜单项的尾随徽章通用）：返回 `(填充色, 文字色)`。
+    /// 淡色底 + **可读**的同色系前景。Neutral 用 `text_muted`（够深可读），不再用浅灰 `border`
+    /// 当字色——否则灰字灰底几乎看不清。
+    pub fn badge_colors(self, p: &Palette) -> (Color, Color) {
+        let fg = match self {
+            Intent::Primary => p.accent,
+            Intent::Neutral => p.text_muted,
+            Intent::Danger => p.danger,
+            Intent::Custom(c) => c,
+        };
+        (fg.scale_alpha(0.15), fg)
+    }
 }
 
 /// 尺寸单位：支持随 DPI 缩放的逻辑像素和固定物理像素两种模式。

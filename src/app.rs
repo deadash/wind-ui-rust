@@ -1709,10 +1709,7 @@ impl AppHandler for UiHost {
                         content_right -= MENU_ICON_W + MENU_GAP;
                     }
                     if let Some((text, intent)) = &it.badge {
-                        let base = match intent {
-                            crate::theme::Intent::Primary => pal.accent,
-                            other => other.colors(pal).bg,
-                        };
+                        let (fill, fg) = intent.badge_colors(pal);
                         let bw = canvas.measure_text(text, None, 12.0).w + 2 * BADGE_PAD_X;
                         let br =
                             Rect::new(content_right - bw, top + (h - BADGE_H) / 2, bw, BADGE_H);
@@ -1722,9 +1719,9 @@ impl AppHandler for UiHost {
                             br.w as f32,
                             br.h as f32,
                             999.0,
-                            &Paint::fill(base.scale_alpha(0.15)),
+                            &Paint::fill(fill),
                         );
-                        canvas.draw_text(text, br, base, crate::spec::Align::Center, None, 12.0);
+                        canvas.draw_text(text, br, fg, crate::spec::Align::Center, None, 12.0);
                         content_right -= bw + MENU_GAP;
                     }
                     // 标签（+ 可选第二行小字说明）。

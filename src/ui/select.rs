@@ -290,10 +290,7 @@ impl Widget for Dropdown {
             .map(|(text, _)| canvas.measure_text(text, None, 12.0).w + 2 * BADGE_PAD_X)
             .unwrap_or(0);
         if let Some((text, intent)) = &badge {
-            let base = match intent {
-                Intent::Primary => pal.accent,
-                other => other.colors(pal).bg,
-            };
+            let (fill, fg) = intent.badge_colors(pal);
             let br = Rect::new(
                 bounds.x + bounds.w - PAD_X - CHEVRON_W - badge_w,
                 bounds.y + (bounds.h - BADGE_H) / 2,
@@ -306,9 +303,9 @@ impl Widget for Dropdown {
                 br.w as f32,
                 br.h as f32,
                 999.0,
-                &Paint::fill(base.scale_alpha(0.15)),
+                &Paint::fill(fill),
             );
-            canvas.draw_text(text, br, base, Align::Center, None, 12.0);
+            canvas.draw_text(text, br, fg, Align::Center, None, 12.0);
         }
 
         // 当前选项文本（左侧，留出右侧 chevron 与徽章）。
