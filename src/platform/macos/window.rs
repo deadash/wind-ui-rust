@@ -286,6 +286,15 @@ define_class!(
             let allow = self.ivars().borrow_mut().handler.on_close_request();
             if !allow {
                 self.setNeedsDisplay(true);
+                // 取消关闭时排一次待处理窗口操作：hide_on_close 正是在 on_close_request
+                // 里返回 false 并留下 WindowOp::Hide。不排的话点关闭按钮会既不关也不隐。
+                //
+                // 借用已在上一条语句结束时释放——borrow_mut 是临时值，且 orderOut
+                // 会重入本视图的回调（同 win32 两段式）。
+                let op = self.ivars().borrow_mut().handler.take_window_op();
+                if let (Some(WindowOp::Hide), Some(win)) = (op, self.window()) {
+                    win.orderOut(None);
+                }
             }
             allow
         }

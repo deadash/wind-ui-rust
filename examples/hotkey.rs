@@ -6,7 +6,8 @@
 //! - 按 **Ctrl+Alt+D**（任何程序里都行，本窗口无需焦点）唤起窗口并置前。
 //! - 按 **Ctrl+Alt+H** 隐藏窗口。
 //! - 窗口内点「隐藏到托盘」按钮同样隐藏（走 `EventCtx::hide_window`）。
-//! - 托盘右键 → 退出。
+//! - **ESC 或点标题栏 × 均隐藏而非退出**（`hide_on_close`）。
+//! - 退出只有一条路：托盘右键 → 退出。
 //!
 //! 热键消息由系统投递到本窗口队列，空闲时仍阻塞在 `GetMessageW`——**零 CPU 占用**。
 
@@ -53,7 +54,7 @@ fn main() {
         .child(Element::label_rc(hits_text).height(22).width_match())
         .child(Element::divider())
         .child(
-            Element::label("Ctrl+Alt+D 唤起 · Ctrl+Alt+H 隐藏 · 关窗即退出")
+            Element::label("Ctrl+Alt+D 唤起 · Ctrl+Alt+H 隐藏 · ESC/× 收起 · 托盘右键退出")
                 .fg(Color::hex(0x636E72))
                 .height(20)
                 .width_match(),
@@ -64,6 +65,9 @@ fn main() {
     App::new("全局热键", 380, 240)
         .tray(tray)
         .start_hidden()
+        // ESC 与标题栏 × 均隐藏而非退出——常驻工具里「关闭」的意思是「收起来」。
+        // 真正的退出只在托盘右键菜单里。
+        .hide_on_close()
         // 回调只声明意图，拿不到窗口句柄——见 App::hotkey 文档中的借用纪律。
         .hotkey(Hotkey::new(Key::Char('D')).ctrl().alt(), move |ctx| {
             hits.set(hits.get() + 1);

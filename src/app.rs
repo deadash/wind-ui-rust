@@ -285,6 +285,9 @@ pub struct App {
     waker_shared: Option<Arc<WakerShared>>,
     single: Option<crate::single_instance::SingleInstance>,
     close_handler: Option<Box<dyn FnMut() -> bool>>,
+    /// 关闭请求转为隐藏窗口。与 `close_handler` 同属核心层的关闭决策链输入，
+    /// 平台层对此无感知，故不放 `WindowConfig`。
+    hide_on_close: bool,
 }
 
 impl App {
@@ -320,6 +323,7 @@ impl App {
             waker_shared: None,
             single: None,
             close_handler: None,
+            hide_on_close: false,
         }
     }
 
@@ -496,6 +500,23 @@ impl App {
         self
     }
 
+    /// 关闭请求转为隐藏窗口：按 ESC 或点标题栏关闭按钮时**隐藏而非退出进程**。
+    ///
+    /// 常驻托盘类应用用此项——用户的「关闭」意思通常是「收起来」，不是「杀掉它」。
+    /// 真正的退出留给托盘右键菜单（`TrayMenuItem::item("退出", |ctx| ctx.quit())`）。
+    ///
+    /// 优先级低于既有拦截链：先关最顶层对话框，再问 [`Self::on_close_request`]；
+    /// 只有拦截器放行后才轮到本项决定「关还是隐」。因此「有未保存数据时弹提示」与
+    /// 「关闭即隐藏」可以并存。
+    ///
+    /// # Panics
+    ///
+    /// debug 期，若既无托盘图标也无全局热键则 panic：窗口一旦被隐藏就再也无法唤起。
+    pub fn hide_on_close(mut self) -> Self {
+        self.hide_on_close = true;
+        self
+    }
+
     /// 配置系统托盘图标（图标 + 提示 + 左键/双击 + 原生右键菜单）。
     /// 窗口创建后安装，窗口销毁时自动清理。截屏模式下忽略。
     pub fn tray(mut self, tray: platform::Tray) -> Self {
@@ -535,11 +556,13 @@ impl App {
     }
 
     pub fn run(mut self) {
-        // 启动即隐藏却无任何唤起途径 = 用户永远看不到窗口，只能去任务管理器结束进程。
-        // 在 run() 而非 start_hidden() 里查：tray/hotkey 可能在其后才链上。
+        // 窗口会被隐藏（启动即隐 / 关闭转隐）却无任何唤起途径 = 用户再也看不到窗口，
+        // 只能去任务管理器结束进程。在 run() 而非各 setter 里查：tray/hotkey 可能在其后才链上。
         debug_assert!(
-            !self.cfg.start_hidden || self.cfg.tray.is_some() || !self.cfg.hotkeys.is_empty(),
-            "start_hidden 需配合 tray 或 hotkey：否则窗口无法被唤起"
+            !(self.cfg.start_hidden || self.hide_on_close)
+                || self.cfg.tray.is_some()
+                || !self.cfg.hotkeys.is_empty(),
+            "start_hidden / hide_on_close 需配合 tray 或 hotkey：否则窗口隐藏后无法被唤起"
         );
         let single = self.single.take();
         let theme_src = match self.theme_src {
@@ -558,6 +581,7 @@ impl App {
                 self.pumps,
                 self.intervals,
                 self.close_handler,
+                self.hide_on_close,
             ))
         } else {
             Box::new(ClosureHandler {
@@ -580,6 +604,7 @@ impl App {
             self.pumps,
             self.intervals,
             self.close_handler,
+            self.hide_on_close,
         )
     }
 
@@ -753,12 +778,57 @@ struct UiHost {
     show_fps: bool,
     /// 关闭请求拦截器：返回 true 允许关闭，false 取消。None 时默认允许。
     close_handler: Option<Box<dyn FnMut() -> bool>>,
+    /// 关闭请求转为隐藏窗口（常驻托盘类应用）。
+    hide_on_close: bool,
 }
 
 /// 脏区四周外扩的抗锯齿余量（逻辑像素）：覆盖滑块边缘 AA 与子像素取整，杜绝残影。
 const DAMAGE_MARGIN: i32 = 2;
 
 impl UiHost {
+    /// 关闭请求的统一决策，ESC 与标题栏关闭按钮共用。返回 true 表示应当真正关闭窗口。
+    ///
+    /// 优先级：关最顶层对话框 → 问 `close_handler` → 按 `hide_on_close` 决定关还是隐。
+    ///
+    /// 隐藏走既有的 `WindowOp` 管道而非在此直接操作窗口：本函数在平台层持有窗口状态
+    /// 借用期间被调用（win32 `WM_CLOSE` / macOS `windowShouldClose:`），此处碰 OS 会
+    /// 同步重入（见 AGENTS.md 铁律 6）。
+    fn resolve_close(&mut self) -> bool {
+        // 优先关闭最顶层可见对话框（不退出窗口）。
+        if close_topmost_modal() {
+            // 对话框被关闭，需要重绘以隐藏遮罩。
+            self.needs_full = true;
+            return false;
+        }
+        // 无对话框时询问 close_handler，默认允许关闭。
+        let allowed = self.close_handler.as_mut().map(|h| h()).unwrap_or(true);
+        if allowed && self.hide_on_close {
+            self.pending_window_op = Some(WindowOp::Hide);
+            return false;
+        }
+        allowed
+    }
+
+    /// 落地控件发出的关闭请求（`EventCtx::request_close`）：`hide_on_close` 时转为隐藏。
+    ///
+    /// 关闭请求有**三个**入口，走两套管道，容易漏：
+    /// - ESC 与系统标题栏 × → `on_close_request` → [`Self::resolve_close`]
+    /// - 控件主动请求 → `res.close` → **本函数**
+    ///
+    /// 第三个入口最易被忽略：有边框窗口的 × 由系统绘制、走 `WM_CLOSE`；而**无边框窗口
+    /// 的 × 是自绘控件**（`Element::window_button(WindowButtonKind::Close)`），走的是
+    /// `request_close()`。漏掉本函数，`.frameless().hide_on_close()` 会直接杀进程。
+    ///
+    /// 此处**不询问 `close_handler`**：`request_close()` 的语义是「应用已决定关闭」，
+    /// 而非「用户请求关闭」，沿用既有行为不变。
+    fn apply_close_intent(&mut self) {
+        if self.hide_on_close {
+            self.pending_window_op = Some(WindowOp::Hide);
+        } else {
+            self.close = true;
+        }
+    }
+
     fn new(
         root: Element,
         theme_src: ThemeHandle,
@@ -766,6 +836,7 @@ impl UiHost {
         pumps: Vec<Box<dyn FnMut()>>,
         intervals: Vec<(std::time::Duration, Box<dyn FnMut()>)>,
         close_handler: Option<Box<dyn FnMut() -> bool>>,
+        hide_on_close: bool,
     ) -> Self {
         // 尽早注入，使首个事件（首帧渲染前）也能读到正确主题。
         let theme = theme_src.current();
@@ -815,6 +886,7 @@ impl UiHost {
             interval_durs,
             show_fps: std::env::var("WINDUI_FPS").is_ok_and(|v| v != "0" && !v.is_empty()),
             close_handler,
+            hide_on_close,
         }
     }
 
@@ -1252,7 +1324,7 @@ impl UiHost {
                             MenuAction::SendKey(key) => {
                                 let res = self.tree.dispatch_key(key, Some(target));
                                 if res.close {
-                                    self.close = true;
+                                    self.apply_close_intent();
                                 }
                             }
                             MenuAction::Run(f) => f(),
@@ -1967,7 +2039,7 @@ impl AppHandler for UiHost {
             self.focus_visible = false;
         }
         if res.close {
-            self.close = true;
+            self.apply_close_intent();
         }
         // 控件请求弹出上下文菜单。target 是 SendKey 动作的派发对象：优先刚获焦的控件
         // （如 TextInput 右键剪贴板项），否则回退到根节点（on_context_menu 容器不可聚焦，
@@ -2024,7 +2096,7 @@ impl AppHandler for UiHost {
         // 其余键先交给焦点控件；未被消费的 Escape 回退为关闭窗口。
         let res = self.tree.dispatch_key(ev, self.focus);
         if res.close {
-            self.close = true;
+            self.apply_close_intent();
         }
         if let Some(url) = res.open_url {
             platform::open_url(&url);
@@ -2038,17 +2110,8 @@ impl AppHandler for UiHost {
         if let Some(req) = res.toast {
             self.show_toast(req);
         }
-        if !res.consumed && ev.key == Key::Escape {
-            // 优先关闭最顶层可见对话框；无对话框时才询问 close_handler，再关窗口。
-            if !close_topmost_modal() {
-                let allowed = self.close_handler.as_mut().map(|h| h()).unwrap_or(true);
-                if allowed {
-                    self.close = true;
-                }
-            } else {
-                // 对话框被关闭，需要重绘以隐藏遮罩。
-                self.needs_full = true;
-            }
+        if !res.consumed && ev.key == Key::Escape && self.resolve_close() {
+            self.close = true;
         }
         // 键盘改动可能影响布局（文本增减）或他处（切页/对话框）→ 置 needs_relayout：
         // render 重排后用结构签名判定，签名不变（定宽输入打字）走局部，变了升级整窗。
@@ -2064,13 +2127,7 @@ impl AppHandler for UiHost {
     }
 
     fn on_close_request(&mut self) -> bool {
-        // 优先关闭最顶层可见对话框（不退出窗口）。
-        if close_topmost_modal() {
-            self.needs_full = true;
-            return false;
-        }
-        // 无对话框时询问 close_handler，默认允许关闭。
-        self.close_handler.as_mut().map(|h| h()).unwrap_or(true)
+        self.resolve_close()
     }
 
     fn capture_active(&self) -> bool {
@@ -2111,7 +2168,7 @@ impl AppHandler for UiHost {
         );
         let res = self.tree.dispatch_files(p, paths);
         if res.close {
-            self.close = true;
+            self.apply_close_intent();
         }
         if let Some(url) = res.open_url {
             platform::open_url(&url);
@@ -2406,6 +2463,74 @@ mod tests {
     fn on_interval_registers() {
         let app = App::new("t", 100, 100).on_interval(std::time::Duration::from_millis(100), || {});
         assert_eq!(app.intervals.len(), 1);
+    }
+
+    /// 默认（未开 hide_on_close）：关闭请求获准 → 真关，不留窗口操作。
+    #[test]
+    fn close_request_closes_by_default() {
+        let app = App::new("t", 100, 100).content(Element::col());
+        let mut app = app.into_handler_for_test();
+        assert!(app.on_close_request(), "默认应允许关闭");
+        assert_eq!(app.take_window_op(), None, "不该留下窗口操作");
+    }
+
+    /// hide_on_close：关闭请求被拒（不关窗），改留下 Hide 意图交平台层执行。
+    #[test]
+    fn hide_on_close_turns_close_into_hide() {
+        let app = App::new("t", 100, 100)
+            .hide_on_close()
+            .content(Element::col());
+        let mut app = app.into_handler_for_test();
+        assert!(!app.on_close_request(), "hide_on_close 时不该关窗");
+        assert_eq!(
+            app.take_window_op(),
+            Some(WindowOp::Hide),
+            "须留下 Hide 意图——平台层靠它在借用释放后隐藏窗口"
+        );
+    }
+
+    /// 拦截器优先于 hide_on_close：拦截器拒绝时，连 Hide 都不该发生。
+    /// 这是文档承诺的「未保存提示与关闭即隐藏可并存」的前提。
+    #[test]
+    fn close_handler_takes_priority_over_hide_on_close() {
+        let app = App::new("t", 100, 100)
+            .hide_on_close()
+            .on_close_request(|| false)
+            .content(Element::col());
+        let mut app = app.into_handler_for_test();
+        assert!(!app.on_close_request());
+        assert_eq!(
+            app.take_window_op(),
+            None,
+            "拦截器拒绝时窗口应原样留着，既不关也不隐"
+        );
+    }
+
+    /// 控件的 request_close（无边框窗口的自绘 × 走此路）也须受 hide_on_close 约束。
+    /// 它与 ESC/系统 × 走的是**另一条管道**（res.close 而非 on_close_request），
+    /// 漏接会让 .frameless().hide_on_close() 直接杀进程。
+    #[test]
+    fn widget_request_close_respects_hide_on_close() {
+        let app = App::new("t", 100, 100)
+            .hide_on_close()
+            .content(Element::col());
+        let mut app = app.into_handler_for_test();
+        app.apply_close_intent();
+        assert!(
+            !app.wants_close(),
+            "hide_on_close 时控件请求关闭不该退出进程"
+        );
+        assert_eq!(app.take_window_op(), Some(WindowOp::Hide));
+    }
+
+    /// 未开 hide_on_close 时，控件的 request_close 仍须真关——不可回归。
+    #[test]
+    fn widget_request_close_still_closes_by_default() {
+        let app = App::new("t", 100, 100).content(Element::col());
+        let mut app = app.into_handler_for_test();
+        app.apply_close_intent();
+        assert!(app.wants_close());
+        assert_eq!(app.take_window_op(), None);
     }
 
     #[test]

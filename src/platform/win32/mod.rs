@@ -987,6 +987,13 @@ unsafe extern "system" fn wnd_proc(
             }
             if allow {
                 let _ = DestroyWindow(hwnd);
+            } else {
+                // 取消关闭时排一次待处理窗口操作：hide_on_close 正是在 on_close_request
+                // 里返回 false 并留下 WindowOp::Hide。不排的话点关闭按钮会既不关也不隐，
+                // 看起来像卡死。
+                //
+                // 两段式：上面的 state 借用已在取出 (allow, repaint) 的块结束时释放。
+                apply_window_op(hwnd);
             }
             LRESULT(0)
         }
