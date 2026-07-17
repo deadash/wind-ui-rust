@@ -189,6 +189,16 @@ pub(crate) fn run_offscreen(cfg: &WindowConfig, handler: &mut Box<dyn AppHandler
     eprintln!("[windui] 截屏已保存: {}", path.display());
 }
 
+/// 一条全局热键绑定：组合 + 回调。
+///
+/// 回调拿到的 [`HotkeyCtx`](crate::event::HotkeyCtx) **不持有窗口句柄**，只能声明
+/// 窗口操作意图——回调在平台层持有窗口状态借用期间执行，直接调用 OS 窗口 API 会
+/// 同步重入消息处理并造成 `&mut` 别名（见 `AGENTS.md` 铁律 6）。
+pub struct HotkeyBinding {
+    pub hotkey: crate::event::Hotkey,
+    pub callback: Box<dyn FnMut(&mut crate::event::HotkeyCtx)>,
+}
+
 /// 窗口配置（平台无关）。由 `App` 构建器组装，交各平台后端的 `run` 消费。
 pub struct WindowConfig {
     pub title: String,
@@ -211,6 +221,13 @@ pub struct WindowConfig {
     pub screenshot_hover: Option<(i32, i32)>,
     /// 系统托盘图标（None=不创建）。窗口创建后安装，窗口销毁时自动清理。
     pub tray: Option<Tray>,
+    /// 全局热键绑定（空=不注册）。窗口创建后注册，窗口销毁时自动注销。
+    pub hotkeys: Vec<HotkeyBinding>,
+    /// 启动即隐藏：窗口创建后不显示，交由托盘或全局热键唤起。
+    ///
+    /// 无托盘图标也无热键时启用此项，用户将**永远看不到窗口**——故 `App::start_hidden`
+    /// 在 debug 期对该组合 panic 提示误用。
+    pub start_hidden: bool,
     /// 无标题栏窗口（自定义标题栏）：客户区铺满整窗，保留系统级吸附/阴影/缩放。
     pub frameless: bool,
     /// 动画全局开关：None=随系统“显示动画”设置；Some(b)=强制开/关。
@@ -238,6 +255,8 @@ impl Default for WindowConfig {
             screenshot_click: None,
             screenshot_hover: None,
             tray: None,
+            hotkeys: Vec::new(),
+            start_hidden: false,
             frameless: false,
             animations: None,
             accelerated: false,

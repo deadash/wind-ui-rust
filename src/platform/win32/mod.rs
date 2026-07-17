@@ -6,6 +6,7 @@
 pub mod clipboard;
 #[cfg(feature = "d2d")]
 mod d2d;
+pub mod hotkey;
 pub mod tray;
 
 pub use tray::{Tray, TrayCtx, TrayMenuItem};
@@ -52,21 +53,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
     GetMessageExtraInfo, GetMessageTime, GetMessageW, GetSystemMetrics, GetWindowLongPtrW,
     GetWindowRect, IsIconic, IsZoomed, LoadCursorW, LoadIconW, MsgWaitForMultipleObjectsEx,
-    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassExW, SetCursor, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
     CREATESTRUCTW, CW_USEDEFAULT, GWLP_USERDATA, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION,
     HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IDC_ARROW, IDC_HAND, IDC_IBEAM,
     MINMAXINFO, MSG, MWMO_INPUTAVAILABLE, NCCALCSIZE_PARAMS, PM_REMOVE, QS_ALLINPUT,
     SIZE_MINIMIZED, SM_CXDOUBLECLK, SM_CXFRAME, SM_CXPADDEDBORDER, SM_CXSCREEN, SM_CYDOUBLECLK,
     SM_CYFRAME, SM_CYSCREEN, SM_REMOTESESSION, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE,
-    SW_SHOW, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST, WM_NCMOUSEMOVE, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_TIMER, WM_TOUCH, WNDCLASSEXW, WS_MAXIMIZEBOX,
-    WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_MAXIMIZE, SW_MINIMIZE,
+    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CAPTURECHANGED, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_DPICHANGED,
+    WM_DROPFILES, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_GETMINMAXINFO, WM_HOTKEY,
+    WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCALCSIZE, WM_NCCREATE, WM_NCHITTEST,
+    WM_NCMOUSEMOVE, WM_PAINT, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE,
+    WM_TIMER, WM_TOUCH, WNDCLASSEXW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 
 use super::{AppHandler, WindowConfig};
@@ -264,6 +265,8 @@ struct WindowState {
     touch: Touch,
     /// 系统托盘状态（None=无托盘）。drop 时自动清理图标。
     tray: Option<tray::TrayState>,
+    /// 全局热键状态（None=无热键）。drop 时自动注销。
+    hotkeys: Option<hotkey::HotkeyState>,
     /// 无标题栏窗口：wnd_proc 据此处理 WM_NCCALCSIZE / WM_NCHITTEST。
     frameless: bool,
     /// 是否已向系统申请鼠标离开通知（TrackMouseEvent）。离开后系统清此标志需重新申请。
@@ -353,6 +356,7 @@ impl WindowState {
             last_click: ClickTracker::default(),
             touch: Touch::default(),
             tray: None,
+            hotkeys: None,
             frameless: false,
             mouse_tracked: false,
             pending_surrogate: None,
@@ -556,6 +560,15 @@ unsafe fn run_windowed(
     // 接收文件拖放：拖入文件后以 WM_DROPFILES 递送路径 + 落点。
     DragAcceptFiles(hwnd, true);
 
+    // 全局热键（若配置）：窗口创建后注册，状态存入 WindowState（drop 时自动注销）。
+    // 注册失败不阻止启动——热键是全局独占资源，被占用是常态而非异常。
+    if !cfg.hotkeys.is_empty() {
+        let hs = hotkey::HotkeyState::register(hwnd, std::mem::take(&mut cfg.hotkeys));
+        if let Some(s) = state_from(hwnd) {
+            s.hotkeys = Some(hs);
+        }
+    }
+
     // 系统托盘图标（若配置）：窗口创建后安装，状态存入 WindowState（drop 时清理）。
     if let Some(t) = cfg.tray.take() {
         if let Some(ts) = tray::install(hwnd, t) {
@@ -609,8 +622,12 @@ unsafe fn run_windowed(
         );
     }
 
-    let _ = ShowWindow(hwnd, SW_SHOW);
-    let _ = UpdateWindow(hwnd);
+    // 启动即隐藏：常驻托盘类应用不该在启动时闪一下窗口。此处**不调用 ShowWindow**，
+    // 窗口保持初始的不可见态，等托盘点击或全局热键送来 WindowOp::Show。
+    if !cfg.start_hidden {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = UpdateWindow(hwnd);
+    }
 
     run_message_loop(hwnd);
 
@@ -905,6 +922,19 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         // 托盘回调消息：左键/双击触发回调，右键弹原生菜单。
+        // 全局热键：系统投递到本窗口队列（事件驱动，不轮询，故不破坏空闲零 CPU）。
+        //
+        // 严格两段式（铁律 6）：第一段借 state 跑回调、取出意图；借用在语句结束时释放。
+        // 第二段才碰 OS——`ShowWindow`/`SetForegroundWindow` 会同步派发 WM_SHOWWINDOW /
+        // WM_ACTIVATE 回本函数，届时会再 `state_from` 一次。若此刻第一段的借用还活着，
+        // 就是两个 `&mut WindowState` 并存的 UB（无 RefCell，不会 panic，只会静默出错）。
+        WM_HOTKEY => {
+            let op = state_from(hwnd)
+                .and_then(|s| s.hotkeys.as_mut())
+                .and_then(|hs| hs.dispatch(wparam.0));
+            run_window_op(hwnd, op);
+            LRESULT(0)
+        }
         tray::WM_TRAYICON => {
             if let Some(state) = state_from(hwnd) {
                 if let Some(ts) = state.tray.as_mut() {
@@ -1113,9 +1143,22 @@ unsafe fn handle_nchittest(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     LRESULT(ht as isize)
 }
 
-/// 事件分发后执行待处理的窗口操作（自定义标题栏按钮）。
+/// 事件分发后执行待处理的窗口操作（自定义标题栏按钮、`EventCtx::hide_window` 等）。
+///
+/// 两段式：`state_from` 的借用在取出 op 的那条语句结束时即释放，随后 `run_window_op`
+/// 里的 OS 调用才可能重入 `wnd_proc`（铁律 6）。
 unsafe fn apply_window_op(hwnd: HWND) {
     let op = state_from(hwnd).and_then(|s| s.handler.take_window_op());
+    run_window_op(hwnd, op);
+}
+
+/// 执行一个窗口操作。**调用方须已释放 `WindowState` 借用**——此处的 OS 调用会同步
+/// 重入 `wnd_proc`（`ShowWindow` 派发 WM_SHOWWINDOW、`SetForegroundWindow` 派发
+/// WM_ACTIVATE），届时会再次 `state_from`。
+///
+/// 事件路径（`apply_window_op`）与全局热键路径（`WM_HOTKEY`）共用本函数：op 的来源
+/// 不同，执行语义必须一致。
+unsafe fn run_window_op(hwnd: HWND, op: Option<WindowOp>) {
     match op {
         Some(WindowOp::Minimize) => {
             let _ = ShowWindow(hwnd, SW_MINIMIZE);
@@ -1128,7 +1171,28 @@ unsafe fn apply_window_op(hwnd: HWND) {
             };
             let _ = ShowWindow(hwnd, cmd);
         }
+        Some(WindowOp::Show) => show_and_activate(hwnd),
+        Some(WindowOp::Hide) => {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
         None => {}
+    }
+}
+
+/// 显示并前置窗口：取消最小化 + 置前。
+///
+/// `SetForegroundWindow` 受系统前台激活权限限制——后台进程默认无权抢前台，调用会
+/// 静默失败（窗口只在任务栏闪烁）。但**全局热键是系统认可的激活来源**：处理
+/// `WM_HOTKEY` 期间本线程持有前台激活权，故经热键唤起时此处成立。
+/// 托盘点击同理（用户交互授予）。
+pub(crate) fn show_and_activate(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOW);
+        }
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 

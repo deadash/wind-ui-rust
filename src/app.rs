@@ -303,6 +303,8 @@ impl App {
                 screenshot_click: None,
                 screenshot_hover: None,
                 tray: None,
+                hotkeys: Vec::new(),
+                start_hidden: false,
                 frameless: false,
                 animations: None,
                 accelerated: false,
@@ -448,6 +450,52 @@ impl App {
         self
     }
 
+    /// 注册全局热键：应用无焦点、窗口隐藏时亦可触发。可多次调用注册多个。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// App::new("查词", 480, 360)
+    ///     .start_hidden()
+    ///     .hotkey(Hotkey::new(Key::Char('D')).ctrl().alt(), |ctx| ctx.show_window())
+    ///     .run();
+    /// ```
+    ///
+    /// 回调拿到的 [`HotkeyCtx`](crate::event::HotkeyCtx) **只能声明窗口操作意图**，
+    /// 拿不到窗口句柄——回调在平台层持有窗口状态借用期间执行，直接调 OS 窗口 API 会
+    /// 同步重入消息处理并造成 `&mut` 别名（见 `AGENTS.md` 铁律 6）。
+    ///
+    /// **注册可能失败且不报错**：热键是全局独占资源，组合被其他程序占用时系统会拒绝，
+    /// 此时该热键静默失效、其余热键与应用本身不受影响。这是刻意的——为一个热键冲突
+    /// 让整个应用起不来是不可接受的。
+    ///
+    /// **平台状态：全局热键当前仅 Windows 实现。** macOS 上本方法在 debug 期 panic
+    /// （提示未实现）、release 期静默忽略；托盘、[`Self::start_hidden`] 与窗口显隐在
+    /// 两平台均可用。详见 `src/platform/macos/hotkey.rs`。
+    pub fn hotkey(
+        mut self,
+        hotkey: crate::event::Hotkey,
+        callback: impl FnMut(&mut crate::event::HotkeyCtx) + 'static,
+    ) -> Self {
+        self.cfg.hotkeys.push(platform::HotkeyBinding {
+            hotkey,
+            callback: Box::new(callback),
+        });
+        self
+    }
+
+    /// 启动即隐藏：窗口创建后不显示，等托盘点击或全局热键唤起。
+    ///
+    /// 常驻托盘类应用用此项避免启动时闪一下窗口。
+    ///
+    /// # Panics
+    ///
+    /// debug 期，若既无托盘图标也无全局热键则 panic：那样用户将**永远无法唤起窗口**，
+    /// 只能从任务管理器结束进程。这几乎总是误用而非有意为之。
+    pub fn start_hidden(mut self) -> Self {
+        self.cfg.start_hidden = true;
+        self
+    }
+
     /// 配置系统托盘图标（图标 + 提示 + 左键/双击 + 原生右键菜单）。
     /// 窗口创建后安装，窗口销毁时自动清理。截屏模式下忽略。
     pub fn tray(mut self, tray: platform::Tray) -> Self {
@@ -487,6 +535,12 @@ impl App {
     }
 
     pub fn run(mut self) {
+        // 启动即隐藏却无任何唤起途径 = 用户永远看不到窗口，只能去任务管理器结束进程。
+        // 在 run() 而非 start_hidden() 里查：tray/hotkey 可能在其后才链上。
+        debug_assert!(
+            !self.cfg.start_hidden || self.cfg.tray.is_some() || !self.cfg.hotkeys.is_empty(),
+            "start_hidden 需配合 tray 或 hotkey：否则窗口无法被唤起"
+        );
         let single = self.single.take();
         let theme_src = match self.theme_src {
             Some(h) => h,

@@ -112,7 +112,7 @@ fn main() {
 | 导航 | `segmented`（连体多段单选）/ `nav_row` / `collapsible` / `accordion`（手风琴） |
 | 列表 | `list`（单选/滚动/高亮/图标/禁用态） |
 | 图片 | `image` / `image_view`（PNG/SVG，状态调制/着色/圆角） |
-| 系统 | 系统托盘（图标 + 左键/双击 + 原生右键菜单）、无边框窗口（自定义标题栏）、文件拖放、剪贴板 |
+| 系统 | 系统托盘（图标 + 左键/双击 + 原生右键菜单）、全局热键（Windows）、启动即隐藏、无边框窗口（自定义标题栏）、文件拖放、剪贴板 |
 
 表单控件通过 `Rc<Cell<T>>` / `Rc<RefCell<String>>` 与外部状态双向绑定。
 
@@ -126,7 +126,7 @@ cargo test                                                  # 运行单元测试
 cargo clippy --all-targets                                  # 静态检查
 ```
 
-示例一览：`fullshowcase`（综合）、`animation`、`theming`、`image`、`list`、`dropdown`、`progress`、`multiline`、`emoji`（彩色 emoji 渲染）、`frameless`、`light_titlebar`、`tray`、`file_drop`、`ime_settings`，以及 `phase0`–`phase5` 分阶段演示。
+示例一览：`fullshowcase`（综合）、`animation`、`theming`、`image`、`list`、`dropdown`、`progress`、`multiline`、`emoji`（彩色 emoji 渲染）、`frameless`、`light_titlebar`、`tray`、`hotkey`（全局热键 + 启动即隐藏）、`file_drop`、`ime_settings`，以及 `phase0`–`phase5` 分阶段演示。
 
 ## 架构
 

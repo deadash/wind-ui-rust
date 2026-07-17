@@ -1146,6 +1146,17 @@ impl EventCtx<'_> {
     pub fn toggle_maximize(&mut self) {
         self.out.window_op = Some(WindowOp::ToggleMaximize);
     }
+    /// 请求显示并前置窗口。
+    pub fn show_window(&mut self) {
+        self.out.window_op = Some(WindowOp::Show);
+    }
+    /// 请求隐藏窗口（进程继续存活，可经托盘或全局热键唤起）。
+    ///
+    /// 与 `ctx.request_close()` 的区别是根本性的：隐藏只改变可见性，关闭会销毁窗口
+    /// 并结束消息循环。常驻托盘类应用要的是前者。
+    pub fn hide_window(&mut self) {
+        self.out.window_op = Some(WindowOp::Hide);
+    }
 
     /// 弹出轻提示（中性信息）。居中浮层 + 淡入淡出 + 定时自动消失，由宿主接管。
     /// **脱离布局树**——不绑定任何节点，任意控件回调内 `ctx.toast("…")` 即可。

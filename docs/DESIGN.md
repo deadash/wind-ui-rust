@@ -347,6 +347,11 @@ retained 模式下，事件回调既要改 widget 自身状态、又可能要改
 - **命中链先算后用**：hit-test 阶段只读借 arena 得到 `Vec<NodeId>`，处理阶段才可变借。
 - **`EventCtx` 作受控句柄**：传给 `on_event` 的不是裸 arena，而是 `EventCtx`，提供 `mark_dirty(id)`、`request_focus(id)`、`get_state_mut::<T>(id)`、`set_text(id, ..)` 等安全操作，内部用「取出-执行-放回」打破自借用。
 - **应用状态用闭包捕获**：Builder 的 `.on_click(move |ctx| ...)` 闭包可捕获 `Rc<RefCell<AppState>>`（小工具友好），或发出用户消息进 `ctx.commands` 队列由主循环消费（Elm 风格，状态更可控）。MVP 默认支持前者，预留后者。
+- **OS 回调只给意图、不给句柄**：平台层在持有窗口状态借用期间调用户回调时，回调若能直接调 OS 窗口 API（`ShowWindow`/`SetForegroundWindow` 等），这些 API 会**同步**派发消息重入 `wnd_proc`，那里再取一次状态即造成 `&mut` 别名。win32 的窗口状态是裸指针造的 `&mut`（无 `RefCell`），**违反不会 panic，只会静默 UB**。
+
+  解法：**不把句柄交给回调**。`HotkeyCtx`（`event.rs`）只有一个 `Option<WindowOp>` 字段，`show_window()` 仅写入意图；平台层在借用释放后才由 `run_window_op` 执行。这样「别在借用期间碰 OS」从**靠人记性的纪律**（AGENTS.md 铁律 6）升级为**类型上的保证**——危险代码写不出来。
+
+  > 这是后续所有 OS 回调的**推荐范式**。反例：win32 的 `TrayCtx` 持有 `hwnd` 并直接调 `ShowWindow`，其调用点仍在借用期内，属既有待收敛项。
 
 ```rust
 pub struct EventCtx<'a> {

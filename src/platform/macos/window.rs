@@ -762,6 +762,14 @@ impl ContentView {
                 match op {
                     WindowOp::Minimize => win.miniaturize(None),
                     WindowOp::ToggleMaximize => win.zoom(None),
+                    // 与 macos/tray.rs 的 TrayCtx::show_window / hide_window 同源：
+                    // 二者是同一语义的两个入口（托盘点击 / 控件请求），实现必须一致。
+                    WindowOp::Show => {
+                        win.makeKeyAndOrderFront(None);
+                        // 隐藏期间应用可能已失去激活态，仅 orderFront 不足以到前台。
+                        NSApplication::sharedApplication(MainThreadMarker::from(self)).activate();
+                    }
+                    WindowOp::Hide => win.orderOut(None),
                 }
             }
         }
@@ -943,13 +951,23 @@ pub(crate) fn run_windowed(
     // on_interval：按 handler 注册的间隔安装周期 NSTimer。
     view.install_interval_timers();
 
+    // 全局热键（若配置）：macOS 尚未实现，此处仅触发 debug 期提示。
+    // 详见 platform/macos/hotkey.rs——Windows 侧已实现，macOS 需 Carbon RegisterEventHotKey。
+    if !cfg.hotkeys.is_empty() {
+        super::hotkey::HotkeyState::register(std::mem::take(&mut cfg.hotkeys));
+    }
+
     // 系统托盘（若配置）：窗口创建后安装；TrayState 须存活至退出（按钮 target 为弱引用）。
     let _tray = cfg
         .tray
         .take()
         .and_then(|t| super::tray::install(mtm, window.clone(), t));
 
-    window.makeKeyAndOrderFront(None);
+    // 启动即隐藏：不 orderFront，窗口保持不可见，等托盘唤起。
+    // 注意 app.activate() 仍需调用——否则应用不在前台，托盘菜单交互会异常。
+    if !cfg.start_hidden {
+        window.makeKeyAndOrderFront(None);
+    }
     app.activate();
     app.run();
     drop(_tray);

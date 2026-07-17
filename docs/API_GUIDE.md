@@ -274,6 +274,31 @@ App::new("…", w, h).tray(
 - 回调拿 `TrayCtx`：`show_window()` / `hide_window()` / `quit()` / `notify(title, body)`（气泡通知）。
 - 图标可 `.icon_rgba(w,h,&rgba)`（零依赖，从 RGBA 造 HICON），未设则用系统默认应用图标。窗口销毁时托盘自动清理。完整示例见 `examples/tray.rs`。
 
+### 全局热键与启动即隐藏
+
+常驻后台小工具的骨架：启动不显示窗口，靠热键随时唤起。
+
+```rust
+App::new("查词", 480, 360)
+    .tray(Tray::new().on_left_click(|ctx| ctx.show_window()))
+    .start_hidden()                                   // 启动不显示窗口，无闪烁
+    .hotkey(Hotkey::new(Key::Char('D')).ctrl().alt(), |ctx| ctx.show_window())
+    .hotkey(Hotkey::new(Key::Char('H')).ctrl().alt(), |ctx| ctx.hide_window())
+    .content(ui)
+    .run();
+```
+
+- **全局**：应用无焦点、窗口隐藏时亦可触发。消息由系统投递到窗口队列，**事件驱动不轮询**，空闲仍是零 CPU。
+- 修饰键链式声明：`.ctrl()` / `.alt()` / `.shift()` / `.meta()`（`meta` = Win 键 / macOS Command 键）。键位复用 `Key`：`Key::Char('D')`、`Key::Escape` 等；非 ASCII 字符无稳定虚拟键映射，不可作热键。
+- **注册可能失败且不报错**：热键是全局独占资源，组合被其他程序占用时系统会拒绝，该热键静默失效，其余热键与应用不受影响——为一个热键冲突让整个应用起不来是不可接受的。
+- 回调拿 `HotkeyCtx`，**只有 `show_window()` / `hide_window()`，拿不到窗口句柄**。这是刻意的：回调在平台层持有窗口状态借用期间执行，直接调 OS 窗口 API 会同步重入消息处理并造成 `&mut` 别名（见 `AGENTS.md` 铁律 6）。窗口操作降级为「意图」由平台层在借用释放后执行。
+- 控件回调里用 `EventCtx::show_window()` / `hide_window()`（与 `request_close()` 不同：隐藏只改可见性，关闭会销毁窗口并结束消息循环）。
+- `start_hidden()` 须配合托盘或热键——否则用户永远无法唤起窗口，debug 期对此 panic。
+
+> **平台状态**：全局热键当前**仅 Windows 实现**。macOS 上 `App::hotkey` 在 debug 期 panic、release 期静默忽略；托盘、`start_hidden`、窗口显隐在两平台均可用。macOS 热键需 Carbon `RegisterEventHotKey`，见 `src/platform/macos/hotkey.rs`。
+
+完整示例见 `examples/hotkey.rs`。
+
 ### 无标题栏窗口（自定义标题栏）
 ```rust
 let title_bar = Element::row().width_match().height(36).cross(Align::Stretch)

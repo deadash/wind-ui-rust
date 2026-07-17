@@ -17,6 +17,93 @@ pub enum WindowOp {
     Minimize,
     /// 最大化 / 还原切换。
     ToggleMaximize,
+    /// 显示并前置窗口（从隐藏态唤起）。
+    Show,
+    /// 隐藏窗口（进程继续存活）。配合托盘或全局热键使用；
+    /// 无托盘图标也无热键时隐藏窗口，用户将无法再唤起它。
+    Hide,
+}
+
+/// 全局热键的修饰键组合。
+///
+/// `meta` 在 Windows 上是 Win 键、macOS 上是 Command 键——同一概念的平台命名差异
+/// 收口于此，调用方不必分平台。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Mods {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub meta: bool,
+}
+
+/// 全局热键：由系统注册，**应用无焦点、窗口隐藏时亦可触发**。
+///
+/// ```no_run
+/// # use windui::prelude::*;
+/// // Ctrl+Alt+D
+/// let hk = Hotkey::new(Key::Char('D')).ctrl().alt();
+/// ```
+///
+/// 注册可能失败——热键是**全局独占**资源，组合已被其他程序占用时系统会拒绝。
+/// 见 `App::hotkey` 对失败处理的说明。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hotkey {
+    pub mods: Mods,
+    pub key: Key,
+}
+
+impl Hotkey {
+    /// 无修饰键的热键。单独的字母键作全局热键会抢走全系统的该按键，
+    /// 实践中应至少加一个修饰键。
+    pub fn new(key: Key) -> Self {
+        Self {
+            mods: Mods::default(),
+            key,
+        }
+    }
+    pub fn ctrl(mut self) -> Self {
+        self.mods.ctrl = true;
+        self
+    }
+    pub fn alt(mut self) -> Self {
+        self.mods.alt = true;
+        self
+    }
+    pub fn shift(mut self) -> Self {
+        self.mods.shift = true;
+        self
+    }
+    /// Windows 键 / macOS Command 键。
+    pub fn meta(mut self) -> Self {
+        self.mods.meta = true;
+        self
+    }
+}
+
+/// 全局热键回调的上下文。
+///
+/// **刻意只能声明意图，拿不到窗口句柄。** 回调在平台层持有窗口状态借用期间执行，
+/// 此时若直接调用 `ShowWindow` 等会同步重入消息处理的 API，将造成 `&mut` 别名
+/// （见 `AGENTS.md` 铁律 6「OS 重入前释放借用」）。把窗口操作降级为「意图」、由平台层
+/// 在借用释放后统一执行，使该约束成为**类型上的保证**而非人的记性。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HotkeyCtx {
+    pub(crate) op: Option<WindowOp>,
+}
+
+impl HotkeyCtx {
+    /// 请求显示并前置窗口。
+    pub fn show_window(&mut self) {
+        self.op = Some(WindowOp::Show);
+    }
+    /// 请求隐藏窗口。
+    pub fn hide_window(&mut self) {
+        self.op = Some(WindowOp::Hide);
+    }
+    /// 取出回调声明的意图（供平台层在**释放窗口状态借用之后**执行）。
+    pub(crate) fn take_op(&mut self) -> Option<WindowOp> {
+        self.op.take()
+    }
 }
 
 /// 控件期望的鼠标光标形状。`Widget::cursor()` 据交互语义声明，宿主取当前悬停
