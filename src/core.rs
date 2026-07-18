@@ -969,6 +969,11 @@ impl EventCtx<'_> {
     pub fn id(&self) -> NodeId {
         self.self_id
     }
+    /// 当前时刻（ms，单调，与挂钟无关，仅用差值）。宿主在事件分发前刷新，故长按、双击、
+    /// 拖动速度一类的时长判定应取它，**不要**在事件里读 `anim::clock_ms()` 的历史语义。
+    pub fn now_ms(&self) -> u64 {
+        crate::anim::clock_ms()
+    }
     /// 请求重绘本控件（纯视觉变化，不改布局）。失效区域取本节点视觉矩形（含投影/焦点环）。
     pub fn mark_dirty(&mut self) {
         let r = self.tree.visual_bounds(self.self_id);

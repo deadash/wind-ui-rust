@@ -905,6 +905,20 @@ impl UiHost {
         }
     }
 
+    /// 把帧时钟同步到当前时刻并返回它。
+    ///
+    /// `anim::clock_ms()` 是控件唯一的时间源，而这里是它唯一的写入点。若只在 render 里刷，
+    /// 空闲不出帧期间它会冻结在上一帧，控件在**事件路径**读到的便是「上一帧几点」而非
+    /// 「现在几点」——两次交互之间的静默期会被整段算进任何基于它的时长判定（长按、双击、
+    /// 拖动速度）。故事件分发前也刷一次，使 `EventCtx::now_ms()` 始终可信。
+    ///
+    /// 对动画相位无影响：所有 `Transition::retarget` 都在 paint 路径，那里本就会再刷一次。
+    fn sync_clock(&self) -> u64 {
+        let now = self.start.elapsed().as_millis() as u64;
+        crate::anim::set_clock_ms(now);
+        now
+    }
+
     /// 结束惯性滑动并复位目标节点的越界回弹偏移（打断/取消/重启时必经，
     /// 否则 Bounce 相位中途清除会残留 over_scroll 使内容卡偏）。返回此前是否在滑动。
     fn clear_fling(&mut self) -> bool {
@@ -1463,8 +1477,7 @@ impl AppHandler for UiHost {
         crate::theme::set_current(self.theme.clone());
         // 动画：清上一帧请求/脏区并刷新帧时钟，绘制中控件可重新请求。
         crate::anim::reset_request();
-        let now_ms = self.start.elapsed().as_millis() as u64;
-        crate::anim::set_clock_ms(now_ms);
+        let now_ms = self.sync_clock();
         // 惯性滑动：在布局前推进 scroll_y，本帧 arrange 据此钳制并重排。
         self.step_fling(now_ms);
         // pixmap 是物理像素；布局用逻辑坐标（物理 / scale），绘制时再 ×scale 放大。
@@ -1972,6 +1985,7 @@ impl AppHandler for UiHost {
     }
 
     fn on_pointer(&mut self, mut ev: crate::event::PointerEvent) -> bool {
+        self.sync_clock();
         // 物理坐标 → 逻辑坐标（布局与命中均在逻辑空间）。
         let s = self.scale;
         ev.pos = Point::new(
@@ -2077,6 +2091,7 @@ impl AppHandler for UiHost {
     }
 
     fn on_key(&mut self, ev: crate::event::KeyEvent) -> bool {
+        self.sync_clock();
         // 菜单激活时：Escape 关闭，其余键吞掉（避免在菜单后误编辑）。
         if self.menu.is_some() {
             if ev.key == Key::Escape {
