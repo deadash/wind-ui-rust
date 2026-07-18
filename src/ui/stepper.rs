@@ -32,6 +32,13 @@ const REPEAT_INTERVAL_MID_MS: u64 = 50;
 /// 高速重复间隔（ms，elapsed ≥ REPEAT_ACCEL2_MS）。
 const REPEAT_INTERVAL_FAST_MS: u64 = 30;
 
+/// `press_start_ms` 的哨兵：按下事件只标记「已按下」，真实起点留给首帧 paint 写入。
+///
+/// `anim::clock_ms()` 是**帧时钟**，仅在 `render` 里刷新；控件空闲不出帧时它冻结在上一帧。
+/// 事件分发早于本帧 render，故在 `on_event` 里读它拿到的是「上一帧几点」而非「现在几点」，
+/// 两次点击之间的静默期会被整段算进长按时长，导致按下即判定为已长按数秒、直接跳进高速档。
+const PRESS_START_PENDING: u64 = u64::MAX;
+
 fn repeat_interval_ms(elapsed_ms: u64) -> u64 {
     if elapsed_ms < REPEAT_ACCEL1_MS {
         REPEAT_INTERVAL_SLOW_MS
@@ -40,6 +47,26 @@ fn repeat_interval_ms(elapsed_ms: u64) -> u64 {
     } else {
         REPEAT_INTERVAL_FAST_MS
     }
+}
+
+/// 推进长按状态机，返回本帧是否应步进。
+///
+/// 按下后的首帧（`press_start` 为哨兵）只把起点锚到当前帧时钟、不步进；其后先过
+/// `REPEAT_DELAY_MS` 等待期，再看距上次步进是否够一个（随时长加速的）间隔。
+fn advance_repeat(now_ms: u64, press_start: &Cell<u64>, last_step: &Cell<u64>) -> bool {
+    if press_start.get() == PRESS_START_PENDING {
+        press_start.set(now_ms);
+        last_step.set(now_ms);
+        return false;
+    }
+    let elapsed = now_ms.saturating_sub(press_start.get());
+    if elapsed >= REPEAT_DELAY_MS
+        && now_ms.saturating_sub(last_step.get()) >= repeat_interval_ms(elapsed)
+    {
+        last_step.set(now_ms);
+        return true;
+    }
+    false
 }
 
 fn hover_amt(cell: &Cell<Transition<f32>>, on: bool) -> f32 {
@@ -73,7 +100,7 @@ pub struct Stepper {
     composing: Cell<bool>,
     /// 长按方向：0=未按 / -1=减 / +1=加。
     press_dir: Cell<i8>,
-    /// 按下时的帧时钟（ms），用于计算等待/加速阶段。
+    /// 长按起点（ms）；`PRESS_START_PENDING` 表示待首帧 paint 用新鲜帧时钟初始化。
     press_start_ms: Cell<u64>,
     /// 上次重复步进的时钟（ms）。
     last_step_ms: Cell<u64>,
@@ -183,15 +210,11 @@ impl Widget for Stepper {
         // 长按重复步进（retarget-in-paint 驱动，与 hover 动画同一帧循环）。
         let dir = self.press_dir.get();
         if dir != 0 {
+            // 帧时钟此刻刚由宿主刷新，与「现在」同步；按下后的首帧据此锚定长按起点。
             let now = crate::anim::clock_ms();
-            let elapsed = now.saturating_sub(self.press_start_ms.get());
-            if elapsed >= REPEAT_DELAY_MS {
-                let interval = repeat_interval_ms(elapsed);
-                if now.saturating_sub(self.last_step_ms.get()) >= interval {
-                    let v = (self.value.get() + dir as f64 * self.step).clamp(self.min, self.max);
-                    self.value.set(v);
-                    self.last_step_ms.set(now);
-                }
+            if advance_repeat(now, &self.press_start_ms, &self.last_step_ms) {
+                let v = (self.value.get() + dir as f64 * self.step).clamp(self.min, self.max);
+                self.value.set(v);
             }
             crate::anim::request_repaint();
         }
@@ -358,9 +381,8 @@ impl Widget for Stepper {
                             ctx.capture();
                             let dir: i8 = if z == 0 { -1 } else { 1 };
                             self.press_dir.set(dir);
-                            let now = crate::anim::clock_ms();
-                            self.press_start_ms.set(now);
-                            self.last_step_ms.set(now);
+                            // 起点不在此处取：事件路径读到的帧时钟是陈旧的（见 PRESS_START_PENDING）。
+                            self.press_start_ms.set(PRESS_START_PENDING);
                         }
                         _ => {
                             if self.editing.get() {
@@ -501,5 +523,73 @@ impl Widget for Stepper {
 
     fn set_composing(&mut self, composing: bool) {
         self.composing.set(composing);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模拟按下：起点置哨兵，交给首帧锚定。
+    fn press() -> (Cell<u64>, Cell<u64>) {
+        (Cell::new(PRESS_START_PENDING), Cell::new(0))
+    }
+
+    /// 回归：两次点击之间的静默期不得计入长按时长。
+    ///
+    /// 帧时钟空闲时冻结，按下事件读到的是上一帧时刻。旧实现在事件里取起点，静默 1.5s 后
+    /// 再点会算出 elapsed=1500，一按下就越过等待期并直落中速档 → 「点一下跳两格 / 秒进快速加」。
+    #[test]
+    fn stale_frame_clock_between_clicks_does_not_trigger_repeat() {
+        let (start, last) = press();
+        // 上一帧停在 150ms，用户 1650ms 才按下，本帧时钟 1650。
+        assert!(
+            !advance_repeat(1650, &start, &last),
+            "首帧只锚定起点，不得步进"
+        );
+        assert_eq!(start.get(), 1650, "起点须锚到当前帧而非上一帧的 150");
+        // 紧接着的几帧仍在等待期内，一格都不许多跳。
+        assert!(!advance_repeat(1666, &start, &last));
+        assert!(!advance_repeat(1700, &start, &last));
+        assert!(
+            !advance_repeat(2000, &start, &last),
+            "距按下 350ms，仍未过 400ms 等待期"
+        );
+    }
+
+    /// 真长按：过等待期后按间隔步进，并随时长逐级加速。
+    #[test]
+    fn hold_repeats_after_delay_and_accelerates() {
+        let (start, last) = press();
+        assert!(!advance_repeat(1000, &start, &last));
+        assert!(!advance_repeat(1399, &start, &last), "399ms 未到等待期");
+        assert!(advance_repeat(1400, &start, &last), "400ms 起首次重复");
+        // 慢速档 80ms。
+        assert!(!advance_repeat(1479, &start, &last));
+        assert!(advance_repeat(1480, &start, &last));
+        // 距按下 >1000ms 进中速档 50ms。
+        last.set(2400);
+        assert!(!advance_repeat(2449, &start, &last));
+        assert!(advance_repeat(2450, &start, &last));
+        // 距按下 >2000ms 进高速档 30ms。
+        last.set(3500);
+        assert!(!advance_repeat(3529, &start, &last));
+        assert!(advance_repeat(3530, &start, &last));
+    }
+
+    /// 每次按下都重新锚定，不受上一轮长按残留的起点影响。
+    #[test]
+    fn each_press_reanchors_start() {
+        let (start, last) = press();
+        advance_repeat(1000, &start, &last);
+        assert!(
+            advance_repeat(5000, &start, &last),
+            "同一轮长按 4s 后应仍在重复"
+        );
+        // 松开后再次按下：置回哨兵。
+        start.set(PRESS_START_PENDING);
+        assert!(!advance_repeat(9000, &start, &last));
+        assert_eq!(start.get(), 9000);
+        assert_eq!(last.get(), 9000, "last_step 须一并重置，否则首帧即满足间隔");
     }
 }
