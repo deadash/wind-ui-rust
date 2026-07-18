@@ -1,6 +1,9 @@
 //! macOS 系统托盘（`NSStatusItem`）：图标 + 提示 + 左键/双击回调 + 原生右键菜单。
 //!
-//! 公共构建器 API（`Tray` / `TrayMenuItem` / `TrayCtx`）与 win32 同形。左键单击/双击触发回调，
+//! 公共构建器 API（`Tray` / `TrayMenuItem` / `TrayCtx`）与 win32 同形——含 `TrayCtx`
+//! 方法的 `&mut self` 签名：本平台可以立即执行、无需 win32 那套意图队列，但签名保持
+//! 一致，才不会出现「在 macOS 上写得通、到 Windows 上语义变了」的跨平台陷阱。
+//! 左键单击/双击触发回调，
 //! 右键弹原生 `NSMenu`（勾选项按 `Rc<Cell>` 当前值显示对勾、分隔线）。气泡走
 //! `NSUserNotification`（已弃用；未打包为 .app 时系统可能不展示，属系统限制）。
 //!
@@ -36,24 +39,24 @@ pub struct TrayCtx {
 
 impl TrayCtx {
     /// 显示并前置窗口（托盘最常见动作）。
-    pub fn show_window(&self) {
+    pub fn show_window(&mut self) {
         if let Some(mtm) = MainThreadMarker::new() {
             self.window.makeKeyAndOrderFront(None);
             NSApplication::sharedApplication(mtm).activate();
         }
     }
     /// 隐藏窗口（最小化到托盘）。
-    pub fn hide_window(&self) {
+    pub fn hide_window(&mut self) {
         self.window.orderOut(None);
     }
     /// 退出应用。
-    pub fn quit(&self) {
+    pub fn quit(&mut self) {
         if let Some(mtm) = MainThreadMarker::new() {
             NSApplication::sharedApplication(mtm).terminate(None);
         }
     }
     /// 弹出系统通知（标题 + 正文）。未打包为 .app 时可能不展示。
-    pub fn notify(&self, title: &str, body: &str) {
+    pub fn notify(&mut self, title: &str, body: &str) {
         deliver_notification(title, body);
         let _ = &self.status_item; // 保留字段（未来可用 status item 锚定通知）。
     }

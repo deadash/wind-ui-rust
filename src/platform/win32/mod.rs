@@ -936,11 +936,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         tray::WM_TRAYICON => {
-            if let Some(state) = state_from(hwnd) {
-                if let Some(ts) = state.tray.as_mut() {
-                    tray::handle_message(ts, lparam);
-                }
-            }
+            on_tray_message(hwnd, lparam);
             LRESULT(0)
         }
         // 输入法开始合成：通知焦点控件进入组合态（自绘光标隐藏，让系统组合浮层
@@ -1004,6 +1000,10 @@ unsafe extern "system" fn wnd_proc(
             PostQuitMessage(0);
             let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
             if !ptr.is_null() {
+                // **先清零指针再 drop**，顺序是承重的：模态循环（`TrackPopupMenu`）
+                // 期间窗口可能被销毁，循环结束后 `on_tray_message` 还要再
+                // `state_from` 一次。清零在前，那次调用才会拿到 None 而不是解引用
+                // 已释放的 WindowState。
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 drop(Box::from_raw(ptr));
             }
@@ -1183,6 +1183,94 @@ unsafe fn run_window_op(hwnd: HWND, op: Option<WindowOp>) {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
         None => {}
+    }
+}
+
+/// 托盘消息处理。**严格分段，每段之间必须释放 `WindowState` 借用**（铁律 6）。
+///
+/// 托盘是重入风险最高的路径：右键菜单的 `TrackPopupMenu` 自带模态消息循环，菜单
+/// 从弹出到用户点选之间的每一次鼠标移动都会重入 `wnd_proc`。
+///
+/// 分段按「这个 OS 调用会不会重入」切，两条路径互斥（非先后关系）：
+/// - 点击路径：「取意图」（持借用）→「执行意图」（无借用）。
+/// - 菜单路径：「建菜单」（持借用，不重入）→「弹菜单」（**必须无借用**，模态重入）
+///   →「跑选中项」（持借用，只写意图）→「执行意图」（无借用）。
+///
+/// 动作分类由自由函数 `tray::classify` 完成，不碰 state——右键路径因此全程只在
+/// 「建菜单」「跑选中项」两处取借用。
+unsafe fn on_tray_message(hwnd: HWND, lparam: LPARAM) {
+    match tray::classify(lparam) {
+        tray::TrayEvent::Click(kind) => {
+            // 取意图：借 state 跑回调；借用随本语句结束而释放。
+            let actions = state_from(hwnd)
+                .and_then(|s| s.tray.as_mut())
+                .map(|ts| tray::run_click(ts, kind))
+                .unwrap_or_default();
+            // 执行意图：已无借用。
+            run_tray_actions(hwnd, actions);
+        }
+        tray::TrayEvent::RightClick => {
+            // 建菜单：借用内完成（CreatePopupMenu/AppendMenuW 均不重入）。
+            let Some(menu) = state_from(hwnd)
+                .and_then(|s| s.tray.as_ref())
+                .and_then(|ts| ts.build_menu())
+            else {
+                return;
+            };
+            // 弹菜单：**无借用**。菜单存续期间 wnd_proc 会被反复重入。
+            let id = tray::track_menu(hwnd, menu);
+            if id == 0 {
+                return; // 用户取消
+            }
+            // 跑选中项：重借取意图，借用随语句释放。
+            //
+            // 若窗口在弹菜单的模态循环里被销毁，`WM_DESTROY` 已先清零 GWLP_USERDATA
+            // 才 drop `WindowState`（见该分支），故此处 `state_from` 返回 None 而非
+            // 解引用已释放内存——这个顺序是本分段设计的前提。
+            let actions = state_from(hwnd)
+                .and_then(|s| s.tray.as_mut())
+                .map(|ts| ts.run_item(id))
+                .unwrap_or_default();
+            // 执行意图：已无借用。
+            run_tray_actions(hwnd, actions);
+        }
+        tray::TrayEvent::Other => {}
+    }
+}
+
+/// 按声明顺序执行托盘回调的意图队列。**调用方须已释放 `WindowState` 借用**——
+/// Show/Hide/Quit 都会同步重入 `wnd_proc`。
+///
+/// 逐条执行且每条之间不持有借用，故「先 notify 再 show_window」这类组合成立。
+unsafe fn run_tray_actions(hwnd: HWND, actions: Vec<tray::TrayAction>) {
+    for action in actions {
+        match action {
+            // 显隐复用窗口操作通道：托盘与热键、事件路径的显隐语义必须一致
+            // （例如 Show 需处理「窗口当前是最小化」的情形）。
+            tray::TrayAction::Show => run_window_op(hwnd, Some(WindowOp::Show)),
+            tray::TrayAction::Hide => run_window_op(hwnd, Some(WindowOp::Hide)),
+            // 不走 WindowOp：托盘「退出」是应用的唯一真实出口，**刻意绕过
+            // `hide_on_close`**（否则开了关闭转隐藏的应用将永远退不掉）。
+            //
+            // `break` 丢弃 quit 之后的意图，是刻意的三重收口：窗口已销毁，后续意图
+            // 本就无从生效（HWND 失效、`state_from` 取不到 state）；显式截断让这个
+            // 事实可读，而非依赖两个不相干的兜底；也堵住「HWND 被系统回收后
+            // `state_from` 取到另一个窗口的 state」这一理论缺口。macOS 侧
+            // `NSApp::terminate` 本就不返回，两平台由此在构造上一致。
+            tray::TrayAction::Quit => {
+                let _ = DestroyWindow(hwnd);
+                break;
+            }
+            // 先取出投递目标释放借用，再调 Shell_NotifyIconW（它会跨线程发消息）。
+            tray::TrayAction::Notify { title, body } => {
+                let target = state_from(hwnd)
+                    .and_then(|s| s.tray.as_ref())
+                    .map(|ts| ts.notify_target());
+                if let Some((h, uid)) = target {
+                    tray::notify(h, uid, &title, &body);
+                }
+            }
+        }
     }
 }
 

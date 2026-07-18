@@ -26,51 +26,84 @@ use windows::Win32::UI::Shell::{
     NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, DestroyWindow,
-    GetCursorPos, LoadIconW, SetForegroundWindow, ShowWindow, TrackPopupMenu, HICON, ICONINFO,
-    IDI_APPLICATION, MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, SW_HIDE, SW_SHOW,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
+    AppendMenuW, CreateIconIndirect, CreatePopupMenu, DestroyIcon, DestroyMenu, GetCursorPos,
+    LoadIconW, SetForegroundWindow, TrackPopupMenu, HICON, HMENU, ICONINFO, IDI_APPLICATION,
+    MF_CHECKED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD, TPM_RIGHTBUTTON, WM_APP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_RBUTTONUP,
 };
 
 /// 托盘回调消息（WM_APP+1）：lParam 低位为鼠标动作（legacy v0 编码）。
 pub(crate) const WM_TRAYICON: u32 = WM_APP + 1;
 
-/// 托盘回调上下文：操作窗口与弹气泡（不暴露裸 hwnd）。
+/// 托盘回调想做的事。**纯意图，不含任何 OS 调用**。
+///
+/// 存在的理由见 `TrayCtx`：回调在持有 `WindowState` 借用期间运行，此时碰 OS 就是 UB。
+/// 回调只能写下这个值，由借用释放后的 `run_tray_action` 代为执行。
+pub(crate) enum TrayAction {
+    Show,
+    Hide,
+    Quit,
+    Notify { title: String, body: String },
+}
+
+/// 左键动作。单独成类型是为了让 `run_click` 的 match 天然穷尽——否则它得留一条
+/// 「右键不该走到这」的兜底臂，而那种臂一旦被走到就是静默失效（菜单再也弹不出来，
+/// 无 panic 无警告），正是本次重构要根除的失败模式。
+pub(crate) enum ClickKind {
+    Left,
+    Double,
+}
+
+/// 托盘鼠标动作。分类不需要碰 `WindowState`，故 `classify` 是自由函数——右键路径
+/// 因此完全不必取借用（借用窗口越窄越好，这是重入风险最高的路径）。
+pub(crate) enum TrayEvent {
+    Click(ClickKind),
+    RightClick,
+    Other,
+}
+
+/// 解析托盘回调消息的鼠标动作（lParam 低位，legacy v0 编码）。
+pub(crate) fn classify(lparam: LPARAM) -> TrayEvent {
+    match lparam.0 as u32 {
+        WM_LBUTTONUP => TrayEvent::Click(ClickKind::Left),
+        WM_LBUTTONDBLCLK => TrayEvent::Click(ClickKind::Double),
+        WM_RBUTTONUP => TrayEvent::RightClick,
+        _ => TrayEvent::Other,
+    }
+}
+
+/// 托盘回调上下文：声明要对窗口做什么（不暴露裸 hwnd）。
+///
+/// **这里的方法只记录意图，不调用任何 OS API**——回调运行时 `wnd_proc` 正持有
+/// `&mut WindowState`，而 `ShowWindow` / `DestroyWindow` / `TrackPopupMenu` 都会同步
+/// 派发消息重入 `wnd_proc`，届时再取一次 `&mut WindowState` 即形成别名 UB（铁律 6，
+/// 无 RefCell 故不会 panic，只会静默出错）。真正的执行发生在借用释放之后。
+///
+/// 意图按调用顺序累积成队列，逐条执行——故一个回调内 `notify` 后再 `show_window`
+/// 两者都生效，与「立即执行」的直觉一致（macOS 侧本就是立即执行，语义由此对齐）。
 pub struct TrayCtx {
-    hwnd: HWND,
-    uid: u32,
+    actions: Vec<TrayAction>,
 }
 
 impl TrayCtx {
     /// 显示并前置窗口（托盘最常见动作）。
-    pub fn show_window(&self) {
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-            let _ = SetForegroundWindow(self.hwnd);
-        }
+    pub fn show_window(&mut self) {
+        self.actions.push(TrayAction::Show);
     }
     /// 隐藏窗口（最小化到托盘）。
-    pub fn hide_window(&self) {
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-        }
+    pub fn hide_window(&mut self) {
+        self.actions.push(TrayAction::Hide);
     }
     /// 退出应用（销毁窗口 → 清理托盘）。
-    pub fn quit(&self) {
-        unsafe {
-            let _ = DestroyWindow(self.hwnd);
-        }
+    pub fn quit(&mut self) {
+        self.actions.push(TrayAction::Quit);
     }
     /// 弹出气泡通知（标题 + 正文）。
-    pub fn notify(&self, title: &str, body: &str) {
-        unsafe {
-            let mut nid = base_nid(self.hwnd, self.uid);
-            nid.uFlags = NIF_INFO;
-            copy_wide(&mut nid.szInfoTitle, title);
-            copy_wide(&mut nid.szInfo, body);
-            nid.dwInfoFlags = NIIF_INFO;
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
-        }
+    pub fn notify(&mut self, title: &str, body: &str) {
+        self.actions.push(TrayAction::Notify {
+            title: title.to_string(),
+            body: body.to_string(),
+        });
     }
 }
 
@@ -231,75 +264,143 @@ pub(crate) fn install(hwnd: HWND, tray: Tray) -> Option<TrayState> {
     })
 }
 
-/// 处理托盘回调消息：左键/双击触发回调，右键弹原生菜单。
-pub(crate) fn handle_message(state: &mut TrayState, lparam: LPARAM) {
-    match lparam.0 as u32 {
-        WM_LBUTTONUP => invoke(state.tray.on_left_click.as_mut(), state.hwnd, state.uid),
-        WM_LBUTTONDBLCLK => invoke(state.tray.on_double_click.as_mut(), state.hwnd, state.uid),
-        WM_RBUTTONUP => unsafe { show_menu(state) },
-        _ => {}
-    }
+/// 跑左键/双击回调，取回它声明的意图队列。
+///
+/// 就地跑回调是安全的——回调只写 `TrayAction`，不碰 OS（见 `TrayCtx`）。
+/// 右键不走这里：菜单需要模态弹出，必须在借用之外分段完成，故签名只收
+/// `ClickKind`——右键根本传不进来。
+pub(crate) fn run_click(state: &mut TrayState, kind: ClickKind) -> Vec<TrayAction> {
+    let cb = match kind {
+        ClickKind::Left => state.tray.on_left_click.as_mut(),
+        ClickKind::Double => state.tray.on_double_click.as_mut(),
+    };
+    invoke(cb)
 }
 
-fn invoke(cb: Option<&mut TrayFn>, hwnd: HWND, uid: u32) {
-    if let Some(cb) = cb {
-        let mut ctx = TrayCtx { hwnd, uid };
-        cb(&mut ctx);
-    }
+/// 跑一个回调，取回它声明的意图队列。
+fn invoke(cb: Option<&mut TrayFn>) -> Vec<TrayAction> {
+    let Some(cb) = cb else { return Vec::new() };
+    let mut ctx = TrayCtx {
+        actions: Vec::new(),
+    };
+    cb(&mut ctx);
+    ctx.actions
 }
 
-/// 构建并弹出原生右键菜单，调用选中项回调。
-unsafe fn show_menu(state: &mut TrayState) {
-    let Ok(hmenu) = CreatePopupMenu() else { return };
-    for (i, it) in state.tray.items.iter().enumerate() {
-        match &it.kind {
-            ItemKind::Separator => {
-                let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
-            }
-            ItemKind::Action {
-                label,
-                checked,
-                enabled,
-                ..
-            } => {
-                let mut flags = MF_STRING;
-                if checked.as_ref().is_some_and(|c| c.get()) {
-                    flags |= MF_CHECKED;
-                }
-                // 禁用：灰显且不可选（TPM_RETURNCMD 不会返回灰显项 id，故回调天然不触发）。
-                if enabled.is_some_and(|e| !e.get()) {
-                    flags |= MF_GRAYED;
-                }
-                let w = wide_nul(label);
-                // 命令 id = 序号+1（分隔线不可选，故返回 id 必对应 Action）。
-                let _ = AppendMenuW(hmenu, flags, i + 1, PCWSTR(w.as_ptr()));
-            }
+/// 右键菜单句柄的 RAII 包装：drop 即 `DestroyMenu`。
+///
+/// 存在的理由：`build_menu` 是安全 fn，若直接交出裸 `HMENU`，日后任何在「建菜单」
+/// 与「弹菜单」之间插入可失败步骤的安全代码都会静默泄漏内核对象。包成 RAII 后
+/// 泄漏不可表达。
+pub(crate) struct PopupMenu(HMENU);
+
+impl Drop for PopupMenu {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DestroyMenu(self.0);
         }
     }
+}
+
+impl TrayState {
+    /// 构建右键菜单。只 `CreatePopupMenu` + `AppendMenuW`，两者都不重入
+    /// `wnd_proc`，故可在持有 `WindowState` 借用期间安全调用。
+    pub(crate) fn build_menu(&self) -> Option<PopupMenu> {
+        let hmenu = unsafe { CreatePopupMenu() }.ok()?;
+        for (i, it) in self.tray.items.iter().enumerate() {
+            match &it.kind {
+                ItemKind::Separator => unsafe {
+                    let _ = AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null());
+                },
+                ItemKind::Action {
+                    label,
+                    checked,
+                    enabled,
+                    ..
+                } => {
+                    let mut flags = MF_STRING;
+                    if checked.as_ref().is_some_and(|c| c.get()) {
+                        flags |= MF_CHECKED;
+                    }
+                    // 禁用：灰显且不可选（TPM_RETURNCMD 不会返回灰显项 id，故回调天然不触发）。
+                    if enabled.is_some_and(|e| !e.get()) {
+                        flags |= MF_GRAYED;
+                    }
+                    let w = wide_nul(label);
+                    // 命令 id = 序号+1（分隔线不可选，故返回 id 必对应 Action）。
+                    unsafe {
+                        let _ = AppendMenuW(hmenu, flags, i + 1, PCWSTR(w.as_ptr()));
+                    }
+                }
+            }
+        }
+        Some(PopupMenu(hmenu))
+    }
+
+    /// 跑菜单项 `id`（`track_menu` 的返回值）对应的回调，取回它声明的意图队列。
+    /// 回调只写意图不碰 OS，故可在借用期间安全调用。
+    ///
+    /// `id` 是 1-based 序号，与 `build_menu` 的 `AppendMenuW(.., i + 1, ..)` 对应；
+    /// 分隔线占序号但 id 恒为 0，`TPM_RETURNCMD` 永不返回，故解构失败即视为无意图。
+    pub(crate) fn run_item(&mut self, id: usize) -> Vec<TrayAction> {
+        if id < 1 || id > self.tray.items.len() {
+            return Vec::new();
+        }
+        let ItemKind::Action { cb, .. } = &mut self.tray.items[id - 1].kind else {
+            return Vec::new();
+        };
+        let mut ctx = TrayCtx {
+            actions: Vec::new(),
+        };
+        cb(&mut ctx);
+        ctx.actions
+    }
+
+    /// 气泡通知的投递目标。取出后即可释放借用，由自由函数 `notify` 执行。
+    pub(crate) fn notify_target(&self) -> (HWND, u32) {
+        (self.hwnd, self.uid)
+    }
+}
+
+/// 弹气泡通知。
+///
+/// **自由函数而非 `&TrayState` 方法是刻意的**：`Shell_NotifyIconW` 会经
+/// `SendMessageTimeout` 与 shell 的托盘窗口跨线程通信，而跨线程发送期间本线程会
+/// 泵入站消息。虽然读 `self` 的动作都发生在调用之前（故按 Stacked Borrows 仍成立），
+/// 但那让正确性依赖「使用顺序」而非「借用已结构性死亡」——正是本次修复要消除的
+/// 那类脆弱性。签名只收 hwnd/uid，借用便无处可藏。
+pub(crate) fn notify(hwnd: HWND, uid: u32, title: &str, body: &str) {
+    unsafe {
+        let mut nid = base_nid(hwnd, uid);
+        nid.uFlags = NIF_INFO;
+        copy_wide(&mut nid.szInfoTitle, title);
+        copy_wide(&mut nid.szInfo, body);
+        nid.dwInfoFlags = NIIF_INFO;
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
+/// 弹出原生右键菜单，返回选中项的命令 id（0=未选/取消）。按值消费 `menu`，
+/// 其 `Drop` 负责 `DestroyMenu`（含提前返回与 panic 路径）。
+///
+/// **自由函数而非方法是刻意的**：`TrackPopupMenu` 自带模态消息循环，菜单存续期间
+/// 用户的每一次鼠标移动、窗口切换都会重入 `wnd_proc`。调用方必须已释放
+/// `WindowState` 借用——签名只要 hwnd 不要 `&TrayState`，正是为了让借用无处可藏。
+pub(crate) unsafe fn track_menu(hwnd: HWND, menu: PopupMenu) -> usize {
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     // 必须前置窗口，否则菜单点击外部不消失（Win32 经典要求）。
-    let _ = SetForegroundWindow(state.hwnd);
+    let _ = SetForegroundWindow(hwnd);
     let cmd = TrackPopupMenu(
-        hmenu,
+        menu.0,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
         pt.x,
         pt.y,
         Some(0),
-        state.hwnd,
+        hwnd,
         None,
     );
-    let _ = DestroyMenu(hmenu);
-    let id = cmd.0 as usize;
-    if id >= 1 && id <= state.tray.items.len() {
-        if let ItemKind::Action { cb, .. } = &mut state.tray.items[id - 1].kind {
-            let mut ctx = TrayCtx {
-                hwnd: state.hwnd,
-                uid: state.uid,
-            };
-            cb(&mut ctx);
-        }
-    }
+    cmd.0 as usize
 }
 
 /// 系统默认应用图标（无自定义图标时回退）。
