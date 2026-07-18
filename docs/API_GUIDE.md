@@ -271,7 +271,9 @@ App::new("…", w, h).tray(
 ).content(ui).run();
 ```
 - **右键菜单走原生 `TrackPopupMenu`**（真 OS 弹出，显示在托盘旁）；支持**勾选项**（`check` 绑 `Rc<Cell<bool>>`，弹出时按当前值显示对勾）与**分隔线**。
-- 回调拿 `TrayCtx`：`show_window()` / `hide_window()` / `quit()` / `notify(title, body)`（气泡通知）。
+- 回调拿 `TrayCtx`：`show_window()` / `hide_window()` / `quit()` / `notify(title, body)`（气泡通知）。**拿不到窗口句柄**，理由同下文 `HotkeyCtx`：回调在平台层持有窗口状态借用期间执行，直接调 OS 窗口 API 会同步重入消息处理并造成 `&mut` 别名（`AGENTS.md` 铁律 6）。这几个方法只记录意图，由平台层在借用释放后执行。
+- 一个回调内可**按顺序调用多个**，逐条生效（如先 `notify(..)` 再 `show_window()`）。例外是 `quit()`：它之后的调用不再执行（窗口已销毁）。
+- `quit()` 是应用的真实出口，刻意**不受 `hide_on_close()` 影响**。
 - 图标可 `.icon_rgba(w,h,&rgba)`（零依赖，从 RGBA 造 HICON），未设则用系统默认应用图标。窗口销毁时托盘自动清理。完整示例见 `examples/tray.rs`。
 
 ### 全局热键与启动即隐藏

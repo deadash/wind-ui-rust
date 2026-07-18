@@ -122,6 +122,9 @@ Win32 实现与应使用的 Cocoa/Core 框架 API，以及推荐的分阶段落�
   右键菜单 `NSMenu`/`NSMenuItem`（`checked`→`state`，`separator`→`separatorItem`）。
 - `TrayCtx::{show_window, hide_window, quit, notify}`：分别 `NSWindow::makeKeyAndOrderFront` /
   `orderOut` / `NSApp::terminate` / `UNUserNotificationCenter`。对照 `win32/tray.rs`。
+  注意**不是 1:1 对应**：win32 侧这四个方法只把意图推进 `Vec<TrayAction>`，由平台层在
+  释放窗口状态借用后执行（铁律 6）；macOS 无此约束，可立即执行。但签名须同为
+  `&mut self`，否则同一段回调代码在两个平台上语义不同。
 
 ### 4.5 open_url — `platform/macos/mod.rs::open_url`
 `NSWorkspace::sharedWorkspace().openURL(NSURL::URLWithString(url))`。对照 win32 `ShellExecuteW`。

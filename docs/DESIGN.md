@@ -351,7 +351,9 @@ retained 模式下，事件回调既要改 widget 自身状态、又可能要改
 
   解法：**不把句柄交给回调**。`HotkeyCtx`（`event.rs`）只有一个 `Option<WindowOp>` 字段，`show_window()` 仅写入意图；平台层在借用释放后才由 `run_window_op` 执行。这样「别在借用期间碰 OS」从**靠人记性的纪律**（AGENTS.md 铁律 6）升级为**类型上的保证**——危险代码写不出来。
 
-  > 这是后续所有 OS 回调的**推荐范式**。反例：win32 的 `TrayCtx` 持有 `hwnd` 并直接调 `ShowWindow`，其调用点仍在借用期内，属既有待收敛项。
+  > 这是后续所有 OS 回调的**推荐范式**。win32 的 `TrayCtx` 已同样收敛：只累积 `Vec<TrayAction>`，由 `run_tray_actions` 在借用释放后执行。
+  >
+  > 托盘是该范式最完整的参考实现（`platform/win32/mod.rs` 的 `on_tray_message`），因为它还要处理**模态** OS 调用：`TrackPopupMenu` 自带消息循环，菜单存续期间会被反复重入，无法像 `ShowWindow` 那样「调完就结束」。解法是按「这个 OS 调用会不会重入」切成四段——建菜单（`CreatePopupMenu`/`AppendMenuW`，不重入，可在借用内）、弹菜单（重入，必须无借用）、跑选中项回调（只写意图，可在借用内）、执行意图（无借用）。配合把弹菜单写成只收 `hwnd` 的自由函数，让借用无处可藏。
 
 ```rust
 pub struct EventCtx<'a> {
