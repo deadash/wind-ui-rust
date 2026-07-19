@@ -5,6 +5,10 @@
 
 ## [Unreleased]
 
+### Added
+- **字体族**：`Element::font_family(name)` 指定字体族名（Windows/macOS 均生效）。字体未安装时静默回退系统默认，不报错也不 panic。
+- **无边框窗口圆角**：`frameless()` 窗口在 Win11 上显式声明 `DWMWA_WINDOW_CORNER_PREFERENCE`，与系统其余窗口一致；Win10 上 DWM 不识别该属性、返回错误码并被忽略，无需版本判断。macOS 由 AppKit 天然保持圆角。
+
 ## [0.8.3] - 2026-07-13
 
 ### Added

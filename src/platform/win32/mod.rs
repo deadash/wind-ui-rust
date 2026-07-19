@@ -20,7 +20,10 @@ use tiny_skia::Pixmap;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+use windows::Win32::Graphics::Dwm::{
+    DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_ROUND,
+};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, EndPaint, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, ScreenToClient,
     SetDIBitsToDevice, UpdateWindow, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEFAULT_CHARSET,
@@ -611,6 +614,26 @@ unsafe fn run_windowed(
             cyBottomHeight: 0,
         };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        // 圆角：显式声明，与 Win11 系统其余窗口一致。
+        //
+        // 不依赖 DWM 默认策略：本窗口保留着 WS_OVERLAPPEDWINDOW 样式位（非客户区是靠
+        // WM_NCCALCSIZE 消掉的，不是换成 WS_POPUP），这类窗口在 Win11 上**通常**默认
+        // 就是圆角——但自定义 NCCALCSIZE 之后该默认是否仍成立并无明确保证，显式声明
+        // 比赌默认行为可靠。
+        //
+        // 无版本判断也是刻意的：该属性是 Win11（build 22000+）才有的，旧系统上 DWM
+        // 不认识这个属性号，返回 E_INVALIDARG——我们在此丢弃它，正好得到想要的降级
+        // （Win10 本就没有圆角窗口一说）。属性号 33 在 Win10 上无任何合法属性占用，
+        // 不存在误设成别的属性的风险，故无需 GetVersionEx 分支。
+        let pref = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as *const c_void,
+            // 用 size_of_val 而非写死类型名：尺寸与指针由同一个绑定推导，
+            // 日后有人改 `pref` 的类型时不会留下静默失配的尺寸参数。
+            size_of_val(&pref) as u32,
+        );
         let _ = SetWindowPos(
             hwnd,
             None,

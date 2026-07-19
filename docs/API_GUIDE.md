@@ -318,6 +318,7 @@ App::new("…", w, h).frameless().content(Element::col().fill().child(title_bar)
 - `Element::window_drag()` 标记拖动区（自定义标题栏）：命中非交互区拖窗、命中可聚焦控件（按钮/输入）则不拖、交控件处理。
 - `Element::window_button(WindowButtonKind::{Minimize,Maximize,Close})`：自绘标准图标 + hover/press（关闭键 hover 转红）；图标色取 `.fg()`（深色标题栏用 `.fg(WHITE)`）。点击调 `EventCtx::minimize()/toggle_maximize()/request_close()`。
 - 窗口四边/四角自动可缩放（平台在边缘 N px 内做缩放命中）。完整示例见 `examples/frameless.rs`。
+- **窗口圆角跟随系统**：Win11 上显式声明 `DWMWA_WINDOW_CORNER_PREFERENCE = DWMWCP_ROUND`，与系统其余窗口一致。显式声明而非依赖 DWM 默认策略——自定义 `WM_NCCALCSIZE` 之后默认行为是否仍成立并无明确保证。Win10 上 DWM 不认识该属性、返回错误码，windui 忽略该错误，故无需版本判断。圆角半径由系统决定。macOS 上 AppKit 对 `FullSizeContentView` 窗口自动保持圆角，无需额外处理。
 
 ### GPU 加速渲染（Windows，可选）
 ```rust
@@ -373,12 +374,22 @@ App::new("…", w, h).accelerated(true).content(ui).run();
 Element::label("标题")
     .fg(Color::hex(0x1A1A2E))     // 文字色
     .font_size(22.0)
+    .font_weight(600)             // 400=常规 500=中 600=半粗 700=粗
+    .font_family("Newsreader")    // 字体族名；未设=系统默认
     .bg(Color::WHITE)
     .border(Color::hex(0xDDDDDD), 1)
     .corner(8.0)
     .text_align(Align::Center)
 ```
 `Color` 构造：`Color::rgb(r,g,b)`、`rgba(..)`、`hex(0xRRGGBB)`、`from_hex_str("#7C5CFC")`，常量 `WHITE/BLACK/TRANSPARENT`。
+
+> **样式不沿父链继承**：`font_family` / `font_size` / `fg` 等都只作用于所设的那个节点，给容器设不会传给子节点。沿父链继承的只有 `enabled`、光标形状与 `window_drag` 三项。需要统一字体时自行封装构造函数，或走 `Theme`。
+>
+> （交叉轴对齐是另一回事：子节点未显式设 `align` 时取**其直接容器**的交叉轴对齐，这是容器对子项的排布，只有一层，不会穿透多层祖先。）
+>
+> `font_family` 指定的字体**未安装时不报错也不 panic**：Windows 的 DirectWrite 与 macOS 的 CoreText 均静默回退系统默认字体——字体是否存在取决于用户机器，调用方无从保证；需要确保效果应随程序分发字体。
+>
+> **平台状态**：`font_family` 两平台均生效。`font_weight` **当前仅 Windows 生效**——macOS 的 CoreText 路径尚未接入字重（`src/text/coretext.rs` 构造 `CTFont` 时不传 traits），传入非 400 的值不报错，但没有视觉变化。
 
 ### 7.2 `Theme`（全局 + 每控件覆盖层）
 控件默认视觉**不从内联 Style 取**，而从当前 `Theme` 取。`Theme` 两层：

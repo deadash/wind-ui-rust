@@ -2403,6 +2403,15 @@ impl Element {
         self.style.font_weight = w;
         self
     }
+    /// 字体族名（如 `"Newsreader"`、`"Microsoft YaHei"`）。未设 = 系统默认。
+    ///
+    /// 字体**未安装时不报错也不 panic**：DirectWrite 按名匹配失败即回退系统默认字体。
+    /// 这是刻意的——少一个装饰性字体不该让界面崩掉，何况字体是否存在取决于用户机器，
+    /// 调用方无从保证。需要确保效果时应自行随程序分发字体。
+    pub fn font_family(mut self, name: impl Into<String>) -> Self {
+        self.style.font_family = Some(name.into());
+        self
+    }
     /// 文字水平对齐。
     pub fn text_align(mut self, a: Align) -> Self {
         self.style.text_align = a;
