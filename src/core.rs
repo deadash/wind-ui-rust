@@ -167,6 +167,11 @@ pub struct Node {
     /// 宽实现「按内容自适应、但不小于此值」——短内容对齐统一基线宽，长内容自动
     /// 加宽不换行。与固定宽 `Dimension::Px` 互斥（后者已钉死宽度，下界不参与）。
     pub min_width: i32,
+    /// 最大宽度（0=无约束）：measure **前**收窄可用宽、measure 后对宽度取上界。
+    ///
+    /// 必须在测量前生效，否则文字按更宽的可用宽排好版后才被裁掉——那是截断，不是限宽。
+    /// 限宽的本意是让内容**在更窄的宽度内换行**，长正文的可读性正由此而来。
+    pub max_width: i32,
     pub padding: Insets,
     pub margin: Insets,
     /// 自身对齐覆盖：None=继承容器交叉轴对齐；Some(a)=显式覆盖。
@@ -433,8 +438,14 @@ impl Tree {
         hspec: MeasureSpec,
         text: &mut dyn TextEngine,
     ) -> Size {
-        let (layout, padding, min_width, visible) = match self.get(id) {
-            Some(n) => (n.layout, n.padding, n.min_width, n.effective_visible()),
+        let (layout, padding, min_width, max_width, visible) = match self.get(id) {
+            Some(n) => (
+                n.layout,
+                n.padding,
+                n.min_width,
+                n.max_width,
+                n.effective_visible(),
+            ),
             None => return Size::ZERO,
         };
         if !visible {
@@ -444,20 +455,21 @@ impl Tree {
             return Size::ZERO;
         }
 
-        let avail_w = (wspec.avail() - padding.horizontal()).max(0);
+        let mut avail_w = (wspec.avail() - padding.horizontal()).max(0);
+        // 限宽在测量**前**收窄可用宽：子节点与文字据此换行，而非排完再裁。
+        if max_width > 0 {
+            avail_w = avail_w.min((max_width - padding.horizontal()).max(0));
+        }
         let avail_h = (hspec.avail() - padding.vertical()).max(0);
 
         let content = match layout {
             Layout::None => {
-                // 叶子：纯内容固有尺寸（可能需要测量文本）。按节点字重注入线程局部，
-                // 使文本测量与绘制走同一字重（加粗标题宽度不被低估而误裁/误换行）。
+                // 叶子：纯内容固有尺寸（可能需要测量文本）。字重与行高随 `Style` 一并
+                // 交给控件，由控件构造 `TextStyle` 传给引擎——测量与绘制因此天然同源，
+                // 不再依赖「调用前注入、调用后复位」这种容易漏掉一半的约定。
                 let n = self.get(id).unwrap();
-                crate::text::set_weight(n.style.font_weight);
-                let m = n
-                    .widget
-                    .measure(Size::new(avail_w, avail_h), &n.style, text);
-                crate::text::set_weight(crate::text::WEIGHT_NORMAL);
-                m
+                n.widget
+                    .measure(Size::new(avail_w, avail_h), &n.style, text)
             }
             Layout::Linear { axis, spacing, .. } => {
                 self.measure_linear(id, axis, spacing, wspec, hspec, avail_w, avail_h, text)
@@ -470,7 +482,12 @@ impl Tree {
         let desired_h = content.h + padding.vertical();
         // min_width：约束收敛后对宽度取下界（0=无）。放在 resolve 之后，使
         // 「Wrap 自适应宽 < 下界」时抬到下界，而自适应宽更大时保留（避免长文本换行）。
-        let resolved_w = wspec.resolve(desired_w).max(min_width);
+        let mut resolved_w = wspec.resolve(desired_w).max(min_width);
+        // 上界后于下界施加：两者同时设定且冲突时以上界为准，宽度才不会超出调用方
+        // 明确给出的上限（下界的本意是「至少这么宽」，让位于硬上限是合理的）。
+        if max_width > 0 {
+            resolved_w = resolved_w.min(max_width);
+        }
         let size = Size::new(resolved_w, hspec.resolve(desired_h));
         if let Some(n) = self.get_mut(id) {
             n.measured = size;
@@ -816,18 +833,35 @@ impl Tree {
         if let Some((bc, bw)) = &n.style.border {
             if *bw > 0 {
                 let bp = Paint::fill(bc.solid_color(&theme));
-                canvas.stroke_round_rect(fx, fy, fw, fh, radius, *bw as f32, &bp);
+                let e = n.style.border_edges;
+                if e.is_all() {
+                    // 四边齐全走圆角描边，保住 corner_radius。
+                    canvas.stroke_round_rect(fx, fy, fw, fh, radius, *bw as f32, &bp);
+                } else {
+                    // 缺边时逐边画矩形段：圆角在此无意义——一条底边不存在「圆角」，
+                    // 硬套圆角描边会在缺口处留下两截弧线。
+                    let w = *bw as f32;
+                    if e.top {
+                        canvas.fill_round_rect(fx, fy, fw, w, 0.0, &bp);
+                    }
+                    if e.bottom {
+                        canvas.fill_round_rect(fx, fy + fh - w, fw, w, 0.0, &bp);
+                    }
+                    if e.left {
+                        canvas.fill_round_rect(fx, fy, w, fh, 0.0, &bp);
+                    }
+                    if e.right {
+                        canvas.fill_round_rect(fx + fw - w, fy, w, fh, 0.0, &bp);
+                    }
+                }
             }
         }
 
         let content = abs.inset(n.padding);
         // 标记当前节点矩形：节点内的 anim::request_repaint 会把脏区归到此处（局部重绘用）。
         crate::anim::set_paint_rect(Some(abs));
-        // 按节点字重注入线程局部，使 widget 内的文字绘制按 Style.font_weight 取字体格式。
-        crate::text::set_weight(n.style.font_weight);
         n.widget
             .paint(abs, content, n.focused, enabled, canvas, &n.style);
-        crate::text::set_weight(crate::text::WEIGHT_NORMAL);
         crate::anim::set_paint_rect(None);
 
         // 焦点环：仅在键盘导航时（focus_ring_visible）绘制，纯鼠标操作不显示。
@@ -2562,6 +2596,105 @@ mod tests {
         tree.dispatch_pointer(mv, &mut h, &mut cap);
         tree.layout_root(Size::new(100, 100), &mut te);
         assert!(tree.get(id).unwrap().scroll_y > 0, "拖动滚动条应增加偏移");
+    }
+
+    /// 限宽必须在**测量前**收窄可用宽：节点撑满可用宽时，最终宽应被上界收住。
+    #[test]
+    fn max_width_caps_matched_width() {
+        let root = Element::col()
+            .width(400)
+            .height(100)
+            .child(Element::leaf().width_match().height(10).max_width(240));
+        let tree = layout(root, 400, 100);
+        let child = tree.get(tree.root.unwrap()).unwrap().children[0];
+        assert_eq!(
+            tree.get(child).unwrap().measured.w,
+            240,
+            "width_match 应被 max_width 收住"
+        );
+    }
+
+    /// 内容本就比上界窄时，限宽不该把它撑宽——上界是上界，不是固定宽。
+    #[test]
+    fn max_width_leaves_narrow_content_alone() {
+        let root = Element::col()
+            .width(400)
+            .height(100)
+            .child(Element::leaf().width(80).height(10).max_width(240));
+        let tree = layout(root, 400, 100);
+        let child = tree.get(tree.root.unwrap()).unwrap().children[0];
+        assert_eq!(tree.get(child).unwrap().measured.w, 80);
+    }
+
+    /// 上下界冲突时以**上界**为准：调用方给出的硬上限不应被下界顶破。
+    #[test]
+    fn max_width_wins_over_min_width() {
+        let root = Element::col().width(400).height(100).child(
+            Element::leaf()
+                .width_match()
+                .height(10)
+                .min_width(300)
+                .max_width(200),
+        );
+        let tree = layout(root, 400, 100);
+        let child = tree.get(tree.root.unwrap()).unwrap().children[0];
+        assert_eq!(tree.get(child).unwrap().measured.w, 200);
+    }
+
+    /// 行高直接改变文字节点的占位高度（`NullTextEngine` 如实反映倍数）。
+    #[test]
+    fn line_height_scales_text_node_height() {
+        let plain = layout(
+            Element::col()
+                .width(200)
+                .height(200)
+                .child(Element::label("行高").font_size(20.0)),
+            200,
+            200,
+        );
+        let tall = layout(
+            Element::col()
+                .width(200)
+                .height(200)
+                .child(Element::label("行高").font_size(20.0).line_height(2.0)),
+            200,
+            200,
+        );
+        let h = |t: &Tree| {
+            let c = t.get(t.root.unwrap()).unwrap().children[0];
+            t.get(c).unwrap().measured.h
+        };
+        assert_eq!(h(&plain), 20, "未设行高时按字号占位");
+        assert_eq!(h(&tall), 40, "行高 2.0 应使占位翻倍");
+    }
+
+    /// 单边边框**不参与布局**——这正是它相对「1px 色块」的价值所在。
+    #[test]
+    fn border_edges_does_not_affect_layout() {
+        let mk = |e: Option<crate::style::Edges>| {
+            let mut leaf = Element::leaf()
+                .width(100)
+                .height(50)
+                .border(Color::BLACK, 1);
+            if let Some(e) = e {
+                leaf = leaf.border_edges(e);
+            }
+            let t = layout(Element::col().width(200).height(200).child(leaf), 200, 200);
+            let c = t.get(t.root.unwrap()).unwrap().children[0];
+            t.get(c).unwrap().measured
+        };
+        assert_eq!(mk(None), mk(Some(crate::style::Edges::BOTTOM)));
+    }
+
+    /// `Edges` 的按位合并语义：合并后两条边都在，其余仍不在。
+    #[test]
+    fn edges_bitor_merges() {
+        use crate::style::Edges;
+        let e = Edges::TOP | Edges::BOTTOM;
+        assert!(e.top && e.bottom);
+        assert!(!e.left && !e.right);
+        assert!(!e.is_all(), "只有四边齐全才算 all");
+        assert!((Edges::TOP | Edges::BOTTOM | Edges::LEFT | Edges::RIGHT).is_all());
     }
 
     #[test]

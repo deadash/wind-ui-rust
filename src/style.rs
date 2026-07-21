@@ -103,6 +103,74 @@ impl Shadow {
     }
 }
 
+/// 边框作用于哪几条边。
+///
+/// 存在的理由是设计里大量使用**单边**边框——页签的下划线、分区的底线、侧栏的
+/// 右边线。此前只能用「1px 高的色块」拼出来：那既要多一个节点，又会占据布局位置，
+/// 把它当分隔元素而非装饰，容器一改间距就跟着错位。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Edges {
+    pub top: bool,
+    pub right: bool,
+    pub bottom: bool,
+    pub left: bool,
+}
+
+impl Edges {
+    pub const NONE: Edges = Edges {
+        top: false,
+        right: false,
+        bottom: false,
+        left: false,
+    };
+    pub const ALL: Edges = Edges {
+        top: true,
+        right: true,
+        bottom: true,
+        left: true,
+    };
+    pub const TOP: Edges = Edges {
+        top: true,
+        ..Edges::NONE
+    };
+    pub const RIGHT: Edges = Edges {
+        right: true,
+        ..Edges::NONE
+    };
+    pub const BOTTOM: Edges = Edges {
+        bottom: true,
+        ..Edges::NONE
+    };
+    pub const LEFT: Edges = Edges {
+        left: true,
+        ..Edges::NONE
+    };
+
+    /// 是否四边齐全。齐全时走圆角描边路径，缺边时逐边画直线段。
+    pub fn is_all(self) -> bool {
+        self == Edges::ALL
+    }
+}
+
+impl std::ops::BitOr for Edges {
+    type Output = Edges;
+    /// 合并两组边，用于 `Edges::TOP | Edges::BOTTOM` 这类写法。
+    fn bitor(self, o: Edges) -> Edges {
+        Edges {
+            top: self.top || o.top,
+            right: self.right || o.right,
+            bottom: self.bottom || o.bottom,
+            left: self.left || o.left,
+        }
+    }
+}
+
+impl Default for Edges {
+    fn default() -> Self {
+        Edges::ALL
+    }
+}
+
 /// 背景/边框/文字等视觉属性。核心层统一绘制投影、背景与边框，widget 绘制内容。
 #[derive(Debug, Clone)]
 pub struct Style {
@@ -110,6 +178,8 @@ pub struct Style {
     pub bg: Option<Brush>,
     /// 边框（画刷, 线宽 px）。
     pub border: Option<(Brush, i32)>,
+    /// 边框作用于哪几条边。默认四边。仅在 `border` 有值时有意义。
+    pub border_edges: Edges,
     /// 圆角半径 px。
     pub corner_radius: f32,
     /// 前景/文字色（当 `fg_role` 为 None 时生效）。
@@ -122,6 +192,11 @@ pub struct Style {
     pub font_weight: u16,
     /// 字体族（None = 系统默认）。
     pub font_family: Option<String>,
+    /// 行高倍数（相对字号）。`None` 用字体自带行距。
+    ///
+    /// 影响**多行文字的行间距**，单行文字只影响其占位高度。取倍数而非绝对像素，
+    /// 使行距随字号与 DPI 一同缩放。中文正文通常 1.6–1.7，西文 1.4–1.5。
+    pub line_height: Option<f32>,
     /// 文字水平对齐。
     pub text_align: Align,
     /// 浮层投影（None = 无）。
@@ -135,12 +210,14 @@ impl Default for Style {
         Self {
             bg: None,
             border: None,
+            border_edges: Edges::ALL,
             corner_radius: 0.0,
             fg: Color::hex(0x1A1A1A),
             fg_role: Some(Role::Text),
             font_size: 14.0,
             font_weight: crate::text::WEIGHT_NORMAL,
             font_family: None,
+            line_height: None,
             text_align: Align::Start,
             shadow: None,
             opacity: 1.0,

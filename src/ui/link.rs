@@ -70,12 +70,7 @@ impl Link {
 
 impl Widget for Link {
     fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
-        text.measure(
-            &self.text,
-            style.font_family.as_deref(),
-            style.font_size,
-            None,
-        )
+        text.measure(&self.text, &crate::text::TextStyle::of(style), None)
     }
 
     fn paint(
@@ -114,13 +109,12 @@ impl Widget for Link {
             content,
             color,
             style.text_align,
-            style.font_family.as_deref(),
-            style.font_size,
+            &crate::text::TextStyle::of(style),
         );
         if self.underline {
             // 下划线贴文字底缘；x 跟随文字（Start 对齐），长度取文字实测宽。
             let tw = canvas
-                .measure_text(&self.text, style.font_family.as_deref(), style.font_size)
+                .measure_text(&self.text, &crate::text::TextStyle::of(style))
                 .w;
             let y = (content.y + content.h - 1) as f32;
             let x0 = content.x as f32;

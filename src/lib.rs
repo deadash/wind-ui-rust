@@ -31,11 +31,11 @@ pub mod prelude {
     pub use crate::render::{Gradient, PixmapTarget, RenderTarget};
     pub use crate::signal::{signal, Signal};
     pub use crate::spec::{Align, Axis, Dimension};
-    pub use crate::style::{Brush, Role, Shadow, Style};
+    pub use crate::style::{Brush, Edges, Role, Shadow, Style};
     pub use crate::sync::Sender;
     pub use crate::theme::{Intent, Len, TableTheme, Theme};
     pub use crate::ui::{
-        DropdownItem, Element, ImageContent, ImageView, Link, SortOrder, SortStyle, Truncate,
-        WindowButton, WindowButtonKind,
+        DropdownItem, Element, ImageContent, ImageView, Link, Para, RichColor, RichDoc, SortOrder,
+        SortStyle, SpanStyle, Truncate, WindowButton, WindowButtonKind,
     };
 }

@@ -204,24 +204,20 @@ impl Widget for Dropdown {
         match &self.options {
             OptionSource::Plain(opts) => opts.with(|list| {
                 for o in list {
-                    w = w.max(
-                        text.measure(o, style.font_family.as_deref(), style.font_size, None)
-                            .w,
-                    );
+                    w = w.max(text.measure(o, &crate::text::TextStyle::of(style), None).w);
                 }
             }),
             OptionSource::Rich(items) => items.with(|list| {
                 for it in list {
                     let mut iw = text
-                        .measure(
-                            &it.label,
-                            style.font_family.as_deref(),
-                            style.font_size,
-                            None,
-                        )
+                        .measure(&it.label, &crate::text::TextStyle::of(style), None)
                         .w;
                     if let Some((btext, _)) = &it.badge {
-                        iw += text.measure(btext, None, 12.0, None).w + 2 * BADGE_PAD_X + BADGE_GAP;
+                        iw += text
+                            .measure(btext, &crate::text::TextStyle::new(12.0), None)
+                            .w
+                            + 2 * BADGE_PAD_X
+                            + BADGE_GAP;
                     }
                     w = w.max(iw);
                 }
@@ -287,7 +283,12 @@ impl Widget for Dropdown {
         let badge = self.current_badge();
         let badge_w = badge
             .as_ref()
-            .map(|(text, _)| canvas.measure_text(text, None, 12.0).w + 2 * BADGE_PAD_X)
+            .map(|(text, _)| {
+                canvas
+                    .measure_text(text, &crate::text::TextStyle::new(12.0))
+                    .w
+                    + 2 * BADGE_PAD_X
+            })
             .unwrap_or(0);
         if let Some((text, intent)) = &badge {
             let (fill, fg) = intent.badge_colors(pal);
@@ -305,7 +306,13 @@ impl Widget for Dropdown {
                 999.0,
                 &Paint::fill(fill),
             );
-            canvas.draw_text(text, br, fg, Align::Center, None, 12.0);
+            canvas.draw_text(
+                text,
+                br,
+                fg,
+                Align::Center,
+                &crate::text::TextStyle::new(12.0),
+            );
         }
 
         // 当前选项文本（左侧，留出右侧 chevron 与徽章）。
@@ -322,8 +329,7 @@ impl Widget for Dropdown {
             tr,
             text_color,
             Align::Start,
-            style.font_family.as_deref(),
-            style.font_size,
+            &crate::text::TextStyle::of(style),
         );
 
         // 右侧下拉箭头 ▼（两段线）。

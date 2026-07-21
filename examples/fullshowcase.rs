@@ -54,6 +54,9 @@ fn row(label: &str, control: Element) -> Element {
         .child(control)
 }
 
+/// 行高与限宽演示用的中文长句：这两项的差别只有在多行正文上才看得出来。
+const CJK_SAMPLE: &str = "行高决定中文正文的呼吸感。这段字用来对比：未设行高时按字体自带行距排版，设为 1.8 后行与行之间明显松开，长段落的可读性差别很大。";
+
 fn card(title: &str, body: Element) -> Element {
     Element::col()
         .width_match()
@@ -208,6 +211,8 @@ fn main() {
     // 手风琴：单开互斥共享索引（初值 0 = 默认展开第一面板）。
     let acc_sel = signal(0i32);
     let nav_msg = signal(String::from("（点下方导航行试试）"));
+    // 富文本演示：例句组折叠态。
+    let rich_collapsed = signal(false);
     // 链接 on_click 演示：点击计数写入动态标签。
     let link_msg = signal(String::from("（点下方“点我计数”试试）"));
     let link_n = signal(0u32);
@@ -215,6 +220,47 @@ fn main() {
     let components_body = Element::col()
         .width_match()
         .spacing(14)
+        .child(card(
+            "富文本 RichText（span 混排基线对齐 + 胶囊 + 分隔线 + 可折叠例句组）",
+            Element::rich(
+                RichDoc::new()
+                    .style("headword", SpanStyle::new().size(24.0).bold())
+                    .style("phonetic", SpanStyle::new().size(13.0).fg(RichColor::Muted))
+                    .style("pos", SpanStyle::new().size(11.0).bold().chip())
+                    .style("example", SpanStyle::new().size(13.0).fg(RichColor::Muted))
+                    .para(
+                        Para::new()
+                            .styled("headword", "apple")
+                            .text("  ")
+                            .styled("phonetic", "/ˈæp.əl/"),
+                    )
+                    .para(
+                        Para::new()
+                            .styled("pos", "n.")
+                            .text(" 苹果；苹果树。参见 ")
+                            .span("fruit", SpanStyle::new().fg(RichColor::Accent).underline())
+                            .text(" 词条。"),
+                    )
+                    .divider()
+                    .para(
+                        Para::new()
+                            .styled("pos", "习语")
+                            .text(" the apple of one's eye 掌上明珠 ")
+                            .span("apple of the eye", SpanStyle::new().strike().fg(RichColor::Muted)),
+                    )
+                    .section("例句（点击标题折叠）", rich_collapsed, |s| {
+                        s.para(Para::new().styled(
+                            "example",
+                            "An apple a day keeps the doctor away. 一天一苹果，医生远离我。",
+                        ))
+                        .para(Para::new().styled(
+                            "example",
+                            "She bought a pound of apples. 她买了一磅苹果。",
+                        ))
+                    }),
+            )
+            .width_match(),
+        ))
         .child(card(
             "按钮风格（intent：primary / neutral / danger + accent 扩展）",
             Element::row()
@@ -380,6 +426,60 @@ fn main() {
                 .child(row("小尺寸", Element::switch(signal(true)).small()))
                 .child(row("小+关态", Element::switch(signal(false)).small()))
                 .child(row("小+禁用", Element::switch(signal(true)).small().disabled(true))),
+        ))
+        .child(card(
+            "文字行高（line_height：倍数，随字号与 DPI 缩放）",
+            Element::col()
+                .width_match()
+                .spacing(10)
+                .child(Element::label("默认行距").font_size(12.0).fg_role(Role::TextMuted))
+                .child(Element::label(CJK_SAMPLE).width_match())
+                .child(Element::label("行高 1.8").font_size(12.0).fg_role(Role::TextMuted))
+                .child(Element::label(CJK_SAMPLE).width_match().line_height(1.8)),
+        ))
+        .child(card(
+            "正文限宽（max_width：在上界内换行，而非排完再裁）",
+            Element::col()
+                .width_match()
+                .spacing(10)
+                .child(Element::label("不限宽：行长随窗口，越宽越难回到行首").font_size(12.0).fg_role(Role::TextMuted))
+                .child(Element::label(CJK_SAMPLE).width_match())
+                .child(Element::label("限宽 320").font_size(12.0).fg_role(Role::TextMuted))
+                .child(Element::label(CJK_SAMPLE).width_match().max_width(320)),
+        ))
+        .child(card(
+            "单边边框（Edges：不参与布局，替代 1px 色块）",
+            Element::col()
+                .width_match()
+                .spacing(12)
+                .child(
+                    Element::label("仅底边——页签下划线、分区底线用")
+                        .width_match()
+                        .padding(8)
+                        .border_role(Role::Accent, 2)
+                        .border_edges(Edges::BOTTOM),
+                )
+                .child(
+                    Element::label("上下双边（Edges::TOP | Edges::BOTTOM）")
+                        .width_match()
+                        .padding(8)
+                        .border_role(Role::Divider, 1)
+                        .border_edges(Edges::TOP | Edges::BOTTOM),
+                )
+                .child(
+                    Element::label("仅左边——引用块、侧栏标记用")
+                        .width_match()
+                        .padding(8)
+                        .border_role(Role::Accent, 3)
+                        .border_edges(Edges::LEFT),
+                )
+                .child(
+                    Element::label("四边齐全时仍走圆角描边（对照）")
+                        .width_match()
+                        .padding(8)
+                        .corner(8.0)
+                        .border_role(Role::Border, 1),
+                ),
         ))
         .child(card(
             "分段控制器（连体多段单选，点击/方向键切换）",

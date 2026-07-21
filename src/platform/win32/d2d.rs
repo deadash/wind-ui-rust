@@ -89,7 +89,7 @@ pub(super) struct D2DBackend {
     dwrite_factory: IDWriteFactory,
     /// TextFormat 缓存：键 (family, 逻辑字号 bits, 字重)，与软引擎 `DWriteEngine::format` 同构。
     /// IDWriteTextFormat 亦 device-independent，设备丢失无需清空。对齐不进 key（在 layout 上设）。
-    format_cache: HashMap<(String, u32, u16), IDWriteTextFormat>,
+    format_cache: HashMap<(String, u32, u16, Option<u32>), IDWriteTextFormat>,
     /// 文字 layout 缓存（键 `LayoutKey`）：`IDWriteTextLayout` 是重对象（字形整形/换行排版），
     /// 每帧每文字重建会 churn 驱动内存——官方文档明确要复用。device-independent，设备丢失无需清。
     layout_cache: HashMap<LayoutKey, IDWriteTextLayout>,
@@ -123,7 +123,7 @@ pub(super) struct D2DBackend {
 const MAX_RECREATE_FAILS: u32 = 3;
 
 /// 文字 layout 缓存键：(family, text, 字号 bits, 字重, maxWidth bits, maxHeight bits)。
-type LayoutKey = (String, String, u32, u16, u32, u32);
+type LayoutKey = (String, String, u32, u16, Option<u32>, u32, u32);
 
 /// 烘焙阴影缓存键：(宽 px, 高 px, 圆角 px, 模糊 bits, 颜色 rgba)，前三项量化逻辑像素整数。
 type ShadowKey = (u32, u32, u32, u32, u32);
@@ -478,7 +478,7 @@ struct D2DTarget<'a> {
     solid: &'a ID2D1SolidColorBrush,
     grad_cache: &'a mut HashMap<GradKey, ID2D1Brush>,
     dwrite_factory: &'a IDWriteFactory,
-    format_cache: &'a mut HashMap<(String, u32, u16), IDWriteTextFormat>,
+    format_cache: &'a mut HashMap<(String, u32, u16, Option<u32>), IDWriteTextFormat>,
     layout_cache: &'a mut HashMap<LayoutKey, IDWriteTextLayout>,
     image_cache: &'a mut HashMap<usize, ID2D1Bitmap1>,
     bake_ctx: &'a ID2D1DeviceContext,
@@ -529,7 +529,7 @@ struct D2DCanvas<'a> {
     /// DirectWrite 工厂（借入）：建 format/layout。
     dwrite_factory: &'a IDWriteFactory,
     /// TextFormat 缓存（借入，可变）：按 (family, 逻辑字号 bits, 字重) 复用。
-    format_cache: &'a mut HashMap<(String, u32, u16), IDWriteTextFormat>,
+    format_cache: &'a mut HashMap<(String, u32, u16, Option<u32>), IDWriteTextFormat>,
     layout_cache: &'a mut HashMap<LayoutKey, IDWriteTextLayout>,
     /// 图片位图缓存（借入，可变）：按 `Image::cache_id()` 复用 GPU 位图，避免每帧 `CreateBitmap`。
     image_cache: &'a mut HashMap<usize, ID2D1Bitmap1>,
@@ -559,25 +559,25 @@ impl D2DCanvas<'_> {
     fn text_layout(
         &mut self,
         text: &str,
-        family: Option<&str>,
-        size: f32,
+        ts: &crate::text::TextStyle,
         maxw: f32,
         maxh: f32,
     ) -> Option<IDWriteTextLayout> {
-        let fam = family.unwrap_or(DEFAULT_FAMILY).to_string();
-        let weight = crate::text::current_weight();
+        let fam = ts.family.unwrap_or(DEFAULT_FAMILY).to_string();
+        let weight = ts.weight;
         let key: LayoutKey = (
             fam,
             text.to_string(),
-            size.to_bits(),
+            ts.size.to_bits(),
             weight,
+            ts.line_height.map(f32::to_bits),
             maxw.to_bits(),
             maxh.to_bits(),
         );
         if let Some(l) = self.layout_cache.get(&key) {
             return Some(l.clone());
         }
-        let format = self.text_format(family, size)?;
+        let format = self.text_format(ts)?;
         let text_w = wide(text);
         let layout = unsafe {
             self.dwrite_factory
@@ -940,13 +940,18 @@ impl D2DCanvas<'_> {
     }
 
     /// 取/建 `IDWriteTextFormat`（逻辑字号；DPI scale 由 SetTransform 应用，**不**在此 ×scale）。
-    /// 缓存键 (family, 逻辑字号 bits, 字重) 与软引擎 `DWriteEngine::format` 同构，保证两后端字体/字重一致。
-    /// family 缺省 `DEFAULT_FAMILY`、字重经线程局部 `current_weight()`，locale 固定 "zh-cn"——皆与软路径同源。
+    /// 缓存键 (family, 逻辑字号 bits, 字重, 行高 bits) 与软引擎 `DWriteEngine::format` 同构，
+    /// 保证两后端字体/字重/行距一致。family 缺省 `DEFAULT_FAMILY`、locale 固定 "zh-cn"。
     /// 对齐**不**进 key（在 layout 上设），避免污染缓存的 format。
-    fn text_format(&mut self, family: Option<&str>, size: f32) -> Option<IDWriteTextFormat> {
-        let fam = family.unwrap_or(DEFAULT_FAMILY).to_string();
-        let weight = crate::text::current_weight();
-        let key = (fam.clone(), size.to_bits(), weight);
+    fn text_format(&mut self, ts: &crate::text::TextStyle) -> Option<IDWriteTextFormat> {
+        let fam = ts.family.unwrap_or(DEFAULT_FAMILY).to_string();
+        let (weight, size) = (ts.weight, ts.size);
+        let key = (
+            fam.clone(),
+            size.to_bits(),
+            weight,
+            ts.line_height.map(f32::to_bits),
+        );
         if let Some(f) = self.format_cache.get(&key) {
             return Some(f.clone());
         }
@@ -970,6 +975,18 @@ impl D2DCanvas<'_> {
                 )
                 .ok()?
         };
+        // 行距与软引擎 `DWriteEngine::format` 同款：UNIFORM + 基线 0.8，两后端须一致，
+        // 否则同一份界面在硬件与软件渲染下行高不同。
+        if let Some(mult) = ts.line_height {
+            let line = size * mult;
+            unsafe {
+                let _ = format.SetLineSpacing(
+                    windows::Win32::Graphics::DirectWrite::DWRITE_LINE_SPACING_METHOD_UNIFORM,
+                    line,
+                    line * 0.8,
+                );
+            }
+        }
         self.format_cache.insert(key, format.clone());
         Some(format)
     }
@@ -1253,8 +1270,7 @@ impl Canvas for D2DCanvas<'_> {
         rect: crate::geometry::Rect,
         color: Color,
         align: crate::spec::Align,
-        family: Option<&str>,
-        size: f32,
+        ts: &crate::text::TextStyle,
     ) {
         // ★ 全程逻辑坐标：D2D 已 SetTransform(scale)，会把逻辑值放大到物理像素。
         //   绝不在此 ×scale（软渲染 DWriteEngine::draw 的 ×scale 是因其直画物理 pixmap、无变换）。
@@ -1264,7 +1280,7 @@ impl Canvas for D2DCanvas<'_> {
         // 横向在 rect.w 内排版/对齐；纵向**不约束**（maxHeight=MAX），由下方按 metrics 手动定位。
         // 纵向不进 layout 的 ParagraphAlignment，避免文本超高时 CENTER 把多行上下对称裁切
         // （用户实测：2 行空间里 3 行被居中、首尾各裁半行）。缓存复用避免每帧重建。
-        let Some(layout) = self.text_layout(text, family, size, rect.w as f32, f32::MAX) else {
+        let Some(layout) = self.text_layout(text, ts, rect.w as f32, f32::MAX) else {
             return;
         };
         // 水平：与软路径 text_x0 的 Start/Center/End 语义一致（Stretch 同 Start→LEADING）。
@@ -1332,24 +1348,21 @@ impl Canvas for D2DCanvas<'_> {
         }
     }
 
-    fn measure_text(
-        &mut self,
-        text: &str,
-        family: Option<&str>,
-        size: f32,
-    ) -> crate::geometry::Size {
+    fn measure_text(&mut self, text: &str, ts: &crate::text::TextStyle) -> crate::geometry::Size {
         // 用同一 DirectWrite 工厂建 layout + GetMetrics 返回**逻辑** Size（与软路径一致，
         // 不 ×scale）。失败/空文本回退粗估，保证光标占位与编译。
+        let size = ts.size;
+        let line_h = ts.line_height_px().unwrap_or(size);
         if text.is_empty() {
-            return crate::geometry::Size::new(0, size.ceil() as i32);
+            return crate::geometry::Size::new(0, line_h.ceil() as i32);
         }
         let fallback = || {
             crate::geometry::Size::new(
                 (text.chars().count() as f32 * size * 0.6).ceil() as i32,
-                size.ceil() as i32,
+                line_h.ceil() as i32,
             )
         };
-        let Some(layout) = self.text_layout(text, family, size, f32::MAX, f32::MAX) else {
+        let Some(layout) = self.text_layout(text, ts, f32::MAX, f32::MAX) else {
             return fallback();
         };
         let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
@@ -1367,21 +1380,25 @@ impl Canvas for D2DCanvas<'_> {
     fn measure_text_wrapped(
         &mut self,
         text: &str,
-        family: Option<&str>,
-        size: f32,
+        ts: &crate::text::TextStyle,
         max_width: f32,
     ) -> crate::geometry::Size {
         // 与 measure_text 同源，仅 maxWidth 改传 max_width 触发按宽度换行（纵向仍不限）。
+        let size = ts.size;
+        let line_h = ts.line_height_px().unwrap_or(size);
         if text.is_empty() {
-            return crate::geometry::Size::new(0, size.ceil() as i32);
+            return crate::geometry::Size::new(0, line_h.ceil() as i32);
         }
         let fallback = || {
             let per_line = ((max_width / (size * 0.6)).floor() as usize).max(1);
             let chars = text.chars().count().max(1);
             let lines = chars.div_ceil(per_line).max(1);
-            crate::geometry::Size::new(max_width.ceil() as i32, (size.ceil() as i32) * lines as i32)
+            crate::geometry::Size::new(
+                max_width.ceil() as i32,
+                (line_h.ceil() as i32) * lines as i32,
+            )
         };
-        let Some(layout) = self.text_layout(text, family, size, max_width, f32::MAX) else {
+        let Some(layout) = self.text_layout(text, ts, max_width, f32::MAX) else {
             return fallback();
         };
         let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
@@ -1389,6 +1406,39 @@ impl Canvas for D2DCanvas<'_> {
             return fallback();
         }
         crate::geometry::Size::new(m.width.ceil() as i32, m.height.ceil() as i32)
+    }
+
+    fn text_line_metrics(
+        &mut self,
+        text: &str,
+        ts: &crate::text::TextStyle,
+    ) -> crate::text::LineMetrics {
+        // 与 measure_text 同一 DirectWrite 工厂排版，首行 GetLineMetrics 取基线。
+        // d2d 路径整体工作在逻辑坐标（DPI 由变换承担），无需除 scale。
+        let approx = || {
+            let h = ts.line_height_px().unwrap_or(ts.size);
+            crate::text::LineMetrics {
+                ascent: h * 0.8,
+                descent: h * 0.2,
+            }
+        };
+        if text.is_empty() {
+            return approx();
+        }
+        let Some(layout) = self.text_layout(text, ts, f32::MAX, f32::MAX) else {
+            return approx();
+        };
+        let mut lm = [windows::Win32::Graphics::DirectWrite::DWRITE_LINE_METRICS::default(); 1];
+        let mut n = 0u32;
+        // 多行文本会因缓冲区不足返回错误，但首行数据已写入；基线对齐只关心首行。
+        let _ = unsafe { layout.GetLineMetrics(Some(&mut lm), &mut n) };
+        if n == 0 || lm[0].height <= 0.0 {
+            return approx();
+        }
+        crate::text::LineMetrics {
+            ascent: lm[0].baseline,
+            descent: lm[0].height - lm[0].baseline,
+        }
     }
 
     fn push_layer(&mut self, opacity: f32) {

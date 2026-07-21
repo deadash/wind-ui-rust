@@ -85,7 +85,7 @@ impl Widget for SegmentedControl {
         let mut tw = 0;
         let mut th = 0;
         for o in &self.options {
-            let t = text.measure(o, style.font_family.as_deref(), style.font_size, None);
+            let t = text.measure(o, &crate::text::TextStyle::of(style), None);
             tw = tw.max(t.w);
             th = th.max(t.h);
         }
@@ -126,8 +126,8 @@ impl Widget for SegmentedControl {
         }
         let fi = sp.animate();
         self.sel_pos.set(sp);
-        let family = style.font_family.as_deref();
-        let fsize = style.font_size;
+        // 文字属性打包传递：字重与行高随 `Style` 自动带上，不必在每个调用点重列。
+        let ts = &crate::text::TextStyle::of(style);
         // 悬停浅底（非选中段；选中段由滑动胶囊覆盖）。
         for i in 0..n {
             if self.hover == Some(i) && enabled && i != sel {
@@ -188,14 +188,7 @@ impl Widget for SegmentedControl {
         for i in 0..n {
             let (x0, x1) = self.seg_x(bounds, i);
             let seg = Rect::new(x0, bounds.y, x1 - x0, bounds.h);
-            canvas.draw_text(
-                &self.options[i],
-                seg,
-                tc_normal,
-                Align::Center,
-                family,
-                fsize,
-            );
+            canvas.draw_text(&self.options[i], seg, tc_normal, Align::Center, ts);
         }
         if let Some(clip) = pill_clip {
             canvas.save();
@@ -203,14 +196,7 @@ impl Widget for SegmentedControl {
             for i in 0..n {
                 let (x0, x1) = self.seg_x(bounds, i);
                 let seg = Rect::new(x0, bounds.y, x1 - x0, bounds.h);
-                canvas.draw_text(
-                    &self.options[i],
-                    seg,
-                    tc_selected,
-                    Align::Center,
-                    family,
-                    fsize,
-                );
+                canvas.draw_text(&self.options[i], seg, tc_selected, Align::Center, ts);
             }
             canvas.restore();
         }

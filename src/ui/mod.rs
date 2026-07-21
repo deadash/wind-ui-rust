@@ -11,6 +11,7 @@ pub mod link;
 pub mod list;
 pub mod nav;
 pub mod progress;
+pub mod rich;
 pub mod segmented;
 pub mod select;
 pub mod sortable_table;
@@ -39,6 +40,7 @@ pub use link::Link;
 pub use list::ListRow;
 pub use nav::{AccordionHeader, CollapsibleHeader, ExpandState, NavRow};
 pub use progress::ProgressBar;
+pub use rich::{Para, RichColor, RichDoc, RichText, SpanStyle};
 pub use segmented::SegmentedControl;
 pub use select::{Dropdown, DropdownItem};
 pub use sortable_table::SortStyle;
@@ -115,15 +117,14 @@ impl Label {
     fn compute_truncated(
         &self,
         canvas: &mut dyn Canvas,
-        family: Option<&str>,
-        fsize: f32,
+        ts: &crate::text::TextStyle,
         avail_w: i32,
     ) -> (String, bool) {
-        let total_w = canvas.measure_text(&self.text, family, fsize).w;
+        let total_w = canvas.measure_text(&self.text, ts).w;
         if total_w <= avail_w {
             return (self.text.clone(), false);
         }
-        let ew = canvas.measure_text("…", family, fsize).w;
+        let ew = canvas.measure_text("…", ts).w;
         let avail = (avail_w - ew).max(0);
         let chars: Vec<char> = self.text.chars().collect();
         let n = chars.len();
@@ -132,7 +133,7 @@ impl Label {
         let mut acc = String::new();
         for (i, &c) in chars.iter().enumerate() {
             acc.push(c);
-            widths[i + 1] = canvas.measure_text(&acc, family, fsize).w;
+            widths[i + 1] = canvas.measure_text(&acc, ts).w;
         }
         let s = match self.truncate {
             Truncate::End => {
@@ -179,15 +180,10 @@ impl Widget for Label {
         } else {
             None
         };
-        let full = text.measure(
-            &self.text,
-            style.font_family.as_deref(),
-            style.font_size,
-            max_w,
-        );
+        let full = text.measure(&self.text, &crate::text::TextStyle::of(style), max_w);
         if let Some(max_n) = self.max_lines {
             let line_h = text
-                .measure("Ay", style.font_family.as_deref(), style.font_size, None)
+                .measure("Ay", &crate::text::TextStyle::of(style), None)
                 .h
                 .max(1);
             Size::new(full.w, full.h.min(max_n as i32 * line_h))
@@ -204,14 +200,15 @@ impl Widget for Label {
         canvas: &mut dyn Canvas,
         style: &Style,
     ) {
-        let family = style.font_family.as_deref();
-        let fsize = style.font_size;
+        // 文字属性打包传递：字重与行高随 `Style` 自动带上，不必在每个调用点重列。
+        let ts = &crate::text::TextStyle::of(style);
+        let fsize = ts.size;
         // 禁用态：文字降为 text_disabled，使整行（含标签/说明）随容器禁用统一置灰。
         let fg = text_fg(enabled, style, &crate::theme::current());
 
         // max_lines：计算限高矩形；DirectWrite 高度始终为 f32::MAX，必须用 clip_rect 裁剪。
         let (paint_rect, need_clip) = if let Some(max_n) = self.max_lines {
-            let line_h = canvas.measure_text("Ay", family, fsize).h.max(1);
+            let line_h = canvas.measure_text("Ay", ts).h.max(1);
             let clipped = Rect::new(
                 content.x,
                 content.y,
@@ -245,13 +242,13 @@ impl Widget for Label {
             let (text_str, _truncated) = if let Some(hit) = cached {
                 hit
             } else {
-                let (s, t) = self.compute_truncated(canvas, family, fsize, content.w);
+                let (s, t) = self.compute_truncated(canvas, ts, content.w);
                 *self.trunc_cache.borrow_mut() = Some((key_w, key_f, s.clone(), t));
                 (s, t)
             };
-            canvas.draw_text(&text_str, paint_rect, fg, style.text_align, family, fsize);
+            canvas.draw_text(&text_str, paint_rect, fg, style.text_align, ts);
         } else {
-            canvas.draw_text(&self.text, paint_rect, fg, style.text_align, family, fsize);
+            canvas.draw_text(&self.text, paint_rect, fg, style.text_align, ts);
         }
 
         if need_clip {
@@ -300,15 +297,14 @@ impl DynLabel {
         &self,
         s: &str,
         canvas: &mut dyn Canvas,
-        family: Option<&str>,
-        fsize: f32,
+        ts: &crate::text::TextStyle,
         avail_w: i32,
     ) -> (String, bool) {
-        let total_w = canvas.measure_text(s, family, fsize).w;
+        let total_w = canvas.measure_text(s, ts).w;
         if total_w <= avail_w {
             return (s.to_string(), false);
         }
-        let ew = canvas.measure_text("…", family, fsize).w;
+        let ew = canvas.measure_text("…", ts).w;
         let avail = (avail_w - ew).max(0);
         let chars: Vec<char> = s.chars().collect();
         let n = chars.len();
@@ -316,7 +312,7 @@ impl DynLabel {
         let mut acc = String::new();
         for (i, &c) in chars.iter().enumerate() {
             acc.push(c);
-            widths[i + 1] = canvas.measure_text(&acc, family, fsize).w;
+            widths[i + 1] = canvas.measure_text(&acc, ts).w;
         }
         let out = match self.truncate {
             Truncate::End => {
@@ -357,10 +353,10 @@ impl Widget for DynLabel {
         } else {
             None
         };
-        let full = text.measure(&s, style.font_family.as_deref(), style.font_size, max_w);
+        let full = text.measure(&s, &crate::text::TextStyle::of(style), max_w);
         if let Some(max_n) = self.max_lines {
             let line_h = text
-                .measure("Ay", style.font_family.as_deref(), style.font_size, None)
+                .measure("Ay", &crate::text::TextStyle::of(style), None)
                 .h
                 .max(1);
             Size::new(full.w, full.h.min(max_n as i32 * line_h))
@@ -378,13 +374,14 @@ impl Widget for DynLabel {
         style: &Style,
     ) {
         let s = self.text.get();
-        let family = style.font_family.as_deref();
-        let fsize = style.font_size;
+        // 文字属性打包传递：字重与行高随 `Style` 自动带上，不必在每个调用点重列。
+        let ts = &crate::text::TextStyle::of(style);
+        let fsize = ts.size;
         // 禁用态：文字降为 text_disabled（与 Label 一致，随容器禁用置灰）。
         let fg = text_fg(enabled, style, &crate::theme::current());
 
         let (paint_rect, need_clip) = if let Some(max_n) = self.max_lines {
-            let line_h = canvas.measure_text("Ay", family, fsize).h.max(1);
+            let line_h = canvas.measure_text("Ay", ts).h.max(1);
             let clipped = Rect::new(
                 content.x,
                 content.y,
@@ -417,13 +414,13 @@ impl Widget for DynLabel {
             let (text_str, _truncated) = if let Some(hit) = cached {
                 hit
             } else {
-                let (out, t) = self.compute_truncated(&s, canvas, family, fsize, content.w);
+                let (out, t) = self.compute_truncated(&s, canvas, ts, content.w);
                 *self.trunc_cache.borrow_mut() = Some((s.clone(), key_w, key_f, out.clone(), t));
                 (out, t)
             };
-            canvas.draw_text(&text_str, paint_rect, fg, style.text_align, family, fsize);
+            canvas.draw_text(&text_str, paint_rect, fg, style.text_align, ts);
         } else {
-            canvas.draw_text(&s, paint_rect, fg, style.text_align, family, fsize);
+            canvas.draw_text(&s, paint_rect, fg, style.text_align, ts);
         }
 
         if need_clip {
@@ -548,12 +545,7 @@ impl Button {
 
 impl Widget for Button {
     fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
-        let s = text.measure(
-            &self.label,
-            style.font_family.as_deref(),
-            style.font_size,
-            None,
-        );
+        let s = text.measure(&self.label, &crate::text::TextStyle::of(style), None);
         // 图标为正方形，边长取文字高度；加图标宽 + 间距。
         let icon_extra = if self.icon.is_some() {
             s.h + ICON_GAP
@@ -699,13 +691,12 @@ impl Widget for Button {
                 bounds,
                 fg,
                 Align::Center,
-                style.font_family.as_deref(),
-                style.font_size,
+                &crate::text::TextStyle::of(style),
             );
             return;
         };
         // 有图标：图标 + 文字作为整体水平居中，图标在左、垂直居中。
-        let ts = canvas.measure_text(&self.label, style.font_family.as_deref(), style.font_size);
+        let ts = canvas.measure_text(&self.label, &crate::text::TextStyle::of(style));
         let ih = ts.h; // 图标正方形边长 = 文字高
         let total_w = ih + ICON_GAP + ts.w;
         let start_x = bounds.x + ((bounds.w - total_w) / 2).max(0);
@@ -728,8 +719,7 @@ impl Widget for Button {
             text_rect,
             fg,
             Align::Start,
-            style.font_family.as_deref(),
-            style.font_size,
+            &crate::text::TextStyle::of(style),
         );
     }
     fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
@@ -811,6 +801,7 @@ pub struct Element {
     height: Dimension,
     /// 最小宽度下界（None=无）：配合 Wrap 宽实现自适应但不小于该值，见 [`Element::min_width`]。
     min_width: Option<i32>,
+    max_width: Option<i32>,
     padding: Insets,
     margin: Insets,
     align: Option<Align>,
@@ -840,6 +831,7 @@ impl Element {
             width: Dimension::Wrap,
             height: Dimension::Wrap,
             min_width: None,
+            max_width: None,
             padding: Insets::default(),
             margin: Insets::default(),
             align: None,
@@ -1087,6 +1079,25 @@ impl Element {
     /// 是否绘制链接下划线（默认开）。
     pub fn underline(self, on: bool) -> Self {
         self.config_link(move |l| l.set_underline(on))
+    }
+
+    // ---- 富文本 ----
+
+    /// 富文本控件：span 数据模型 + 行内流式布局（同行混字号基线对齐、CJK/Latin
+    /// 断行、胶囊标签、可折叠 Section）。文档经 [`RichDoc`] builder 构造：
+    ///
+    /// ```ignore
+    /// Element::rich(
+    ///     RichDoc::new()
+    ///         .style("headword", SpanStyle::new().size(26.0).bold())
+    ///         .style("pos", SpanStyle::new().size(11.0).chip())
+    ///         .para(Para::new().styled("headword", "apple").text("  ")
+    ///             .styled("pos", "n."))
+    ///         .section("例句", collapsed_signal, |s| s.para("An apple a day…")),
+    /// )
+    /// ```
+    pub fn rich(doc: RichDoc) -> Self {
+        Self::base(Layout::None).widget(rich::RichText::new(doc))
     }
 
     // ---- 图片 ----
@@ -2293,6 +2304,21 @@ impl Element {
         self.min_width = Some(px);
         self
     }
+    /// 最大宽度（逻辑像素）。内容在此宽度内换行，不是排好版再裁。
+    ///
+    /// 典型用途是长正文限宽：行太长会让眼睛在回到行首时找错行，可读性显著下降。
+    /// 配合 `width_match()` 使用——先撑满可用宽，再由本上界收住。
+    ///
+    /// 与 `min_width` 同时设定且冲突时**以本上界为准**。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// Element::label("很长的正文……").width_match().max_width(640);
+    /// ```
+    pub fn max_width(mut self, px: i32) -> Self {
+        self.max_width = Some(px);
+        self
+    }
     pub fn height_match(mut self) -> Self {
         self.height = Dimension::Match;
         self
@@ -2370,6 +2396,25 @@ impl Element {
         self.style.border = Some((crate::style::Brush::Role(role), w));
         self
     }
+    /// 限定边框只画某几条边。须与 `border` / `border_role` 连用，单独调用无效果。
+    ///
+    /// 用于页签下划线、分区底线、栏间竖线这类**单边**装饰。此前只能拿 1px 高的色块
+    /// 拼——那会多占一个布局位置，容器一改间距就跟着错位；作为边框则完全不参与布局。
+    ///
+    /// 缺边时 `corner()` 不生效：一条底边没有「圆角」可言。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// # use windui::style::Edges;
+    /// // 页签栏底线
+    /// Element::row().border_role(Role::Divider, 1).border_edges(Edges::BOTTOM);
+    /// // 上下双线
+    /// Element::row().border_role(Role::Divider, 1).border_edges(Edges::TOP | Edges::BOTTOM);
+    /// ```
+    pub fn border_edges(mut self, edges: crate::style::Edges) -> Self {
+        self.style.border_edges = edges;
+        self
+    }
     pub fn corner(mut self, r: f32) -> Self {
         self.style.corner_radius = r;
         self
@@ -2410,6 +2455,21 @@ impl Element {
     /// 调用方无从保证。需要确保效果时应自行随程序分发字体。
     pub fn font_family(mut self, name: impl Into<String>) -> Self {
         self.style.font_family = Some(name.into());
+        self
+    }
+    /// 行高倍数（相对字号）。不设则用字体自带行距。
+    ///
+    /// 主要影响**多行文字**的行间距；单行文字只影响其占位高度。取倍数而非绝对像素，
+    /// 使行距随字号与 DPI 一同缩放——写死像素会在换字号时失调。
+    ///
+    /// 经验值：中文正文 1.6–1.7，西文 1.4–1.5，标题 1.1–1.25。字号越大行距倍数应越小。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// Element::label("很长的一段中文释义……").line_height(1.7).width_match();
+    /// ```
+    pub fn line_height(mut self, multiple: f32) -> Self {
+        self.style.line_height = Some(multiple);
         self
     }
     /// 文字水平对齐。
@@ -2453,6 +2513,7 @@ impl Element {
             width: self.width,
             height: self.height,
             min_width: self.min_width.unwrap_or(0),
+            max_width: self.max_width.unwrap_or(0),
             padding: self.padding,
             margin: self.margin,
             align: self.align,
@@ -2650,12 +2711,11 @@ mod tests {
             _rect: Rect,
             color: Color,
             _align: crate::spec::Align,
-            _family: Option<&str>,
-            _size: f32,
+            _ts: &crate::text::TextStyle,
         ) {
             self.last_text_color.set(Some(color));
         }
-        fn measure_text(&mut self, _: &str, _: Option<&str>, _: f32) -> Size {
+        fn measure_text(&mut self, _: &str, _: &crate::text::TextStyle) -> Size {
             Size::ZERO
         }
         fn push_layer(&mut self, _: f32) {}
@@ -2711,14 +2771,13 @@ mod tests {
             _: Rect,
             _: Color,
             _: crate::spec::Align,
-            _: Option<&str>,
-            _: f32,
+            _: &crate::text::TextStyle,
         ) {
         }
-        fn measure_text(&mut self, text: &str, _: Option<&str>, size: f32) -> Size {
+        fn measure_text(&mut self, text: &str, ts: &crate::text::TextStyle) -> Size {
             Size::new(
-                (text.chars().count() as f32 * size).ceil() as i32,
-                size.ceil() as i32,
+                (text.chars().count() as f32 * ts.size).ceil() as i32,
+                ts.line_height_px().unwrap_or(ts.size).ceil() as i32,
             )
         }
         fn push_layer(&mut self, _: f32) {}

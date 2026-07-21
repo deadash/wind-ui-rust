@@ -201,8 +201,7 @@ impl Widget for ListRow {
             tr,
             color,
             Align::Start,
-            style.font_family.as_deref(),
-            style.font_size,
+            &crate::text::TextStyle::of(style),
         );
         // 键盘焦点时描边（仅当前焦点行）。
         let _ = focused;

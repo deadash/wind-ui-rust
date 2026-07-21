@@ -458,7 +458,7 @@ impl Widget for IconButton {
     fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
         match &self.kind {
             IconKind::Glyph(g) => {
-                let t = text.measure(g, style.font_family.as_deref(), style.font_size, None);
+                let t = text.measure(g, &crate::text::TextStyle::of(style), None);
                 let side = t.w.max(t.h).max(style.font_size as i32) + 2 * ICON_BTN_PAD;
                 Size::new(side.max(ICON_BTN_SIZE), side.max(ICON_BTN_SIZE))
             }
@@ -521,8 +521,7 @@ impl Widget for IconButton {
                     bounds,
                     color,
                     Align::Center,
-                    style.font_family.as_deref(),
-                    style.font_size,
+                    &crate::text::TextStyle::of(style),
                 );
             }
             IconKind::Image(content) => {
@@ -659,12 +658,7 @@ impl TabButton {
 
 impl Widget for TabButton {
     fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
-        let t = text.measure(
-            &self.label,
-            style.font_family.as_deref(),
-            style.font_size,
-            None,
-        );
+        let t = text.measure(&self.label, &crate::text::TextStyle::of(style), None);
         let icon_extra = if self.icon.is_some() {
             t.h + TAB_ICON_GAP
         } else {
@@ -711,8 +705,7 @@ impl Widget for TabButton {
         };
         // 有图标：图标 + 文字作为整体水平居中（图标在左）；否则文字整体居中。
         if let Some(icon) = &self.icon {
-            let ts =
-                canvas.measure_text(&self.label, style.font_family.as_deref(), style.font_size);
+            let ts = canvas.measure_text(&self.label, &crate::text::TextStyle::of(style));
             let ih = ts.h;
             let total_w = ih + TAB_ICON_GAP + ts.w;
             let sx = bounds.x + ((bounds.w - total_w) / 2).max(0);
@@ -728,8 +721,7 @@ impl Widget for TabButton {
                 tr,
                 color,
                 Align::Start,
-                style.font_family.as_deref(),
-                style.font_size,
+                &crate::text::TextStyle::of(style),
             );
         } else {
             canvas.draw_text(
@@ -737,8 +729,7 @@ impl Widget for TabButton {
                 bounds,
                 color,
                 Align::Center,
-                style.font_family.as_deref(),
-                style.font_size,
+                &crate::text::TextStyle::of(style),
             );
         }
         // 底部指示条补间：选中(且启用)→1，否则→0；从中心展宽 + 淡入。禁用不显示。
@@ -752,8 +743,7 @@ impl Widget for TabButton {
         if amount > 0.0 {
             // 指示条比文字略宽（参考设计：蓝条宽于标签文字），按文字宽 + 两侧外扩，
             // 钳到 tab 宽内。有图标时把图标宽并入。
-            let ts =
-                canvas.measure_text(&self.label, style.font_family.as_deref(), style.font_size);
+            let ts = canvas.measure_text(&self.label, &crate::text::TextStyle::of(style));
             let content_w = if self.icon.is_some() {
                 ts.h + TAB_ICON_GAP + ts.w
             } else {

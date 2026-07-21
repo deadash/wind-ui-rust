@@ -32,7 +32,7 @@ use objc2_core_text::{
     CTTextAlignment,
 };
 
-use super::TextEngine;
+use super::{TextEngine, TextStyle};
 use crate::geometry::{Color, Rect, Size};
 use crate::spec::Align;
 
@@ -86,24 +86,41 @@ impl CoreTextEngine {
 
     /// 用 (font, color, align) 组装属性字典 → CFAttributedString。
     /// 段落样式仅折行路径用到；单行路径手动定位，故对其无影响（保留一条路径即可）。
+    /// 构造带段落样式的属性串。`line_h` 为**物理**行高（None = 用字体自带行距）。
     fn attributed(
         &mut self,
         text: &str,
         font: &CTFont,
         color: &CGColor,
         align: Align,
+        line_h: Option<f32>,
     ) -> CFRetained<CFAttributedString> {
         let ct_align = match align {
             Align::Start | Align::Stretch => CTTextAlignment::Natural,
             Align::Center => CTTextAlignment::Center,
             Align::End => CTTextAlignment::Right,
         };
-        let setting = CTParagraphStyleSetting {
+        // 行高同时设最小与最大，等价于 DirectWrite 的 UNIFORM——只设其一时 Core Text
+        // 仍会让行高随最高字形浮动，中西文混排下行距就会参差。
+        let lh = line_h.unwrap_or(0.0) as f64;
+        let mut settings = vec![CTParagraphStyleSetting {
             spec: CTParagraphStyleSpecifier::Alignment,
             valueSize: std::mem::size_of::<CTTextAlignment>(),
             value: NonNull::from(&ct_align).cast(),
-        };
-        let para = unsafe { CTParagraphStyle::new(&setting, 1) };
+        }];
+        if line_h.is_some() {
+            settings.push(CTParagraphStyleSetting {
+                spec: CTParagraphStyleSpecifier::MinimumLineHeight,
+                valueSize: std::mem::size_of::<f64>(),
+                value: NonNull::from(&lh).cast(),
+            });
+            settings.push(CTParagraphStyleSetting {
+                spec: CTParagraphStyleSpecifier::MaximumLineHeight,
+                valueSize: std::mem::size_of::<f64>(),
+                value: NonNull::from(&lh).cast(),
+            });
+        }
+        let para = unsafe { CTParagraphStyle::new(settings.as_ptr(), settings.len()) };
 
         // 属性名是 Core Text 的 extern static（CFString 常量），取其指针需 unsafe。
         let mut keys: [*const c_void; 3] = unsafe {
@@ -155,22 +172,18 @@ impl TextEngine for CoreTextEngine {
         self.scale = scale.max(0.1);
     }
 
-    fn measure(
-        &mut self,
-        text: &str,
-        family: Option<&str>,
-        size: f32,
-        max_width: Option<f32>,
-    ) -> Size {
+    fn measure(&mut self, text: &str, ts: &TextStyle, max_width: Option<f32>) -> Size {
+        let size = ts.size;
         if text.is_empty() {
-            return Size::new(0, size.ceil() as i32);
+            return Size::new(0, ts.line_height_px().unwrap_or(size).ceil() as i32);
         }
         let s = self.scale;
         let psize = size * s;
-        let font = self.font(family, psize);
+        let font = self.font(ts.family, psize);
         // 颜色与对齐不影响测量，取占位值。
         let black = CGColor::new_srgb(0.0, 0.0, 0.0, 1.0);
-        let attr = self.attributed(text, &font, &black, Align::Start);
+        let plh = ts.line_height_px().map(|h| h * s);
+        let attr = self.attributed(text, &font, &black, Align::Start, plh);
 
         match max_width {
             // 折行：用 framesetter 在宽度内排版，取建议尺寸。
@@ -200,7 +213,9 @@ impl TextEngine for CoreTextEngine {
             _ => {
                 let line = unsafe { CTLine::with_attributed_string(&attr) };
                 let (width, ascent, descent, leading) = line_metrics(&line);
-                let line_h = ascent + descent + leading;
+                // 显式行高优先：CTLine 的 typographic bounds 反映的是字形度量，
+                // 不含段落样式强制的行高。
+                let line_h = plh.map(|h| h as f64).unwrap_or(ascent + descent + leading);
                 Size::new(
                     (width / s as f64).ceil() as i32,
                     (line_h / s as f64).ceil() as i32,
@@ -216,10 +231,10 @@ impl TextEngine for CoreTextEngine {
         rect: Rect,
         color: Color,
         align: Align,
-        family: Option<&str>,
-        size: f32,
+        ts: &TextStyle,
         clip: Option<Rect>,
     ) {
+        let size = ts.size;
         if text.is_empty() || rect.is_empty() {
             return;
         }
@@ -250,14 +265,15 @@ impl TextEngine for CoreTextEngine {
             None => return,
         };
 
-        let font = self.font(family, psize);
+        let font = self.font(ts.family, psize);
         let cg_color = CGColor::new_srgb(
             color.r as f64 / 255.0,
             color.g as f64 / 255.0,
             color.b as f64 / 255.0,
             color.a as f64 / 255.0,
         );
-        let attr = self.attributed(text, &font, &cg_color, align);
+        let plh = ts.line_height_px().map(|h| h * s);
+        let attr = self.attributed(text, &font, &cg_color, align, plh);
 
         // 单行测量，判定是否需要折行（无换行符且整行宽 ≤ rect 宽 → 单行，支持水平滚动）。
         let probe = unsafe { CTLine::with_attributed_string(&attr) };

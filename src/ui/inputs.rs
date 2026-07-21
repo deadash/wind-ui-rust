@@ -32,6 +32,12 @@ pub enum CheckBoxSize {
 
 // ---------------- CheckBox ----------------
 
+/// 文本视觉行布局的缓存键：显示串 + 内框宽 + 字族 + 字号 + 字重 + 行高。
+///
+/// 凡是会改变排版结果的输入都必须在键里，漏一项就会沿用错误的视觉行——
+/// 表现为光标落点与字形对不上，而非明显的渲染错误，很难查。
+type LayoutKey = (String, i32, Option<String>, u32, u16, Option<u32>);
+
 pub struct CheckBox {
     label: String,
     state: Signal<bool>,
@@ -91,7 +97,11 @@ impl Widget for CheckBox {
             CheckBoxSize::Small => (BOX_SIZE_SMALL, GAP_SMALL),
         };
         let fsize = self.font_size(style);
-        let t = text.measure(&self.label, style.font_family.as_deref(), fsize, None);
+        let t = text.measure(
+            &self.label,
+            &crate::text::TextStyle::of(style).with_size(fsize),
+            None,
+        );
         Size::new(bsz + gap + t.w, bsz.max(t.h))
     }
     fn paint(
@@ -197,8 +207,7 @@ impl Widget for CheckBox {
             text_rect,
             text_color,
             Align::Start,
-            style.font_family.as_deref(),
-            self.font_size(style),
+            &crate::text::TextStyle::of(style).with_size(self.font_size(style)),
         );
     }
     fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
@@ -408,12 +417,7 @@ impl RadioButton {
 
 impl Widget for RadioButton {
     fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
-        let t = text.measure(
-            &self.label,
-            style.font_family.as_deref(),
-            style.font_size,
-            None,
-        );
+        let t = text.measure(&self.label, &crate::text::TextStyle::of(style), None);
         Size::new(BOX_SIZE + GAP + t.w, BOX_SIZE.max(t.h))
     }
     fn paint(
@@ -476,8 +480,7 @@ impl Widget for RadioButton {
             text_rect,
             text_color,
             Align::Start,
-            style.font_family.as_deref(),
-            style.font_size,
+            &crate::text::TextStyle::of(style),
         );
     }
     fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
@@ -614,8 +617,7 @@ impl Widget for Slider {
                 label_rect,
                 text_color,
                 crate::spec::Align::Center,
-                style.font_family.as_deref(),
-                style.font_size,
+                &crate::text::TextStyle::of(style),
             );
         }
     }
@@ -721,10 +723,13 @@ struct VisLine {
 struct TextLayout {
     lines: Vec<VisLine>,
     line_h: i32,
-    /// 重建缓存键：显示串 + 内框宽 + 字体族 + 字号 bits。命中则跳过整次重建
-    /// （含每段 O(L²) 累计测量），仅在文本/宽度/字体变化时才重排——光标移动/闪烁、
-    /// 悬停等无关重绘不再触发布局。
-    key: Option<(String, i32, Option<String>, u32)>,
+    /// 重建缓存键：显示串 + 内框宽 + 全部文字属性（字族/字号/字重/行高）。命中则
+    /// 跳过整次重建（含每段 O(L²) 累计测量），仅在文本/宽度/字体变化时才重排——
+    /// 光标移动/闪烁、悬停等无关重绘不再触发布局。
+    ///
+    /// 字重与行高必须进键：它们同样改变每行的宽高，漏掉会让加粗/改行距后沿用旧的
+    /// 视觉行，光标落点与实际字形对不上。
+    key: Option<LayoutKey>,
 }
 
 pub struct TextInput {
@@ -958,18 +963,20 @@ impl TextInput {
         &self,
         canvas: &mut dyn Canvas,
         disp: &str,
-        family: Option<&str>,
-        fsize: f32,
+        ts: &crate::text::TextStyle,
         inner_w: i32,
     ) {
+        let (family, fsize) = (ts.family, ts.size);
         // 缓存命中（文本/宽度/字体均未变）：跳过重建，沿用上次视觉行。
         {
             let lay = self.layout.borrow();
-            if let Some((k_disp, k_w, k_fam, k_size)) = lay.key.as_ref() {
+            if let Some((k_disp, k_w, k_fam, k_size, k_weight, k_lh)) = lay.key.as_ref() {
                 if k_disp == disp
                     && *k_w == inner_w
                     && k_fam.as_deref() == family
                     && *k_size == fsize.to_bits()
+                    && *k_weight == ts.weight
+                    && *k_lh == ts.line_height.map(f32::to_bits)
                 {
                     return;
                 }
@@ -986,9 +993,11 @@ impl TextInput {
             inner_w,
             family.map(str::to_string),
             fsize.to_bits(),
+            ts.weight,
+            ts.line_height.map(f32::to_bits),
         ));
         lay.lines.clear();
-        lay.line_h = canvas.measure_text("Ay", family, fsize).h.max(fsize as i32);
+        lay.line_h = canvas.measure_text("Ay", ts).h.max(fsize as i32);
 
         let mut p = 0usize;
         loop {
@@ -1005,7 +1014,7 @@ impl TextInput {
             let mut acc = String::new();
             for &ch in &chars[p..q] {
                 acc.push(ch);
-                prefix.push(canvas.measure_text(&acc, family, fsize).w);
+                prefix.push(canvas.measure_text(&acc, ts).w);
             }
             for (ls, le, hard) in wrap_paragraph(&chars, p, q, &prefix, inner_w, wrap) {
                 let base = prefix[ls - p];
@@ -1287,7 +1296,7 @@ fn word_run(chars: &[char], idx: usize) -> (usize, usize) {
 impl Widget for TextInput {
     fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
         let lh = text
-            .measure("Ay", style.font_family.as_deref(), style.font_size, None)
+            .measure("Ay", &crate::text::TextStyle::of(style), None)
             .h
             .max(style.font_size as i32);
         // 多行默认约 5 行高（用户可 .height() 覆盖）；单行沿用紧凑高度。
@@ -1351,8 +1360,9 @@ impl Widget for TextInput {
             bounds.w - 2 * TEXT_PAD - lead,
             bounds.h - 2 * vpad,
         );
-        let family = style.font_family.as_deref();
-        let fsize = style.font_size;
+        // 文字属性打包传递：字重与行高随 `Style` 自动带上，不必在每个调用点重列。
+        let ts = &crate::text::TextStyle::of(style);
+        let fsize = ts.size;
         self.font_size_hint.set(fsize);
         // 前置图标（搜索框等）：绘于左侧留白区，垂直居中，弱化色。
         if let Some(g) = self.config.leading {
@@ -1363,15 +1373,14 @@ impl Widget for TextInput {
                 icon_rect,
                 pal.placeholder,
                 Align::Center,
-                family,
-                fsize,
+                ts,
             );
         }
         let wrap = self.config.wrap && multiline;
         let cursor = self.cursor.min(disp.chars().count());
 
         // 重建视觉行布局缓存。
-        self.rebuild_layout(canvas, &disp, family, fsize, inner.w);
+        self.rebuild_layout(canvas, &disp, &crate::text::TextStyle::of(style), inner.w);
         let lay = self.layout.borrow();
         let line_h = lay.line_h.max(1);
         let (cl, cx_in) = self.caret_line_x(&lay, cursor);
@@ -1458,8 +1467,7 @@ impl Widget for TextInput {
                 pr,
                 inp.placeholder(pal),
                 Align::Start,
-                family,
-                fsize,
+                ts,
             );
         } else {
             let chars: Vec<char> = disp.chars().collect();
@@ -1471,7 +1479,7 @@ impl Widget for TextInput {
                 if ln.end > ln.start {
                     let s: String = chars[ln.start..ln.end].iter().collect();
                     let tr = Rect::new(base_x, ly, NO_WRAP_W, line_h);
-                    canvas.draw_text(&s, tr, text_color, Align::Start, family, fsize);
+                    canvas.draw_text(&s, tr, text_color, Align::Start, ts);
                 }
             }
         }
@@ -1895,14 +1903,19 @@ mod tests {
         let ti = dummy_input(); // 单行
         let mut pm = Pixmap::new(200, 30).unwrap();
         let mut c = SkiaCanvas::new(&mut pm); // 无引擎：measure 走确定性近似
-        ti.rebuild_layout(&mut c, "abc", None, 14.0, 200);
+        ti.rebuild_layout(&mut c, "abc", &crate::text::TextStyle::new(14.0), 200);
         assert_eq!(ti.layout.borrow().lines.len(), 1);
         assert_eq!(ti.layout.borrow().lines[0].end, 3);
         // 同参再次：缓存命中，不破坏既有行集。
-        ti.rebuild_layout(&mut c, "abc", None, 14.0, 200);
+        ti.rebuild_layout(&mut c, "abc", &crate::text::TextStyle::new(14.0), 200);
         assert_eq!(ti.layout.borrow().lines[0].end, 3, "缓存命中应沿用旧行");
         // 文本变化：键失配 → 重建为新长度。
-        ti.rebuild_layout(&mut c, "abcdefghij", None, 14.0, 200);
+        ti.rebuild_layout(
+            &mut c,
+            "abcdefghij",
+            &crate::text::TextStyle::new(14.0),
+            200,
+        );
         assert_eq!(ti.layout.borrow().lines[0].end, 10, "文本变化后应重建");
     }
 

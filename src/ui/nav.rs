@@ -98,8 +98,7 @@ fn paint_panel_header(
         tr,
         text_color,
         Align::Start,
-        style.font_family.as_deref(),
-        style.font_size,
+        &crate::text::TextStyle::of(style),
     );
     let cx = bounds.x as f32 + bounds.w as f32 - PAD_X as f32 - CHEVRON_W as f32 / 2.0;
     let cy = bounds.y as f32 + bounds.h as f32 / 2.0;
@@ -196,8 +195,7 @@ impl Widget for NavRow {
             tr,
             text_color,
             Align::Start,
-            style.font_family.as_deref(),
-            style.font_size,
+            &crate::text::TextStyle::of(style),
         );
         // 右侧钻入箭头。
         let cx = bounds.x as f32 + bounds.w as f32 - PAD_X as f32 - CHEVRON_W as f32 / 2.0;

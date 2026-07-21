@@ -447,8 +447,7 @@ impl Canvas for SkiaCanvas<'_> {
         rect: Rect,
         color: Color,
         align: Align,
-        family: Option<&str>,
-        size: f32,
+        ts: &crate::text::TextStyle,
     ) {
         let _g = super::prof::scope(super::prof::TEXT);
         // 传逻辑 rect/size/clip；引擎内部持有 scale 自行物理化（与 measure 同源）。
@@ -472,44 +471,57 @@ impl Canvas for SkiaCanvas<'_> {
             None => self.pixmap,
         };
         if let Some(engine) = self.engine.as_deref_mut() {
-            engine.draw(target, text, rect, color, align, family, size, clip);
+            engine.draw(target, text, rect, color, align, ts, clip);
         }
     }
 
-    fn measure_text(
-        &mut self,
-        text: &str,
-        family: Option<&str>,
-        size: f32,
-    ) -> crate::geometry::Size {
+    fn measure_text(&mut self, text: &str, ts: &crate::text::TextStyle) -> crate::geometry::Size {
         // 逻辑入参；引擎内部物理测量后 /scale 回逻辑，与正文绘制度量同源。
         match self.engine.as_deref_mut() {
-            Some(engine) => engine.measure(text, family, size, None),
+            Some(engine) => engine.measure(text, ts, None),
             None => crate::geometry::Size::new(
-                (text.chars().count() as f32 * size * 0.6).ceil() as i32,
-                size.ceil() as i32,
+                (text.chars().count() as f32 * ts.size * 0.6).ceil() as i32,
+                ts.line_height_px().unwrap_or(ts.size).ceil() as i32,
             ),
+        }
+    }
+
+    fn text_line_metrics(
+        &mut self,
+        text: &str,
+        ts: &crate::text::TextStyle,
+    ) -> crate::text::LineMetrics {
+        // 有引擎时取精确基线；无引擎沿用 trait 默认的 0.8 近似（与 Null 测量一致）。
+        match self.engine.as_deref_mut() {
+            Some(engine) => engine.line_metrics(text, ts),
+            None => {
+                let h = ts.line_height_px().unwrap_or(ts.size);
+                crate::text::LineMetrics {
+                    ascent: h * 0.8,
+                    descent: h * 0.2,
+                }
+            }
         }
     }
 
     fn measure_text_wrapped(
         &mut self,
         text: &str,
-        family: Option<&str>,
-        size: f32,
+        ts: &crate::text::TextStyle,
         max_width: f32,
     ) -> crate::geometry::Size {
         // 与 measure_text 同源，仅多传 max_width 触发引擎按宽度换行。
         match self.engine.as_deref_mut() {
-            Some(engine) => engine.measure(text, family, size, Some(max_width)),
+            Some(engine) => engine.measure(text, ts, Some(max_width)),
             None => {
                 // 无引擎的粗略估算：按等宽字符估算每行字数换行，行高按行数累加。
-                let per_line = ((max_width / (size * 0.6)).floor() as usize).max(1);
+                let per_line = ((max_width / (ts.size * 0.6)).floor() as usize).max(1);
                 let chars = text.chars().count().max(1);
                 let lines = chars.div_ceil(per_line).max(1);
+                let line_h = ts.line_height_px().unwrap_or(ts.size);
                 crate::geometry::Size::new(
                     max_width.ceil() as i32,
-                    (size.ceil() as i32) * lines as i32,
+                    (line_h.ceil() as i32) * lines as i32,
                 )
             }
         }

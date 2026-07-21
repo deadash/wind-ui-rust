@@ -148,16 +148,10 @@ pub trait Canvas {
         rect: Rect,
         color: Color,
         align: Align,
-        family: Option<&str>,
-        size: f32,
+        ts: &crate::text::TextStyle,
     );
     /// 测量单行文字尺寸（用于光标定位等）。无文字引擎时返回粗略估算。
-    fn measure_text(
-        &mut self,
-        text: &str,
-        family: Option<&str>,
-        size: f32,
-    ) -> crate::geometry::Size;
+    fn measure_text(&mut self, text: &str, ts: &crate::text::TextStyle) -> crate::geometry::Size;
 
     /// 测量在 `max_width` 内自动换行后的文字尺寸（用于 tooltip 等超宽自动换行场景）。
     /// 默认退化为单行测量，实现需覆盖以启用真正的换行度量（与 [`Self::draw_text`]
@@ -165,12 +159,26 @@ pub trait Canvas {
     fn measure_text_wrapped(
         &mut self,
         text: &str,
-        family: Option<&str>,
-        size: f32,
+        ts: &crate::text::TextStyle,
         max_width: f32,
     ) -> crate::geometry::Size {
         let _ = max_width;
-        self.measure_text(text, family, size)
+        self.measure_text(text, ts)
+    }
+
+    /// `text` 单行排版后的基线度量（供富文本等同行混字号场景基线对齐）。
+    /// 默认按「基线 = 行高 × 0.8」近似；有真实文字栈的实现应覆盖为精确值
+    /// （软后端委托 `TextEngine::line_metrics`，d2d 走 GetLineMetrics）。
+    fn text_line_metrics(
+        &mut self,
+        text: &str,
+        ts: &crate::text::TextStyle,
+    ) -> crate::text::LineMetrics {
+        let h = self.measure_text(text, ts).h as f32;
+        crate::text::LineMetrics {
+            ascent: h * 0.8,
+            descent: h * 0.2,
+        }
     }
 
     /// 压入一层离屏合成层：后续绘制重定向到该层；`pop_layer` 时以 `opacity`

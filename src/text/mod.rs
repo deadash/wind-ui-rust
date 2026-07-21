@@ -24,20 +24,90 @@ use crate::spec::Align;
 /// 默认字重（DirectWrite NORMAL = 400）。
 pub const WEIGHT_NORMAL: u16 = 400;
 
-thread_local! {
-    /// 当前文字字重（线程局部）：核心层在 measure/paint 前按 `Style.font_weight` 注入，
-    /// 引擎构造字体格式时读取，免去逐个 draw/measure 签名携带 weight（仿 anim::set_paint_rect）。
-    static WEIGHT: std::cell::Cell<u16> = const { std::cell::Cell::new(WEIGHT_NORMAL) };
+/// 一次文字排版所需的全部字体属性。
+///
+/// ## 为什么是一个结构体而不是若干位置参数
+///
+/// 这些属性要穿过两层 trait（`Canvas` 与 `TextEngine`）、四个实现（skia / d2d /
+/// DirectWrite / CoreText）和六十余处调用点。当初它们是散开的位置参数，于是每加一项
+/// 都要改所有签名——字重就是因此**没有**进签名，改走线程局部注入的：核心层在
+/// measure/paint 前 `set_weight`、之后复位。
+///
+/// 那条捷径有真实代价：字重成了隐式全局状态，一旦某条路径忘了复位，后续无关文字
+/// 就会跟着变粗，且只在特定绘制顺序下显形。属性越多，这种耦合越危险。
+///
+/// 收进一个结构体后，新增属性只是加一个字段，签名不动、调用点不动；对控件代码
+/// 反而更短——`&TextStyle::of(style)` 比原先的 `style.font_family.as_deref(),
+/// style.font_size` 少写一截，且字重与行高自动随行，不会漏传。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextStyle<'a> {
+    /// 字族名。`None` 用引擎默认。
+    pub family: Option<&'a str>,
+    /// 字号（逻辑单位 dp）。
+    pub size: f32,
+    /// 字重，`WEIGHT_NORMAL` 为常规。
+    pub weight: u16,
+    /// 行高倍数（相对字号）。`None` 用字体自带的行距。
+    ///
+    /// 单位取**倍数**而非绝对像素，因为行距的本意是随字号缩放的排版节奏；写死像素
+    /// 会在换字号时失调，也无法跨 DPI。
+    pub line_height: Option<f32>,
 }
 
-/// 设置当前文字字重（核心层在测量/绘制文字前调用）。
-pub fn set_weight(w: u16) {
-    WEIGHT.with(|c| c.set(w));
+impl<'a> TextStyle<'a> {
+    /// 只指定字号，其余取默认。用于菜单、徽标等不随控件 `Style` 走的固定字号处。
+    pub fn new(size: f32) -> Self {
+        Self {
+            family: None,
+            size,
+            weight: WEIGHT_NORMAL,
+            line_height: None,
+        }
+    }
+
+    /// 从控件 `Style` 提取文字属性。控件绘制路径一律用它。
+    pub fn of(style: &'a crate::style::Style) -> Self {
+        Self {
+            family: style.font_family.as_deref(),
+            size: style.font_size,
+            weight: style.font_weight,
+            line_height: style.line_height,
+        }
+    }
+
+    /// 换一个字号，其余不变。用于「比正文小两号」这类相对尺寸。
+    pub fn with_size(self, size: f32) -> Self {
+        Self { size, ..self }
+    }
+
+    /// 换一个字重，其余不变。
+    pub fn with_weight(self, weight: u16) -> Self {
+        Self { weight, ..self }
+    }
+
+    /// 行高解析为绝对像素；未指定行高时返回 `None`，由引擎沿用字体自带行距。
+    pub fn line_height_px(&self) -> Option<f32> {
+        self.line_height.map(|m| self.size * m)
+    }
 }
 
-/// 读取当前文字字重（文字引擎构造格式时调用）。
-pub fn current_weight() -> u16 {
-    WEIGHT.with(|c| c.get())
+/// 一行文字的基线度量（逻辑 px）。`ascent`=基线以上高度、`descent`=基线以下高度
+/// （含 leading），二者之和即该文字的自然行高。
+///
+/// 供富文本等**同行混字号**场景做基线对齐：行基线 = max(各段 ascent)，每段绘制
+/// 矩形 top = 基线 − 自身 ascent、高 = 自身自然行高——引擎「矩形内垂直居中」的
+/// 绘制约定在矩形高恰为自然行高时退化为顶对齐，字形即落在正确基线上。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineMetrics {
+    pub ascent: f32,
+    pub descent: f32,
+}
+
+impl LineMetrics {
+    /// 自然行高（ascent + descent）。
+    pub fn height(&self) -> f32 {
+        self.ascent + self.descent
+    }
 }
 
 /// 文字测量与绘制接口。测量供布局阶段，绘制供 paint 阶段合成进 pixmap。
@@ -49,13 +119,19 @@ pub trait TextEngine {
     /// 设置 DPI 缩放因子。
     fn set_scale(&mut self, _scale: f32) {}
     /// 文字尺寸。`max_width=None` 单行不换行；`Some(w)` 在宽度 w 内换行并返回多行尺寸。
-    fn measure(
-        &mut self,
-        text: &str,
-        family: Option<&str>,
-        size: f32,
-        max_width: Option<f32>,
-    ) -> Size;
+    fn measure(&mut self, text: &str, ts: &TextStyle, max_width: Option<f32>) -> Size;
+    /// `text` 按 `ts` 单行排版后的基线度量。传入实际文本（而非样本串）是有意的：
+    /// 字体回退可能改变行度量，按实际内容询问才与 `draw` 同源。
+    ///
+    /// 默认实现按「基线 = 行高 × 0.8」近似——与 DirectWrite UNIFORM 行距的基线
+    /// 约定一致，供 Null 引擎与尚未实现精确度量的引擎（Core Text 待接）使用。
+    fn line_metrics(&mut self, text: &str, ts: &TextStyle) -> LineMetrics {
+        let h = self.measure(text, ts, None).h as f32;
+        LineMetrics {
+            ascent: h * 0.8,
+            descent: h * 0.2,
+        }
+    }
     /// 在 `rect` 内按 `align` 水平对齐、垂直居中绘制文字，合成进 `pixmap`。
     /// `clip` 为可选裁剪矩形（滚动视口等），合成时仅写入该矩形内的像素。
     fn draw(
@@ -65,8 +141,7 @@ pub trait TextEngine {
         rect: Rect,
         color: Color,
         align: Align,
-        family: Option<&str>,
-        size: f32,
+        ts: &TextStyle,
         clip: Option<Rect>,
     );
 }
@@ -75,15 +150,12 @@ pub trait TextEngine {
 pub struct NullTextEngine;
 
 impl TextEngine for NullTextEngine {
-    fn measure(
-        &mut self,
-        text: &str,
-        _family: Option<&str>,
-        size: f32,
-        _max_width: Option<f32>,
-    ) -> Size {
-        let w = (text.chars().count() as f32 * size * 0.6).ceil() as i32;
-        Size::new(w, size.ceil() as i32)
+    fn measure(&mut self, text: &str, ts: &TextStyle, _max_width: Option<f32>) -> Size {
+        let w = (text.chars().count() as f32 * ts.size * 0.6).ceil() as i32;
+        // 行高照实反映到高度上：这是单测唯一能观察到行高生效的地方（真实引擎在
+        // 无 DirectWrite 的测试环境下跑不起来），故这里不能图省事忽略它。
+        let h = ts.line_height_px().unwrap_or(ts.size);
+        Size::new(w, h.ceil() as i32)
     }
     fn draw(
         &mut self,
@@ -92,8 +164,7 @@ impl TextEngine for NullTextEngine {
         _rect: Rect,
         _color: Color,
         _align: Align,
-        _family: Option<&str>,
-        _size: f32,
+        _ts: &TextStyle,
         _clip: Option<Rect>,
     ) {
     }

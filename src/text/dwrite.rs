@@ -22,12 +22,13 @@ use windows::Win32::Graphics::DirectWrite::{
     IDWriteTextFormat, IDWriteTextLayout, IDWriteTextRenderer, IDWriteTextRenderer_Impl,
     DWRITE_COLOR_F, DWRITE_FACTORY_TYPE_SHARED, DWRITE_FONT_STRETCH_NORMAL,
     DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_GLYPH_RUN,
-    DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_MATRIX, DWRITE_MEASURING_MODE, DWRITE_STRIKETHROUGH,
-    DWRITE_TEXT_METRICS, DWRITE_UNDERLINE,
+    DWRITE_GLYPH_RUN_DESCRIPTION, DWRITE_LINE_METRICS, DWRITE_LINE_SPACING_METHOD_UNIFORM,
+    DWRITE_MATRIX, DWRITE_MEASURING_MODE, DWRITE_STRIKETHROUGH, DWRITE_TEXT_METRICS,
+    DWRITE_UNDERLINE,
 };
 use windows::Win32::Graphics::Gdi::{GetCurrentObject, GetObjectW, DIBSECTION, OBJ_BITMAP};
 
-use super::TextEngine;
+use super::{LineMetrics, TextEngine, TextStyle};
 use crate::geometry::{Color, Rect, Size};
 use crate::spec::Align;
 
@@ -53,12 +54,15 @@ pub struct DWriteEngine {
     factory: IDWriteFactory,
     gdi_interop: IDWriteGdiInterop,
     renderer: IDWriteTextRenderer,
-    /// 缓存 TextFormat，按 (family, 物理字号 bits) 复用。
-    formats: HashMap<(String, u32, u16), IDWriteTextFormat>,
-    /// 文本测量缓存：键为 (文本+字体+字号+换行宽+字重+scale) 的 64 位哈希，值为逻辑尺寸。
+    /// 缓存 TextFormat，按 (family, 物理字号 bits, 字重, 行高 bits) 复用。
+    formats: HashMap<(String, u32, u16, Option<u32>), IDWriteTextFormat>,
+    /// 文本测量缓存：键为 (文本+字体+字号+换行宽+字重+行高+scale) 的 64 位哈希，值为逻辑尺寸。
     /// 避免每帧对稳定文本重复 CreateTextLayout/GetMetrics（DirectWrite COM 往返昂贵）。
     /// 用哈希键省去每次查表的字符串分配；64 位空间碰撞概率可忽略。
     measure_cache: HashMap<u64, Size>,
+    /// 基线度量缓存：键与 measure 同要素（无 max_width），值为逻辑 LineMetrics。
+    /// 富文本每个碎片都要问基线，缓存后 COM 往返只发生在首次。
+    metrics_cache: HashMap<u64, LineMetrics>,
     /// DPI 缩放因子（逻辑→物理）。
     scale: f32,
     /// 复用的离屏位图渲染目标（按需扩容），避免每次绘字都创建 COM 对象。
@@ -92,6 +96,7 @@ impl DWriteEngine {
                 renderer,
                 formats: HashMap::new(),
                 measure_cache: HashMap::new(),
+                metrics_cache: HashMap::new(),
                 scale: 1.0,
                 bitmap_target: None,
                 bitmap_w: 0,
@@ -100,11 +105,14 @@ impl DWriteEngine {
         }
     }
 
-    fn format(&mut self, family: Option<&str>, size: f32) -> Option<IDWriteTextFormat> {
-        let fam = family.unwrap_or(DEFAULT_FAMILY).to_string();
-        // 当前字重经线程局部注入（核心层按 Style.font_weight 设置）；400 时等同旧行为。
-        let weight = crate::text::current_weight();
-        let key = (fam.clone(), size.to_bits(), weight);
+    /// 构造（并缓存）文字格式。`psize` 是**物理**字号，与 measure/draw 同源。
+    fn format(&mut self, ts: &TextStyle, psize: f32) -> Option<IDWriteTextFormat> {
+        let fam = ts.family.unwrap_or(DEFAULT_FAMILY).to_string();
+        let weight = ts.weight;
+        // 行距进缓存键：同字族同字号但行距不同，是两套格式。漏掉它会让先构造的那套
+        // 被后者复用，表现为行高时灵时不灵——取决于谁先进缓存。
+        let lh_key = ts.line_height.map(f32::to_bits);
+        let key = (fam.clone(), psize.to_bits(), weight, lh_key);
         if let Some(f) = self.formats.get(&key) {
             return Some(f.clone());
         }
@@ -123,11 +131,22 @@ impl DWriteEngine {
                     dw_weight,
                     DWRITE_FONT_STYLE_NORMAL,
                     DWRITE_FONT_STRETCH_NORMAL,
-                    size,
+                    psize,
                     PCWSTR(locale.as_ptr()),
                 )
                 .ok()?
         };
+        // 行高：UNIFORM 方法强制每行占固定高度，不再随字形起伏。
+        //
+        // 基线取行高的 0.8——DirectWrite 要求显式给出基线位置，而它没有「按比例
+        // 自动分配」的模式。0.8 是西文与 CJK 都能接受的经验值：低于此值行内文字
+        // 贴上沿，高于则贴下沿。
+        if let Some(mult) = ts.line_height {
+            let line = psize * mult;
+            unsafe {
+                let _ = format.SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM, line, line * 0.8);
+            }
+        }
         self.formats.insert(key, format.clone());
         Some(format)
     }
@@ -135,11 +154,11 @@ impl DWriteEngine {
     fn layout(
         &mut self,
         text: &str,
-        family: Option<&str>,
-        size: f32,
+        ts: &TextStyle,
+        psize: f32,
         max_w: f32,
     ) -> Option<IDWriteTextLayout> {
-        let format = self.format(family, size)?;
+        let format = self.format(ts, psize)?;
         let text_w = wide(text);
         unsafe {
             self.factory
@@ -179,29 +198,27 @@ impl TextEngine for DWriteEngine {
         if new != self.scale {
             // scale 变更使所有缓存尺寸失效（物理字号变了）。
             self.measure_cache.clear();
+            self.metrics_cache.clear();
         }
         self.scale = new;
     }
 
-    fn measure(
-        &mut self,
-        text: &str,
-        family: Option<&str>,
-        size: f32,
-        max_width: Option<f32>,
-    ) -> Size {
+    fn measure(&mut self, text: &str, ts: &TextStyle, max_width: Option<f32>) -> Size {
+        let size = ts.size;
         if text.is_empty() {
-            return Size::new(0, size.ceil() as i32);
+            // 空串也要占一行的高度，否则空标签会把周围布局吸扁。
+            return Size::new(0, ts.line_height_px().unwrap_or(size).ceil() as i32);
         }
         // 缓存键：把所有影响排版的输入哈希成 64 位（含线程局部字重与当前 scale）。
         let key = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             text.hash(&mut h);
-            family.hash(&mut h);
+            ts.family.hash(&mut h);
             size.to_bits().hash(&mut h);
             max_width.map(f32::to_bits).hash(&mut h);
-            crate::text::current_weight().hash(&mut h);
+            ts.weight.hash(&mut h);
+            ts.line_height.map(f32::to_bits).hash(&mut h);
             self.scale.to_bits().hash(&mut h);
             h.finish()
         };
@@ -212,7 +229,7 @@ impl TextEngine for DWriteEngine {
         let s = self.scale;
         let psize = size * s;
         let pmw = max_width.map(|w| w * s).unwrap_or(f32::MAX);
-        let Some(layout) = self.layout(text, family, psize, pmw) else {
+        let Some(layout) = self.layout(text, ts, psize, pmw) else {
             return Size::new(0, size.ceil() as i32);
         };
         let mut m = DWRITE_TEXT_METRICS::default();
@@ -231,6 +248,57 @@ impl TextEngine for DWriteEngine {
         sz
     }
 
+    fn line_metrics(&mut self, text: &str, ts: &TextStyle) -> LineMetrics {
+        // 近似回退：空文本 / 排版失败时按行高 0.8 处取基线（与 UNIFORM 行距约定一致）。
+        let approx = || {
+            let h = ts.line_height_px().unwrap_or(ts.size);
+            LineMetrics {
+                ascent: h * 0.8,
+                descent: h * 0.2,
+            }
+        };
+        if text.is_empty() {
+            return approx();
+        }
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            text.hash(&mut h);
+            ts.family.hash(&mut h);
+            ts.size.to_bits().hash(&mut h);
+            ts.weight.hash(&mut h);
+            ts.line_height.map(f32::to_bits).hash(&mut h);
+            self.scale.to_bits().hash(&mut h);
+            h.finish()
+        };
+        if let Some(m) = self.metrics_cache.get(&key) {
+            return *m;
+        }
+        // 物理字号排版（与 measure/draw 同源），首行 GetLineMetrics 取基线后 /scale 回逻辑。
+        // 不限宽——询问的是碎片级文本的固有基线，不涉及换行。
+        let s = self.scale;
+        let Some(layout) = self.layout(text, ts, ts.size * s, f32::MAX) else {
+            return approx();
+        };
+        let mut lm = [DWRITE_LINE_METRICS::default(); 1];
+        let mut n = 0u32;
+        // 文本含 \n 时行数超出缓冲区、调用返回 E_NOT_SUFFICIENT_BUFFER，但首行数据
+        // 已写入——基线对齐只关心首行，故忽略该错误、仅以「确有行写回」为准。
+        let _ = unsafe { layout.GetLineMetrics(Some(&mut lm), &mut n) };
+        if n == 0 || lm[0].height <= 0.0 {
+            return approx();
+        }
+        let m = LineMetrics {
+            ascent: lm[0].baseline / s,
+            descent: (lm[0].height - lm[0].baseline) / s,
+        };
+        if self.metrics_cache.len() >= MEASURE_CACHE_CAP {
+            self.metrics_cache.clear();
+        }
+        self.metrics_cache.insert(key, m);
+        m
+    }
+
     fn draw(
         &mut self,
         pixmap: &mut Pixmap,
@@ -238,10 +306,10 @@ impl TextEngine for DWriteEngine {
         rect: Rect,
         color: Color,
         align: Align,
-        family: Option<&str>,
-        size: f32,
+        ts: &TextStyle,
         clip: Option<Rect>,
     ) {
+        let size = ts.size;
         if text.is_empty() || rect.is_empty() {
             return;
         }
@@ -251,7 +319,7 @@ impl TextEngine for DWriteEngine {
         let pclip = clip.map(|c| c.scaled(s));
         let psize = size * s;
         // 按物理 rect 宽度换行（与 measure 传入的物理 maxWidth 一致）。
-        let Some(layout) = self.layout(text, family, psize, prect.w as f32) else {
+        let Some(layout) = self.layout(text, ts, psize, prect.w as f32) else {
             return;
         };
         let mut m = DWRITE_TEXT_METRICS::default();
@@ -628,8 +696,7 @@ mod alpha_text_tests {
             Rect::new(4, 4, 56, 40),
             Color::rgba(0, 0, 0, 128),
             Align::Start,
-            None,
-            32.0,
+            &crate::text::TextStyle::new(32.0),
             None,
         );
         let d = darkest_red(&pm, 6, 40, 8, 40);
@@ -641,14 +708,14 @@ mod alpha_text_tests {
     fn measure_cache_dedups_and_keys() {
         let mut eng = DWriteEngine::new();
         eng.set_scale(1.0);
-        let _ = eng.measure("hello", None, 14.0, None);
-        let _ = eng.measure("world", None, 14.0, None);
+        let _ = eng.measure("hello", &crate::text::TextStyle::new(14.0), None);
+        let _ = eng.measure("world", &crate::text::TextStyle::new(14.0), None);
         assert_eq!(eng.measure_cache.len(), 2);
-        let a = eng.measure("hello", None, 14.0, None);
-        let b = eng.measure("hello", None, 14.0, None);
+        let a = eng.measure("hello", &crate::text::TextStyle::new(14.0), None);
+        let b = eng.measure("hello", &crate::text::TextStyle::new(14.0), None);
         assert_eq!(a, b, "相同输入测量结果应一致");
         assert_eq!(eng.measure_cache.len(), 2, "重复测量不应新增缓存条目");
-        let _ = eng.measure("hello", None, 18.0, None); // 不同字号 → 新键
+        let _ = eng.measure("hello", &crate::text::TextStyle::new(18.0), None); // 不同字号 → 新键
         assert_eq!(eng.measure_cache.len(), 3);
         eng.set_scale(2.0); // scale 变更应清空缓存
         assert_eq!(eng.measure_cache.len(), 0, "scale 变更应清空测量缓存");
@@ -667,8 +734,7 @@ mod alpha_text_tests {
             Rect::new(4, 4, 56, 40),
             Color::rgba(0, 0, 0, 255),
             Align::Start,
-            None,
-            32.0,
+            &crate::text::TextStyle::new(32.0),
             None,
         );
         let d = darkest_red(&pm, 6, 40, 8, 40);

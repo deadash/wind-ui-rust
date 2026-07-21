@@ -511,6 +511,46 @@ impl LinkTheme {
     }
 }
 
+/// 富文本控件覆盖层（`Element::rich`）。
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RichTheme {
+    /// 折叠箭头色。
+    pub chevron: Option<Color>,
+    /// 分隔线色。
+    pub divider: Option<Color>,
+    /// 胶囊（chip）默认底色（span 未指定 bg 时）。
+    pub chip_bg: Option<Color>,
+    /// 胶囊默认文字色（span 未指定 fg 时）。
+    pub chip_fg: Option<Color>,
+    /// 段前间距（逻辑 px）。
+    pub para_spacing: Option<i32>,
+    /// 折叠区子内容缩进（逻辑 px）。
+    pub section_indent: Option<i32>,
+}
+
+impl RichTheme {
+    pub fn chevron(&self, p: &Palette) -> Color {
+        self.chevron.unwrap_or(p.text_muted)
+    }
+    pub fn divider(&self, p: &Palette) -> Color {
+        self.divider.unwrap_or(p.divider)
+    }
+    pub fn chip_bg(&self, p: &Palette) -> Color {
+        // 与 badge 同族：强调色 15% 淡底。
+        self.chip_bg.unwrap_or(p.accent.scale_alpha(0.15))
+    }
+    pub fn chip_fg(&self, p: &Palette) -> Color {
+        self.chip_fg.unwrap_or(p.accent)
+    }
+    pub fn para_spacing(&self) -> i32 {
+        self.para_spacing.unwrap_or(6)
+    }
+    pub fn section_indent(&self) -> i32 {
+        self.section_indent.unwrap_or(14)
+    }
+}
+
 /// 分段控制器覆盖层（连体多段单选）。
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -761,6 +801,7 @@ pub struct Theme {
     pub stepper: StepperTheme,
     pub list: ListTheme,
     pub link: LinkTheme,
+    pub rich: RichTheme,
     pub segment: SegmentTheme,
     pub table: TableTheme,
     pub nav: NavTheme,

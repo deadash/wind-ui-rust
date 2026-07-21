@@ -1015,14 +1015,24 @@ impl UiHost {
             if it.separator {
                 continue;
             }
-            max_label = max_label.max(self.engine.measure(&it.label, None, MENU_FONT, None).w);
+            max_label = max_label.max(
+                self.engine
+                    .measure(&it.label, &crate::text::TextStyle::new(MENU_FONT), None)
+                    .w,
+            );
             if let Some(sub) = &it.subtitle {
-                max_label = max_label.max(self.engine.measure(sub, None, MENU_FONT - 2.5, None).w);
+                max_label = max_label.max(
+                    self.engine
+                        .measure(sub, &crate::text::TextStyle::new(MENU_FONT - 2.5), None)
+                        .w,
+                );
             }
             let tw = if !it.submenu.is_empty() {
                 10
             } else if let Some(s) = &it.shortcut {
-                self.engine.measure(s, None, MENU_FONT - 2.0, None).w
+                self.engine
+                    .measure(s, &crate::text::TextStyle::new(MENU_FONT - 2.0), None)
+                    .w
             } else if it.checked {
                 12
             } else {
@@ -1030,7 +1040,11 @@ impl UiHost {
             };
             let mut total = tw;
             if let Some((text, _)) = &it.badge {
-                let bw = self.engine.measure(text, None, 12.0, None).w + 2 * BADGE_PAD_X;
+                let bw = self
+                    .engine
+                    .measure(text, &crate::text::TextStyle::new(12.0), None)
+                    .w
+                    + 2 * BADGE_PAD_X;
                 total += if total > 0 { MENU_GAP } else { 0 } + bw;
             }
             if it.trailing_icon.is_some() {
@@ -1604,7 +1618,11 @@ impl AppHandler for UiHost {
                     crate::anim::request_repaint();
                 } else {
                     let (pal, tt) = (&self.theme.palette, &self.theme.tooltip);
-                    let ts = canvas.measure_text_wrapped(&text, None, TOOLTIP_FONT, tt.max_width());
+                    let ts = canvas.measure_text_wrapped(
+                        &text,
+                        &crate::text::TextStyle::new(TOOLTIP_FONT),
+                        tt.max_width(),
+                    );
                     let (w, h) = (ts.w + 2 * TOOLTIP_PAD_X, ts.h + 2 * TOOLTIP_PAD_Y);
                     let ws = self.logical_size;
                     let mut x = self.hover_pos.x + TOOLTIP_CURSOR_DX;
@@ -1630,8 +1648,7 @@ impl AppHandler for UiHost {
                         tr,
                         tt.text(pal),
                         crate::spec::Align::Start,
-                        None,
-                        TOOLTIP_FONT,
+                        &crate::text::TextStyle::new(TOOLTIP_FONT),
                     );
                 }
             }
@@ -1651,7 +1668,7 @@ impl AppHandler for UiHost {
                 crate::event::ToastKind::Success => tt.success(pal),
                 crate::event::ToastKind::Error => tt.error(pal),
             };
-            let icon_sz = canvas.measure_text(glyph, None, TOAST_ICON_FONT);
+            let icon_sz = canvas.measure_text(glyph, &crate::text::TextStyle::new(TOAST_ICON_FONT));
             // 面板宽度上限：两侧各留 TOAST_TOP_MARGIN，保证不越窗口边界。
             let panel_max_w = (ws.w - 2 * TOAST_TOP_MARGIN).max(TOAST_MIN_W);
             // 文字最大宽度＝面板上限减去强调条/内边距/图标/图标间距/✕区/右内边距。
@@ -1664,8 +1681,11 @@ impl AppHandler for UiHost {
                 - TOAST_PAD_X)
                 .max(TOAST_TEXT_MIN_W);
             // 按 text_max_w 换行测量：短文本一行内即可测完，长文本自动折成多行。
-            let ts =
-                canvas.measure_text_wrapped(&toast.req.text, None, TOAST_FONT, text_max_w as f32);
+            let ts = canvas.measure_text_wrapped(
+                &toast.req.text,
+                &crate::text::TextStyle::new(TOAST_FONT),
+                text_max_w as f32,
+            );
             let panel_w = (TOAST_PAD_X
                 + icon_sz.w
                 + TOAST_ICON_GAP
@@ -1704,8 +1724,7 @@ impl AppHandler for UiHost {
                 icon_rect,
                 icon_color.scale_alpha(alpha),
                 crate::spec::Align::Center,
-                None,
-                TOAST_ICON_FONT,
+                &crate::text::TextStyle::new(TOAST_ICON_FONT),
             );
             // 文字：图标右侧，垂直居中、左对齐；rect 宽用 text_max_w（而非 ts.w）
             // 以保证绘制时的换行宽度与测量时一致（长文本才需要换行，短文本本就不超）。
@@ -1716,8 +1735,7 @@ impl AppHandler for UiHost {
                 text_rect,
                 tt.text(pal).scale_alpha(alpha),
                 crate::spec::Align::Start,
-                None,
-                TOAST_FONT,
+                &crate::text::TextStyle::new(TOAST_FONT),
             );
             // ✕ 关闭：面板右侧固定宽区域。
             let close = Rect::new(
@@ -1731,8 +1749,7 @@ impl AppHandler for UiHost {
                 close,
                 pal.text_muted.scale_alpha(alpha),
                 crate::spec::Align::Center,
-                None,
-                TOAST_FONT,
+                &crate::text::TextStyle::new(TOAST_FONT),
             );
             let panel = Rect::new(x, y, panel_w, panel_h);
             self.toast_rects.push((panel, close));
@@ -1829,8 +1846,7 @@ impl AppHandler for UiHost {
                             ir,
                             color,
                             crate::spec::Align::Center,
-                            None,
-                            MENU_FONT,
+                            &crate::text::TextStyle::new(MENU_FONT),
                         );
                     }
                     // 尾随区域从右向左依次收窄：可点击图标 → 徽章胶囊 → 剩余内容右边界。
@@ -1842,14 +1858,16 @@ impl AppHandler for UiHost {
                             ir,
                             color,
                             crate::spec::Align::Center,
-                            None,
-                            MENU_FONT,
+                            &crate::text::TextStyle::new(MENU_FONT),
                         );
                         content_right -= MENU_ICON_W + MENU_GAP;
                     }
                     if let Some((text, intent)) = &it.badge {
                         let (fill, fg) = intent.badge_colors(pal);
-                        let bw = canvas.measure_text(text, None, 12.0).w + 2 * BADGE_PAD_X;
+                        let bw = canvas
+                            .measure_text(text, &crate::text::TextStyle::new(12.0))
+                            .w
+                            + 2 * BADGE_PAD_X;
                         let br =
                             Rect::new(content_right - bw, top + (h - BADGE_H) / 2, bw, BADGE_H);
                         canvas.fill_round_rect(
@@ -1860,7 +1878,13 @@ impl AppHandler for UiHost {
                             999.0,
                             &Paint::fill(fill),
                         );
-                        canvas.draw_text(text, br, fg, crate::spec::Align::Center, None, 12.0);
+                        canvas.draw_text(
+                            text,
+                            br,
+                            fg,
+                            crate::spec::Align::Center,
+                            &crate::text::TextStyle::new(12.0),
+                        );
                         content_right -= bw + MENU_GAP;
                     }
                     // 标签（+ 可选第二行小字说明）。
@@ -1872,8 +1896,7 @@ impl AppHandler for UiHost {
                             lr,
                             color,
                             crate::spec::Align::Start,
-                            None,
-                            MENU_FONT,
+                            &crate::text::TextStyle::new(MENU_FONT),
                         );
                         let sr = Rect::new(label_x, top + h / 2, label_w, h - h / 2);
                         canvas.draw_text(
@@ -1881,8 +1904,7 @@ impl AppHandler for UiHost {
                             sr,
                             mt.text_disabled(pal),
                             crate::spec::Align::Start,
-                            None,
-                            MENU_FONT - 2.5,
+                            &crate::text::TextStyle::new(MENU_FONT - 2.5),
                         );
                     } else {
                         let lr = Rect::new(label_x, top, label_w, h);
@@ -1891,8 +1913,7 @@ impl AppHandler for UiHost {
                             lr,
                             color,
                             crate::spec::Align::Start,
-                            None,
-                            MENU_FONT,
+                            &crate::text::TextStyle::new(MENU_FONT),
                         );
                     }
                     // 尾随：子菜单箭头 › / 快捷键 / 勾选（收窄到 content_right，避免与徽章/图标重叠）。
@@ -1903,8 +1924,7 @@ impl AppHandler for UiHost {
                             tr,
                             color,
                             crate::spec::Align::End,
-                            None,
-                            MENU_FONT + 1.0,
+                            &crate::text::TextStyle::new(MENU_FONT + 1.0),
                         );
                     } else if let Some(s) = &it.shortcut {
                         canvas.draw_text(
@@ -1912,8 +1932,7 @@ impl AppHandler for UiHost {
                             tr,
                             mt.text_disabled(pal),
                             crate::spec::Align::End,
-                            None,
-                            MENU_FONT - 2.0,
+                            &crate::text::TextStyle::new(MENU_FONT - 2.0),
                         );
                     } else if it.checked {
                         canvas.draw_text(
@@ -1921,8 +1940,7 @@ impl AppHandler for UiHost {
                             tr,
                             mt.accent(pal),
                             crate::spec::Align::End,
-                            None,
-                            MENU_FONT,
+                            &crate::text::TextStyle::new(MENU_FONT),
                         );
                     }
                 }
@@ -1964,8 +1982,7 @@ impl AppHandler for UiHost {
                 Rect::new(10, 4, 126, 22),
                 Color::rgba(0, 255, 120, 255),
                 crate::spec::Align::Start,
-                None,
-                12.0,
+                &crate::text::TextStyle::new(12.0),
             );
         }
         drop(canvas);

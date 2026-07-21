@@ -269,8 +269,8 @@ impl Widget for Stepper {
             );
         }
 
-        let family = style.font_family.as_deref();
-        let fsize = style.font_size;
+        // 文字属性打包传递：字重与行高随 `Style` 自动带上，不必在每个调用点重列。
+        let ts = &crate::text::TextStyle::of(style);
         let div = Paint::fill(st.border(pal));
         canvas.draw_line(
             (bounds.x + BTN_W) as f32,
@@ -303,8 +303,8 @@ impl Widget for Stepper {
         };
         let minus_r = Rect::new(bounds.x, bounds.y, BTN_W, bounds.h);
         let plus_r = Rect::new(bounds.right() - BTN_W, bounds.y, BTN_W, bounds.h);
-        canvas.draw_text("\u{2212}", minus_r, minus_c, Align::Center, family, fsize);
-        canvas.draw_text("+", plus_r, plus_c, Align::Center, family, fsize);
+        canvas.draw_text("\u{2212}", minus_r, minus_c, Align::Center, ts);
+        canvas.draw_text("+", plus_r, plus_c, Align::Center, ts);
 
         let mid = Rect::new(
             bounds.x + BTN_W,
@@ -316,12 +316,12 @@ impl Widget for Stepper {
         if self.editing.get() {
             let edit_buf = self.edit_buf.borrow();
             // 文字本身不含光标符，避免宽度变化导致居中位移抖动。
-            canvas.draw_text(&edit_buf, mid, value_color, Align::Center, family, fsize);
+            canvas.draw_text(&edit_buf, mid, value_color, Align::Center, ts);
 
             // 用 measure_text 算光标 x，然后画竖线（与 TextInput 一致）。
-            let full_w = canvas.measure_text(&edit_buf, family, fsize).w;
+            let full_w = canvas.measure_text(&edit_buf, ts).w;
             let cursor = self.edit_cursor.get();
-            let before_w = canvas.measure_text(&edit_buf[..cursor], family, fsize).w;
+            let before_w = canvas.measure_text(&edit_buf[..cursor], ts).w;
             let text_start_x = mid.x + (mid.w - full_w) / 2;
             let cursor_x = text_start_x + before_w;
             if !self.composing.get() {
@@ -339,14 +339,7 @@ impl Widget for Stepper {
                 .set(Some((cursor_x - bounds.x, mid.y - bounds.y, mid.h)));
         } else {
             self.caret_local.set(None);
-            canvas.draw_text(
-                &self.display(),
-                mid,
-                value_color,
-                Align::Center,
-                family,
-                fsize,
-            );
+            canvas.draw_text(&self.display(), mid, value_color, Align::Center, ts);
         }
     }
 

@@ -157,3 +157,18 @@ win32 的 `run_offscreen`（渲染一帧存 PNG、不开窗，供自动化截屏
 - `cargo clippy --all-targets`
 - 截屏回归：`cargo run --example fullshowcase -- --screenshot out.png`（待阶段 1+2 完成后可用）
 ```
+
+## 7. 未验证的 CoreText 改动（技术债登记）
+
+以下改动**在 Windows 上写就，从未在 macOS 编译或运行过**。它们不是遗漏，是明知代价的选择：开发机是 Windows，`coretext.rs` 在此既编译不了也跑不起来，而 AGENTS.md §5 明令「只能真机验证的特性别声称『已验证』」。故在此如实登记，待有 Mac 环境时逐条核实。
+
+| 改动 | 位置 | 需核实什么 |
+|---|---|---|
+| `TextEngine` 签名改收 `TextStyle` | `src/text/coretext.rs` `measure` / `draw` | 能否编译通过；参数改名后无遗漏引用 |
+| 行高（`line_height`） | `attributed()` 新增 `line_h` 参数 | `CTParagraphStyleSpecifier::{MinimumLineHeight, MaximumLineHeight}` 在当前 `objc2-core-text` 版本中是否存在且同名；两者同设时行高是否真的固定 |
+| 行高对测量的影响 | `measure()` 单行分支 | 显式行高优先于 `CTLine` 字形度量这一处理是否与实际渲染一致 |
+| 段落样式设定数组 | `CTParagraphStyle::new(settings.as_ptr(), settings.len())` | 由固定 1 项改为动态 `Vec` 后，指针与长度的传递是否符合该绑定的约定 |
+
+**风险点**：行高的基线处理两平台是分头实现的——Windows 走 `SetLineSpacing(UNIFORM, line, line * 0.8)`，macOS 走 Min/MaxLineHeight。0.8 这个基线系数只在 DirectWrite 侧验证过；CoreText 侧若表现为文字贴上沿或贴下沿，需要的是补一个基线偏移设定，而不是去调 0.8。
+
+**未做**：`letter_spacing` 与斜体尚未实现（两平台皆是）。它们与行高同属文字引擎特性，日后一并补时应同时补上本表。
