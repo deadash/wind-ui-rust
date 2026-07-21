@@ -13,7 +13,8 @@
 //!   居中"的绘制约定在矩形高恰为自然行高时退化为顶对齐，字形落在正确基线。
 //! - **折叠**：Section 的展开态是 `Signal<bool>`（状态与文档分离，翻转不失效
 //!   碎片测量缓存）；折叠 = 布局器不下钻子块——不产出碎片即不测量、不绘制、
-//!   不命中。头部整行可点击，悬停手型光标。
+//!   不命中。头部整行可点击（悬停手型光标）；含 Section 时控件可 Tab 聚焦，
+//!   ↑↓ 在折叠头间移动、Enter/Space 翻转（聚焦头绘焦点框）。
 //! - **主题**：颜色用 [`RichColor`] 语义角色（paint 时按当前 palette 解析，
 //!   运行时换主题自动跟随）或固定色；控件自身 chrome（箭头/分隔线/chip 默认色/
 //!   间距）走 `RichTheme` 覆盖层。
@@ -25,7 +26,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
 use crate::core::{EventCtx, Widget};
-use crate::event::{CursorShape, Event, PointerKind};
+use crate::event::{CursorShape, Event, Key, PointerKind};
 use crate::geometry::{Color, Point, Rect, Size};
 use crate::render::{Canvas, Paint};
 use crate::signal::Signal;
@@ -774,6 +775,33 @@ fn collect_collapsed(blocks: &[RichBlock], out: &mut Vec<bool>) {
     }
 }
 
+/// 当前折叠态是否与快照一致（与 `collect_collapsed` 同序遍历，**零分配**——
+/// 缓存命中判定的快路径，避免每帧为比对而堆分配 Vec）。
+fn collapsed_matches(blocks: &[RichBlock], snap: &[bool]) -> bool {
+    fn walk(blocks: &[RichBlock], snap: &[bool], i: &mut usize) -> bool {
+        for b in blocks {
+            if let RichBlock::Section(sec) = b {
+                let c = sec.collapsed.get();
+                if snap.get(*i) != Some(&c) {
+                    return false;
+                }
+                *i += 1;
+                if !c && !walk(&sec.children, snap, i) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+    let mut i = 0;
+    walk(blocks, snap, &mut i) && i == snap.len()
+}
+
+/// 文档是否含可折叠 Section（决定控件是否参与 Tab 聚焦）。
+fn has_section(blocks: &[RichBlock]) -> bool {
+    blocks.iter().any(|b| matches!(b, RichBlock::Section(_)))
+}
+
 // ---------------------------------------------------------------------------
 // 控件
 // ---------------------------------------------------------------------------
@@ -788,6 +816,8 @@ pub struct RichText {
     hover_header: Cell<Option<usize>>,
     /// 按下时锁定的折叠头下标。
     pressed_header: Cell<Option<usize>>,
+    /// 键盘焦点指向的折叠头下标（↑↓ 移动、Enter/Space 翻转；使用时按 headers 长度钳制）。
+    focus_header: Cell<usize>,
 }
 
 impl RichText {
@@ -798,6 +828,7 @@ impl RichText {
             last_content: Cell::new(Rect::new(0, 0, 0, 0)),
             hover_header: Cell::new(None),
             pressed_header: Cell::new(None),
+            focus_header: Cell::new(0),
         }
     }
 
@@ -816,13 +847,38 @@ impl RichText {
     }
 
     /// 确保缓存布局与 (宽度, 字体, 折叠态, 主题间距) 匹配，不匹配则重排。
+    /// 命中判定走引用比较（零分配）——这是每帧 measure/paint 的常态路径；
+    /// 只有真正 miss 时才构造拥有所有权的 `LayoutKey` 并重排。
     fn ensure_layout(&self, wrap_w: Option<i32>, style: &Style, m: &mut dyn Measurer) {
         let th = crate::theme::current();
-        let key = self.layout_key(wrap_w, style, &th);
         let mut cache = self.cache.borrow_mut();
-        let hit = cache.as_ref().map(|l| l.key == key).unwrap_or(false);
+        let hit = cache.as_ref().is_some_and(|l| {
+            let k = &l.key;
+            k.wrap_w == wrap_w
+                && k.family.as_deref() == style.font_family.as_deref()
+                && k.size_bits == style.font_size.to_bits()
+                && k.weight == style.font_weight
+                && k.line_height_bits == style.line_height.map(f32::to_bits)
+                && k.spacing == (th.rich.para_spacing(), th.rich.section_indent())
+                && collapsed_matches(&self.doc.blocks, &k.collapsed)
+        });
         if !hit {
+            let key = self.layout_key(wrap_w, style, &th);
             *cache = Some(layout_doc(&self.doc, key, style, m, &th));
+        }
+    }
+
+    /// 翻转第 `idx` 个折叠头的信号（Signal 写入自动重绘；折叠态入布局键，下帧重排）。
+    fn toggle_header(&self, idx: usize) {
+        let sig = {
+            let cache = self.cache.borrow();
+            cache
+                .as_ref()
+                .and_then(|l| l.headers.get(idx))
+                .map(|(_, s)| *s)
+        };
+        if let Some(sig) = sig {
+            sig.set(!sig.get());
         }
     }
 
@@ -854,7 +910,7 @@ impl Widget for RichText {
         &self,
         _bounds: Rect,
         content: Rect,
-        _focused: bool,
+        focused: bool,
         enabled: bool,
         canvas: &mut dyn Canvas,
         style: &Style,
@@ -946,9 +1002,58 @@ impl Widget for RichText {
                 &Paint::fill(dcol),
             );
         }
+        // 键盘焦点：给当前聚焦的折叠头描 accent 细框（Tab 聚焦后 ↑↓/Enter 可视化）。
+        if focused && enabled && !lay.headers.is_empty() {
+            let idx = self.focus_header.get().min(lay.headers.len() - 1);
+            let (r, _) = &lay.headers[idx];
+            canvas.stroke_round_rect(
+                (content.x + r.x) as f32 - 2.0,
+                (content.y + r.y) as f32 - 2.0,
+                (r.w + 4) as f32,
+                (r.h + 4) as f32,
+                4.0,
+                1.0,
+                &Paint::fill(pal.accent),
+            );
+        }
     }
 
     fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
+        // 键盘：↑↓ 在折叠头间移动焦点，Enter/Space 翻转当前头（与 Accordion 约定一致）。
+        if let Event::Key(k) = ev {
+            if !k.pressed {
+                return false;
+            }
+            let n = self
+                .cache
+                .borrow()
+                .as_ref()
+                .map(|l| l.headers.len())
+                .unwrap_or(0);
+            if n == 0 {
+                return false;
+            }
+            let cur = self.focus_header.get().min(n - 1);
+            return match k.key {
+                Key::Enter | Key::Space => {
+                    self.focus_header.set(cur);
+                    self.toggle_header(cur);
+                    ctx.mark_dirty();
+                    true
+                }
+                Key::Up if cur > 0 => {
+                    self.focus_header.set(cur - 1);
+                    ctx.mark_dirty();
+                    true
+                }
+                Key::Down if cur + 1 < n => {
+                    self.focus_header.set(cur + 1);
+                    ctx.mark_dirty();
+                    true
+                }
+                _ => false,
+            };
+        }
         let Event::Pointer(p) = ev else { return false };
         match p.kind {
             PointerKind::Move | PointerKind::Enter => {
@@ -976,21 +1081,19 @@ impl Widget for RichText {
                 };
                 ctx.release_capture();
                 if self.header_at(p.pos) == Some(idx) {
-                    if let Some(sig) = {
-                        let cache = self.cache.borrow();
-                        cache
-                            .as_ref()
-                            .and_then(|l| l.headers.get(idx))
-                            .map(|(_, s)| *s)
-                    } {
-                        // Signal 写入自动触发重绘；折叠态入布局键，下一帧自然重排。
-                        sig.set(!sig.get());
-                    }
+                    // 鼠标操作同步键盘焦点位置，避免随后按 Enter 翻转到别的头。
+                    self.focus_header.set(idx);
+                    self.toggle_header(idx);
                 }
                 true
             }
             _ => false,
         }
+    }
+
+    fn focusable(&self) -> bool {
+        // 仅当文档含可折叠 Section 时参与 Tab 导航（纯静态文本不占焦点位）。
+        has_section(&self.doc.blocks)
     }
 
     fn cursor(&self) -> CursorShape {
@@ -1101,6 +1204,31 @@ mod tests {
 
         tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
         assert_eq!(node_h(&tree, root), 34, "收起后高度只剩正文 + 头");
+    }
+
+    #[test]
+    fn enter_key_toggles_focused_section() {
+        let collapsed = signal(false);
+        let doc = RichDoc::new().section("例句", collapsed, |d| d.para("第一句"));
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        tree.dispatch_key(
+            crate::event::KeyEvent {
+                key: Key::Enter,
+                pressed: true,
+                shift: false,
+                ctrl: false,
+            },
+            Some(node),
+        );
+        assert!(collapsed.get(), "Enter 应翻转聚焦的折叠头");
+    }
+
+    #[test]
+    fn focusable_only_with_sections() {
+        let plain = RichText::new(RichDoc::new().para("纯文本"));
+        assert!(!plain.focusable(), "无 Section 的富文本不应占 Tab 焦点位");
+        let with = RichText::new(RichDoc::new().section("头", signal(false), |d| d.para("体")));
+        assert!(with.focusable(), "含 Section 的富文本应可聚焦");
     }
 
     #[test]

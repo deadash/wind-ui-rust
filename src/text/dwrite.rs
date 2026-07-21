@@ -282,8 +282,9 @@ impl TextEngine for DWriteEngine {
         };
         let mut lm = [DWRITE_LINE_METRICS::default(); 1];
         let mut n = 0u32;
-        // 文本含 \n 时行数超出缓冲区、调用返回 E_NOT_SUFFICIENT_BUFFER，但首行数据
-        // 已写入——基线对齐只关心首行，故忽略该错误、仅以「确有行写回」为准。
+        // 本方法面向单行文本（富文本碎片不含 \n）。文本超一行时缓冲区不足、调用返回
+        // E_NOT_SUFFICIENT_BUFFER 且**不保证写入数据**——lm[0] 保持零初始化，由下方
+        // `height <= 0.0` 兜底回退近似值；勿删该防御判断。
         let _ = unsafe { layout.GetLineMetrics(Some(&mut lm), &mut n) };
         if n == 0 || lm[0].height <= 0.0 {
             return approx();

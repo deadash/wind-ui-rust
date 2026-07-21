@@ -1430,7 +1430,8 @@ impl Canvas for D2DCanvas<'_> {
         };
         let mut lm = [windows::Win32::Graphics::DirectWrite::DWRITE_LINE_METRICS::default(); 1];
         let mut n = 0u32;
-        // 多行文本会因缓冲区不足返回错误，但首行数据已写入；基线对齐只关心首行。
+        // 面向单行文本；超一行时缓冲区不足返回错误且不保证写入数据——lm[0] 保持
+        // 零初始化，由下方 `height <= 0.0` 兜底回退近似值，勿删该防御判断。
         let _ = unsafe { layout.GetLineMetrics(Some(&mut lm), &mut n) };
         if n == 0 || lm[0].height <= 0.0 {
             return approx();
