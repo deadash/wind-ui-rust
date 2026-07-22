@@ -898,23 +898,29 @@ impl Element {
     }
 
     /// 指定语义意图的徽章（Primary=强调蓝 / Neutral=灰 / Danger=红 / Custom=自定义基色）。
+    /// 内置三意图的颜色走主题角色延迟解析（运行期换主题自动跟随）；
+    /// `Custom` 为调用方给定的固定基色，本就不随主题。
     pub fn badge_intent(text: impl Into<String>, intent: Intent) -> Self {
-        let th = crate::theme::current();
-        let base = match intent {
-            Intent::Primary => th.palette.accent,
-            other => other.colors(&th.palette).bg,
-        };
-        Element::row()
+        use crate::style::Role;
+        let shell = Element::row()
             .cross(Align::Center)
             .padding_xy(9, 3)
-            .corner(999.0)
-            .bg(base.scale_alpha(0.15))
-            .child(
-                Element::label(text.into())
-                    .font_size(12.0)
-                    .font_weight(600)
-                    .fg(base),
-            )
+            .corner(999.0);
+        let label = Element::label(text.into()).font_size(12.0).font_weight(600);
+        match intent {
+            Intent::Primary => shell
+                .bg_role_alpha(Role::Accent, 0.15)
+                .child(label.fg_role(Role::Accent)),
+            // Neutral 前景用 text_muted（够深可读）——不能用浅灰 border 当字色，
+            // 灰字灰底几乎看不清（badge_colors 已修过的同一个坑，此处对齐）。
+            Intent::Neutral => shell
+                .bg_role_alpha(Role::TextMuted, 0.15)
+                .child(label.fg_role(Role::TextMuted)),
+            Intent::Danger => shell
+                .bg_role_alpha(Role::Danger, 0.15)
+                .child(label.fg_role(Role::Danger)),
+            Intent::Custom(c) => shell.bg(c.scale_alpha(0.15)).child(label.fg(c)),
+        }
     }
 
     /// Label/DynLabel 专属配置入口。
@@ -1753,19 +1759,19 @@ impl Element {
                 Element::label(title.into())
                     .font_size(18.0)
                     .font_weight(700)
-                    .fg(th.palette.text)
+                    .fg_role(crate::style::Role::Text)
                     .weight(1.0)
                     .height(26),
             )
             .child(
                 Element::icon_button("\u{2715}")
                     .size(28, 28)
-                    .fg(th.palette.text_muted)
+                    .fg_role(crate::style::Role::TextMuted)
                     .on_click(on_close),
             );
         let panel = Element::col()
             .width(width)
-            .bg(th.palette.surface)
+            .bg_role(crate::style::Role::Surface)
             .corner(th.metrics.corner_lg)
             .padding(20)
             .spacing(16)
@@ -1817,25 +1823,25 @@ impl Element {
     /// 可删除标签（chip）：意图色淡底 pill + 文字 + 右侧 × 删除按钮。点 × 触发 `on_remove`。
     /// 纯展示标签（不可删）用 [`Element::badge`]。多值字段见 [`Element::tag_field`]。
     pub fn chip(text: impl Into<String>, on_remove: impl FnMut(&mut EventCtx) + 'static) -> Self {
-        let th = crate::theme::current();
-        let base = th.palette.accent;
+        // 颜色走主题角色延迟解析：运行期换主题自动跟随。
+        use crate::style::Role;
         Element::row()
             .cross(Align::Center)
             .spacing(4)
             .padding_xy(9, 3)
             .corner(999.0)
-            .bg(base.scale_alpha(0.14))
+            .bg_role_alpha(Role::Accent, 0.14)
             .child(
                 Element::label(text.into())
                     .font_size(12.5)
-                    .fg(base)
+                    .fg_role(Role::Accent)
                     .height(18),
             )
             .child(
                 Element::icon_button("\u{2715}")
                     .size(16, 16)
                     .font_size(11.0)
-                    .fg(base)
+                    .fg_role(Role::Accent)
                     .on_click(on_remove),
             )
     }
@@ -1844,20 +1850,26 @@ impl Element {
     /// [`Element::chip`] 生成；为空时显示 `placeholder`。新增值由 app 驱动
     /// （维护值列表 Signal，变化后重建 chips 列表）。
     pub fn tag_field(placeholder: impl Into<String>, chips: Vec<Element>) -> Self {
-        let th = crate::theme::current();
+        // 颜色走 InputBg/InputBorder/Placeholder 角色延迟解析（换主题自动跟随）；
+        // corner 为度量，构建期取值即可（换主题不改圆角，同 accordion 先例）。
+        use crate::style::Role;
+        let corner = {
+            let th = crate::theme::current();
+            th.input.corner(&th.metrics)
+        };
         let mut row = Element::row()
             .width_match()
             .cross(Align::Center)
             .spacing(6)
             .padding_xy(8, 6)
-            .corner(th.input.corner(&th.metrics))
-            .bg(th.input.bg(&th.palette))
-            .border(th.input.border(&th.palette), 1);
+            .corner(corner)
+            .bg_role(Role::InputBg)
+            .border_role(Role::InputBorder, 1);
         if chips.is_empty() {
             row = row.child(
                 Element::label(placeholder.into())
                     .font_size(13.0)
-                    .fg(th.palette.placeholder)
+                    .fg_role(Role::Placeholder)
                     .weight(1.0)
                     .height(20),
             );
@@ -1976,7 +1988,6 @@ impl Element {
     ) -> Self {
         let cols: Vec<(String, f32)> = columns.into_iter().map(|(t, w)| (t.into(), w)).collect();
         let cb = Rc::new(RefCell::new(on_edit));
-        let fg = crate::theme::current().palette.text;
         let rows: Vec<Vec<Element>> = cells
             .into_iter()
             .enumerate()
@@ -1995,7 +2006,7 @@ impl Element {
                             .child(
                                 Element::label_rc(sig)
                                     .font_size(13.0)
-                                    .fg(fg)
+                                    .fg_role(crate::style::Role::Text)
                                     .width_match()
                                     .height(20),
                             )
@@ -2436,6 +2447,12 @@ impl Element {
         self.style.bg = Some(crate::style::Brush::Role(role));
         self
     }
+    /// 背景 = 主题角色色 × 透明度（badge/chip 的"意图色淡底"模式）。
+    /// paint 期解析，运行期换主题自动跟随。
+    pub fn bg_role_alpha(mut self, role: crate::style::Role, alpha: f32) -> Self {
+        self.style.bg = Some(crate::style::Brush::RoleAlpha(role, alpha));
+        self
+    }
     pub fn border(mut self, c: Color, w: i32) -> Self {
         self.style.border = Some((crate::style::Brush::Solid(c), w));
         self
@@ -2611,6 +2628,44 @@ mod tests {
     use crate::signal::signal;
     use std::path::PathBuf;
     use std::rc::Rc;
+
+    #[test]
+    fn badge_and_chip_colors_are_theme_roles() {
+        use crate::style::{Brush, Role};
+        // badge/chip 底色须为角色延迟解析（RoleAlpha）——运行期换主题自动跟随；
+        // 此前构建期固化颜色，热切换后徽章仍是旧主题色。
+        let b = Element::badge("v1");
+        assert!(
+            matches!(b.style.bg, Some(Brush::RoleAlpha(Role::Accent, _))),
+            "badge(Primary) 底色应为 Accent 角色淡化"
+        );
+        let d = Element::badge_intent("废弃", crate::theme::Intent::Danger);
+        assert!(
+            matches!(d.style.bg, Some(Brush::RoleAlpha(Role::Danger, _))),
+            "badge(Danger) 底色应为 Danger 角色淡化"
+        );
+        // Neutral 前景须为 text_muted（够深可读），不得用浅灰 border 当字色。
+        let n = Element::badge_intent("中性", crate::theme::Intent::Neutral);
+        assert!(
+            matches!(n.style.bg, Some(Brush::RoleAlpha(Role::TextMuted, _))),
+            "badge(Neutral) 底色应为 TextMuted 角色淡化"
+        );
+        assert_eq!(
+            n.children[0].style.fg_role,
+            Some(Role::TextMuted),
+            "badge(Neutral) 文字应为 TextMuted（灰字灰底不可读）"
+        );
+        let c = Element::chip("x", |_| {});
+        assert!(
+            matches!(c.style.bg, Some(Brush::RoleAlpha(Role::Accent, _))),
+            "chip 底色应为 Accent 角色淡化"
+        );
+        let t = Element::tag_field("占位", vec![]);
+        assert!(
+            matches!(t.style.bg, Some(Brush::Role(Role::InputBg))),
+            "tag_field 底色应为 InputBg 角色"
+        );
+    }
 
     /// 在 200×200 窗口里布局并返回 (tree, root)。
     fn layout(el: Element) -> Tree {

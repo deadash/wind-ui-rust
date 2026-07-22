@@ -314,6 +314,12 @@ pub trait AppHandler {
         false
     }
 
+    /// 取走运行期热键操作队列（`HotkeyHandle` 的改绑/启停意图）。平台在意图
+    /// 消费点（与窗口操作同点）调用并对 `HotkeyState` 落地。默认无操作。
+    fn take_hotkey_ops(&mut self) -> Vec<(usize, crate::event::HotkeyOp)> {
+        Vec::new()
+    }
+
     /// 注册的定时器间隔（平台据此 SetTimer/NSTimer）。无则空。
     fn intervals(&self) -> Vec<std::time::Duration> {
         Vec::new()

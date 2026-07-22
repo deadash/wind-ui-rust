@@ -80,6 +80,16 @@ impl Hotkey {
     }
 }
 
+/// 运行期热键操作意图（[`crate::app::HotkeyHandle`] 排队、平台层消费执行）。
+/// 与 `WindowOp` 同属"核心声明意图、平台落地"的管线——核心层不碰平台句柄。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyOp {
+    /// 改绑到新组合（旧组合注销；新组合注册失败时回滚保留旧绑定）。
+    Rebind(Hotkey),
+    /// 启用/停用（停用即向系统注销，把组合归还给其他程序；再启用重新注册）。
+    SetEnabled(bool),
+}
+
 /// 全局热键回调的上下文。
 ///
 /// **刻意只能声明意图，拿不到窗口句柄。** 回调在平台层持有窗口状态借用期间执行，

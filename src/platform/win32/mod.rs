@@ -776,6 +776,9 @@ unsafe extern "system" fn wnd_proc(
             if let Some(state) = state_from(hwnd) {
                 state.paint(hwnd);
             }
+            // 帧路径也消费热键操作：pump/interval/信号驱动的改绑（非事件路径）
+            // 经 request_repaint 唤帧后在此落地，不必等下一次用户事件。
+            apply_hotkey_ops(hwnd);
             LRESULT(0)
         }
         WM_GETMINMAXINFO => {
@@ -1180,6 +1183,27 @@ unsafe fn handle_nchittest(hwnd: HWND, lparam: LPARAM) -> LRESULT {
 unsafe fn apply_window_op(hwnd: HWND) {
     let op = state_from(hwnd).and_then(|s| s.handler.take_window_op());
     run_window_op(hwnd, op);
+    // 运行期热键操作与窗口操作同点消费（HotkeyHandle 排队 → 此处落地）。
+    // Register/UnregisterHotKey 不向本窗口同步派发消息，可在借用内直接执行。
+    apply_hotkey_ops(hwnd);
+}
+
+/// 消费运行期热键操作队列（改绑/启停），落地到 `HotkeyState`。
+/// 先经 handler 取队列（借 handler 字段），再对 hotkeys 字段执行——同一
+/// `WindowState` 的两个字段序贯借用，无别名。
+unsafe fn apply_hotkey_ops(hwnd: HWND) {
+    let Some(state) = state_from(hwnd) else {
+        return;
+    };
+    let ops = state.handler.take_hotkey_ops();
+    if ops.is_empty() {
+        return;
+    }
+    if let Some(hk) = state.hotkeys.as_mut() {
+        for (id, op) in ops {
+            hk.apply(id, op);
+        }
+    }
 }
 
 /// 执行一个窗口操作。**调用方须已释放 `WindowState` 借用**——此处的 OS 调用会同步

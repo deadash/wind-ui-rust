@@ -40,4 +40,7 @@ impl HotkeyState {
         );
         Self
     }
+
+    /// 运行期热键操作（改绑/启停）。macOS 未实现——注册本就未生效，静默忽略。
+    pub(crate) fn apply(&mut self, _id: usize, _op: crate::event::HotkeyOp) {}
 }

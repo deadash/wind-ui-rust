@@ -268,9 +268,55 @@ impl ThemeHandle {
         *self.inner.borrow_mut() = Rc::new(t);
         crate::anim::request_repaint();
     }
+    /// 就地修改当前主题（快照 → 改 → 写回 → 请求重绘）。运行期局部调整的便捷入口：
+    ///
+    /// ```ignore
+    /// th.update(|t| t.palette.accent = Color::hex(0x2E9E5B));   // 换强调色
+    /// th.update(|t| t.metrics.font_size += 1.0);                // 全局调大字号
+    /// ```
+    pub fn update(&self, f: impl FnOnce(&mut Theme)) {
+        let mut t: Theme = (**self.inner.borrow()).clone();
+        f(&mut t);
+        self.set(t);
+    }
     /// 当前主题快照。
     pub fn current(&self) -> Rc<Theme> {
         self.inner.borrow().clone()
+    }
+}
+
+/// 运行期热键句柄（`App::hotkey_rc` 返回）。克隆进控件回调，随时改绑/启停：
+///
+/// ```ignore
+/// let hk = app.hotkey_rc(Hotkey::new(Key::Char('D')).ctrl().alt(), |ctx| ctx.show_window());
+/// // 设置页回调里：
+/// hk.rebind(Hotkey::new(Key::Char('J')).ctrl());   // 立即向系统换注册
+/// hk.set_enabled(false);                            // 注销，把组合归还系统
+/// ```
+///
+/// 操作经意图队列在平台层落地（下一次消息循环内生效）：改绑失败（新组合被其他
+/// 程序占用）时**回滚保留旧绑定**，与注册失败不阻启动的既定语义一致。
+#[derive(Clone)]
+pub struct HotkeyHandle {
+    id: usize,
+    queue: Rc<RefCell<Vec<(usize, crate::event::HotkeyOp)>>>,
+}
+
+impl HotkeyHandle {
+    /// 改绑到新组合（下一次消息循环生效；失败回滚保留旧绑定）。
+    pub fn rebind(&self, hotkey: crate::event::Hotkey) {
+        self.queue
+            .borrow_mut()
+            .push((self.id, crate::event::HotkeyOp::Rebind(hotkey)));
+        // 唤一帧，让平台意图消费点尽快跑到。
+        crate::anim::request_repaint();
+    }
+    /// 启用/停用（停用即注销，组合归还给其他程序）。
+    pub fn set_enabled(&self, on: bool) {
+        self.queue
+            .borrow_mut()
+            .push((self.id, crate::event::HotkeyOp::SetEnabled(on)));
+        crate::anim::request_repaint();
     }
 }
 
@@ -288,6 +334,11 @@ pub struct App {
     /// 关闭请求转为隐藏窗口。与 `close_handler` 同属核心层的关闭决策链输入，
     /// 平台层对此无感知，故不放 `WindowConfig`。
     hide_on_close: bool,
+    /// 用户是否经 `App::bg` 显式指定了窗口背景（是 → 固定色；否 → 清屏色随主题
+    /// palette.bg 热切换，修"切暗色主题后清屏仍是亮色底"）。
+    bg_explicit: bool,
+    /// 运行期热键操作队列（`hotkey_rc` 句柄写入、UiHost 中转、平台消费）。
+    hotkey_ops: Rc<RefCell<Vec<(usize, crate::event::HotkeyOp)>>>,
 }
 
 impl App {
@@ -324,12 +375,16 @@ impl App {
             single: None,
             close_handler: None,
             hide_on_close: false,
+            bg_explicit: false,
+            hotkey_ops: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
     /// 窗口背景色。命名与 `Element::bg` 统一。
     pub fn bg(mut self, c: Color) -> Self {
         self.cfg.bg = c;
+        // 显式指定即固定：清屏色不再随主题热切换。
+        self.bg_explicit = true;
         self
     }
 
@@ -368,7 +423,10 @@ impl App {
 
     /// 设置主题（默认使用内置默认主题）。窗口背景未显式设置时随主题 palette.bg。
     pub fn theme(mut self, t: Theme) -> Self {
-        self.cfg.bg = t.palette.bg;
+        // 尊重 App::bg 的显式指定：`.bg(c).theme(t)` 与 `.theme(t).bg(c)` 结果一致。
+        if !self.bg_explicit {
+            self.cfg.bg = t.palette.bg;
+        }
         // 已有运行期句柄时同步初值，保证 theme()/theme_handle() 任意调用序结果一致。
         if let Some(h) = &self.theme_src {
             *h.inner.borrow_mut() = Rc::new(t.clone());
@@ -487,6 +545,32 @@ impl App {
         self
     }
 
+    /// 注册全局热键并返回**运行期句柄**（改绑/启停即时生效，无需重启）。
+    /// 语义同 [`Self::hotkey`]（注册失败静默、回调只声明意图）；句柄克隆进
+    /// 控件回调，设置页"修改热键"场景用它：
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// # let mut app = App::new("demo", 320, 200);
+    /// let hk = app.hotkey_rc(Hotkey::new(Key::Char('D')).ctrl().alt(), |ctx| ctx.show_window());
+    /// // 之后某个按钮回调里：hk.rebind(Hotkey::new(Key::Char('J')).ctrl());
+    /// ```
+    pub fn hotkey_rc(
+        &mut self,
+        hotkey: crate::event::Hotkey,
+        callback: impl FnMut(&mut crate::event::HotkeyCtx) + 'static,
+    ) -> HotkeyHandle {
+        let id = self.cfg.hotkeys.len();
+        self.cfg.hotkeys.push(platform::HotkeyBinding {
+            hotkey,
+            callback: Box::new(callback),
+        });
+        HotkeyHandle {
+            id,
+            queue: self.hotkey_ops.clone(),
+        }
+    }
+
     /// 启动即隐藏：窗口创建后不显示，等托盘点击或全局热键唤起。
     ///
     /// 常驻托盘类应用用此项避免启动时闪一下窗口。
@@ -578,6 +662,8 @@ impl App {
                 root,
                 theme_src,
                 cfg.bg,
+                !self.bg_explicit,
+                self.hotkey_ops.clone(),
                 self.pumps,
                 self.intervals,
                 self.close_handler,
@@ -601,6 +687,8 @@ impl App {
             self.content.unwrap(),
             theme_src,
             self.cfg.bg,
+            !self.bg_explicit,
+            self.hotkey_ops.clone(),
             self.pumps,
             self.intervals,
             self.close_handler,
@@ -746,6 +834,10 @@ struct UiHost {
     toast_rects: Vec<(Rect, Rect)>,
     /// 窗口背景色（与平台 fill 同色）：局部重绘的子缓冲按此填底，重建脏区与全窗一致。
     bg: Color,
+    /// 清屏色是否随主题 palette.bg 热切换（未经 `App::bg` 显式固定时为 true）。
+    bg_follows_theme: bool,
+    /// 运行期热键操作队列（HotkeyHandle 写入；平台经 `take_hotkey_ops` 消费）。
+    hotkey_ops: Rc<RefCell<Vec<(usize, crate::event::HotkeyOp)>>>,
     /// 持久后备缓冲（物理像素，整窗）：保留上一全窗帧，供局部帧重建未变区域。
     back: Option<Pixmap>,
     /// 上一帧累积的动画脏区（逻辑坐标）：下一动画帧据此局部重绘；None=下一帧需全窗。
@@ -833,6 +925,8 @@ impl UiHost {
         root: Element,
         theme_src: ThemeHandle,
         bg: Color,
+        bg_follows_theme: bool,
+        hotkey_ops: Rc<RefCell<Vec<(usize, crate::event::HotkeyOp)>>>,
         pumps: Vec<Box<dyn FnMut()>>,
         intervals: Vec<(std::time::Duration, Box<dyn FnMut()>)>,
         close_handler: Option<Box<dyn FnMut() -> bool>>,
@@ -870,6 +964,8 @@ impl UiHost {
             toasts: Vec::new(),
             toast_rects: Vec::new(),
             bg,
+            bg_follows_theme,
+            hotkey_ops,
             back: None,
             pending_damage: None,
             event_damage: None,
@@ -1489,6 +1585,10 @@ impl AppHandler for UiHost {
         // 从运行期句柄刷新主题快照（热切换下一帧生效），注入线程局部供控件读取。
         self.theme = self.theme_src.current();
         crate::theme::set_current(self.theme.clone());
+        // 清屏色随主题（未经 App::bg 显式固定时）：暗色主题下窗口底色同步转暗。
+        if self.bg_follows_theme {
+            self.bg = self.theme.palette.bg;
+        }
         // 动画：清上一帧请求/脏区并刷新帧时钟，绘制中控件可重新请求。
         crate::anim::reset_request();
         let now_ms = self.sync_clock();
@@ -2165,6 +2265,10 @@ impl AppHandler for UiHost {
 
     fn wants_close(&self) -> bool {
         self.close
+    }
+
+    fn take_hotkey_ops(&mut self) -> Vec<(usize, crate::event::HotkeyOp)> {
+        std::mem::take(&mut *self.hotkey_ops.borrow_mut())
     }
 
     fn on_close_request(&mut self) -> bool {
@@ -2879,6 +2983,77 @@ mod tests {
             lum(handler.theme.palette.bg) < 300,
             "热切换后 host 应共享句柄的暗色主题"
         );
+        // 清屏色（局部重绘子缓冲的填底色）也应随主题转暗——
+        // 否则暗色主题下局部重绘区域会闪出亮色底。
+        assert!(
+            lum(handler.bg) < 300,
+            "未经 App::bg 显式固定时，清屏色应随主题热切换"
+        );
+    }
+
+    #[test]
+    fn explicit_bg_stays_fixed_across_theme_switch() {
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        let fixed = Color::hex(0x102030);
+        let mut app = App::new("t", 60, 60).bg(fixed);
+        let handle = app.theme_handle();
+        app = app.content(Element::col());
+        let mut handler = app.into_handler_for_test();
+        handler.set_scale(1.0);
+        let mut pm = Pixmap::new(60, 60).unwrap();
+        handle.set(crate::theme::Theme::dark());
+        handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(60, 60));
+        assert_eq!(handler.bg, fixed, "App::bg 显式指定的清屏色不随主题变化");
+    }
+
+    #[test]
+    fn explicit_bg_survives_later_theme_call() {
+        // `.bg(c).theme(t)` 与 `.theme(t).bg(c)` 必须同义：显式底色不被 theme() 覆盖。
+        let fixed = Color::hex(0x102030);
+        let a = App::new("t", 60, 60)
+            .bg(fixed)
+            .theme(crate::theme::Theme::dark());
+        assert_eq!(a.cfg.bg, fixed, "后调 theme() 不应覆盖显式 bg");
+        let b = App::new("t", 60, 60)
+            .theme(crate::theme::Theme::dark())
+            .bg(fixed);
+        assert_eq!(b.cfg.bg, fixed);
+    }
+
+    #[test]
+    fn theme_update_mutates_in_place() {
+        let mut app = App::new("t", 60, 60);
+        let handle = app.theme_handle();
+        handle.update(|t| t.palette.accent = Color::hex(0x123456));
+        assert_eq!(
+            handle.current().palette.accent,
+            Color::hex(0x123456),
+            "update 应就地修改当前主题"
+        );
+    }
+
+    #[test]
+    fn hotkey_handle_queues_and_host_drains_ops() {
+        use crate::event::{Hotkey, HotkeyOp};
+        use crate::platform::AppHandler;
+        let mut app = App::new("t", 60, 60);
+        let hk = app.hotkey_rc(Hotkey::new(Key::Char('D')).ctrl().alt(), |_| {});
+        let hk2 = hk.clone();
+        hk.rebind(Hotkey::new(Key::Char('J')).ctrl());
+        hk2.set_enabled(false);
+        let mut handler = app.content(Element::col()).into_handler_for_test();
+        let ops = handler.take_hotkey_ops();
+        assert_eq!(
+            ops,
+            vec![
+                (0, HotkeyOp::Rebind(Hotkey::new(Key::Char('J')).ctrl())),
+                (0, HotkeyOp::SetEnabled(false)),
+            ],
+            "句柄操作应按序入列且携带正确的槽位 id"
+        );
+        assert!(handler.take_hotkey_ops().is_empty(), "取走后队列应清空");
     }
 
     #[test]

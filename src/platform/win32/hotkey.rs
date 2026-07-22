@@ -20,19 +20,35 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
 };
 
-use crate::event::{Hotkey, HotkeyCtx, Key, WindowOp};
+use crate::event::{Hotkey, HotkeyCtx, HotkeyOp, Key, WindowOp};
 use crate::platform::HotkeyBinding;
 
-/// 热键回调。`None` 表示该槽注册失败。
-type Slot = Option<Box<dyn FnMut(&mut HotkeyCtx)>>;
+/// 一个热键槽：组合、回调与向系统的注册状态。回调**始终保留**（即使当前组合
+/// 注册失败）——运行期 `Rebind` 换到可用组合后即恢复生效。
+struct Slot {
+    hotkey: Hotkey,
+    callback: Box<dyn FnMut(&mut HotkeyCtx)>,
+    /// 当前是否已在系统注册成功（失败/停用为 false，WM_HOTKEY 不会来）。
+    registered: bool,
+    /// 用户启用态（`SetEnabled` 控制；停用即注销、组合归还系统）。
+    enabled: bool,
+}
 
 /// 已注册的热键集合。窗口销毁时 `drop` 自动注销。
 pub(crate) struct HotkeyState {
     hwnd: HWND,
     /// 索引即 `RegisterHotKey` 的 id，亦即 `WM_HOTKEY` 的 wParam。
-    /// 注册失败的槽位置 `None`，以保持 id 与索引对齐——用紧凑数组会让 id 错位，
-    /// 令 WM_HOTKEY 触发到错误的回调。
+    /// 槽位固定不压缩——紧凑数组会让 id 错位，令 WM_HOTKEY 触发到错误的回调。
     bindings: Vec<Slot>,
+}
+
+/// 尝试向系统注册（含 MOD_NOREPEAT：按住不放只触发一次，缺了它长按会以
+/// 键盘重复率刷屏般触发回调）。无法映射虚拟键或系统拒绝 → false。
+fn try_register(hwnd: HWND, id: usize, hk: Hotkey) -> bool {
+    vk_of(hk.key).is_some_and(|vk| {
+        let mods = mods_of(hk) | MOD_NOREPEAT;
+        unsafe { RegisterHotKey(Some(hwnd), id as i32, mods, vk) }.is_ok()
+    })
 }
 
 impl HotkeyState {
@@ -40,26 +56,64 @@ impl HotkeyState {
     ///
     /// 单个热键注册失败**不影响其余热键**，也不阻止窗口创建：热键是全局独占资源，
     /// 组合被别的程序占用是常态而非异常，让整个应用起不来是不可接受的。失败者静默
-    /// 忽略——当前没有向应用回报失败的 API，需要时再加。
+    /// 忽略；运行期可经 [`HotkeyOp::Rebind`] 换组合恢复。
     pub(crate) fn register(hwnd: HWND, bindings: Vec<HotkeyBinding>) -> Self {
-        let mut slots = Vec::with_capacity(bindings.len());
+        let bindings = bindings
+            .into_iter()
+            .enumerate()
+            .map(|(id, b)| Slot {
+                registered: try_register(hwnd, id, b.hotkey),
+                hotkey: b.hotkey,
+                callback: b.callback,
+                enabled: true,
+            })
+            .collect();
+        Self { hwnd, bindings }
+    }
 
-        for (id, b) in bindings.into_iter().enumerate() {
-            // 无法映射为虚拟键（非 ASCII 字符、越界 VK 等）→ 置空槽。
-            let registered = vk_of(b.hotkey.key).is_some_and(|vk| {
-                // MOD_NOREPEAT：按住不放时只触发一次。缺了它，长按热键会以键盘重复率
-                // 刷屏般触发回调。
-                let mods = mods_of(b.hotkey) | MOD_NOREPEAT;
-                unsafe { RegisterHotKey(Some(hwnd), id as i32, mods, vk) }.is_ok()
-            });
-            // 失败槽置 None 而非跳过：id 即索引，紧凑数组会让后续 id 错位，
-            // 令 WM_HOTKEY 触发到错误的回调。
-            slots.push(registered.then_some(b.callback));
-        }
-
-        Self {
-            hwnd,
-            bindings: slots,
+    /// 运行期热键操作（`HotkeyHandle` 排队、消息循环消费）。
+    ///
+    /// `Rebind`：先注销旧组合再注册新组合；新组合注册失败（被占用等）时**回滚**
+    /// 重注册旧组合——绝不让一次失败的改绑把原本可用的热键弄丢。
+    /// `RegisterHotKey`/`UnregisterHotKey` 不向本窗口同步派发消息，可在
+    /// `WindowState` 借用内安全调用（与回调执行的借用纪律无冲突）。
+    pub(crate) fn apply(&mut self, id: usize, op: HotkeyOp) {
+        let hwnd = self.hwnd;
+        let Some(slot) = self.bindings.get_mut(id) else {
+            return;
+        };
+        match op {
+            HotkeyOp::Rebind(new) => {
+                if slot.registered {
+                    unsafe {
+                        let _ = UnregisterHotKey(Some(hwnd), id as i32);
+                    }
+                    slot.registered = false;
+                }
+                if slot.enabled && try_register(hwnd, id, new) {
+                    slot.hotkey = new;
+                    slot.registered = true;
+                } else if slot.enabled {
+                    // 回滚：新组合拿不到，旧组合续命。
+                    slot.registered = try_register(hwnd, id, slot.hotkey);
+                    #[cfg(debug_assertions)]
+                    eprintln!("[windui] 热键改绑失败（组合被占用？），保留旧绑定");
+                } else {
+                    // 停用中只记新组合，待 SetEnabled(true) 时注册。
+                    slot.hotkey = new;
+                }
+            }
+            HotkeyOp::SetEnabled(on) => {
+                slot.enabled = on;
+                if !on && slot.registered {
+                    unsafe {
+                        let _ = UnregisterHotKey(Some(hwnd), id as i32);
+                    }
+                    slot.registered = false;
+                } else if on && !slot.registered {
+                    slot.registered = try_register(hwnd, id, slot.hotkey);
+                }
+            }
         }
     }
 
@@ -69,9 +123,9 @@ impl HotkeyState {
     /// 见本模块头部的借用纪律。
     #[must_use]
     pub(crate) fn dispatch(&mut self, id: usize) -> Option<WindowOp> {
-        let cb = self.bindings.get_mut(id)?.as_mut()?;
+        let slot = self.bindings.get_mut(id)?;
         let mut ctx = HotkeyCtx::default();
-        cb(&mut ctx);
+        (slot.callback)(&mut ctx);
         ctx.take_op()
     }
 }
@@ -80,7 +134,7 @@ impl Drop for HotkeyState {
     fn drop(&mut self) {
         for (id, slot) in self.bindings.iter().enumerate() {
             // 只注销注册成功的：对未注册的 id 调 UnregisterHotKey 会失败（无害但无意义）。
-            if slot.is_some() {
+            if slot.registered {
                 unsafe {
                     let _ = UnregisterHotKey(Some(self.hwnd), id as i32);
                 }

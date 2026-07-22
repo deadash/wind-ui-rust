@@ -28,6 +28,10 @@ pub enum Role {
     AccordionBorder,
     /// 手风琴面板头背景。
     AccordionHeaderBg,
+    /// 输入框类底色（含 InputTheme 覆盖层回退；tag_field 等仿输入框容器用）。
+    InputBg,
+    /// 输入框类边框（含 InputTheme 覆盖层回退）。
+    InputBorder,
 }
 
 impl Role {
@@ -52,6 +56,8 @@ impl Role {
             Role::Danger => p.danger,
             Role::AccordionBorder => t.accordion.border(p),
             Role::AccordionHeaderBg => t.accordion.header_bg(p),
+            Role::InputBg => t.input.bg(p),
+            Role::InputBorder => t.input.border(p),
         }
     }
 }
@@ -62,6 +68,9 @@ pub enum Brush {
     Solid(Color),
     Gradient(Gradient),
     Role(Role),
+    /// 角色色 × 透明度调制（badge/chip 的"意图色 15% 淡底"模式）：
+    /// paint 期解析，运行期换主题自动跟随——比为每个角色加 XxxSoft 变体正交。
+    RoleAlpha(Role, f32),
 }
 
 impl Brush {
@@ -71,6 +80,7 @@ impl Brush {
             Brush::Solid(c) => Paint::fill(*c),
             Brush::Gradient(g) => Paint::gradient(g.clone()),
             Brush::Role(r) => Paint::fill(r.resolve(t)),
+            Brush::RoleAlpha(r, a) => Paint::fill(r.resolve(t).scale_alpha(*a)),
         }
     }
     /// 解析出的纯色用色（Gradient 取首个 stop，用于边框 stroke）。
