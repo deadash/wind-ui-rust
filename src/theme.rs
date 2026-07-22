@@ -529,6 +529,39 @@ pub struct RichTheme {
     pub section_indent: Option<i32>,
 }
 
+/// WCAG 相对亮度（sRGB → 线性化加权）。
+fn rel_luminance(c: Color) -> f32 {
+    fn lin(u: u8) -> f32 {
+        let s = u as f32 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+/// WCAG 对比度（1..21）。
+pub(crate) fn contrast_ratio(a: Color, b: Color) -> f32 {
+    let (la, lb) = (rel_luminance(a), rel_luminance(b));
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+/// 半透明前景 `over` 合成到不透明底色上（求淡底 chip 的实际视觉底色）。
+fn composite_over(fg: Color, bg: Color) -> Color {
+    let a = fg.a as f32 / 255.0;
+    let ch = |f: u8, b: u8| (f as f32 * a + b as f32 * (1.0 - a)).round() as u8;
+    Color::rgba(ch(fg.r, bg.r), ch(fg.g, bg.g), ch(fg.b, bg.b), 0xFF)
+}
+
+/// 通道线性插值（t∈0..=1，从 a 到 b）。
+fn mix(a: Color, b: Color, t: f32) -> Color {
+    let ch = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color::rgba(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), 0xFF)
+}
+
 impl RichTheme {
     pub fn chevron(&self, p: &Palette) -> Color {
         self.chevron.unwrap_or(p.text_muted)
@@ -540,8 +573,22 @@ impl RichTheme {
         // 与 badge 同族：强调色 15% 淡底。
         self.chip_bg.unwrap_or(p.accent.scale_alpha(0.15))
     }
+    /// chip 默认前景：从 accent 向正文色插值，直到对**实际视觉底色**（淡底合成到
+    /// surface 上）达到 WCAG AA（4.5:1）。「同色淡底 + 同色前景」的直觉搭配实测只有
+    /// 约 3:1（淡底把背景亮度拉向中间，恰好吃掉前景的对比余量），必须派生修正。
+    /// 只要主题满足「正文色对 surface 可读」这一基本前提，插值就必然收敛达标。
     pub fn chip_fg(&self, p: &Palette) -> Color {
-        self.chip_fg.unwrap_or(p.accent)
+        if let Some(c) = self.chip_fg {
+            return c;
+        }
+        let bg = composite_over(self.chip_bg(p), p.surface);
+        for i in 0..=8 {
+            let c = mix(p.accent, p.text, i as f32 / 8.0);
+            if contrast_ratio(c, bg) >= 4.5 {
+                return c;
+            }
+        }
+        p.text
     }
     pub fn para_spacing(&self) -> i32 {
         self.para_spacing.unwrap_or(6)
@@ -846,6 +893,19 @@ pub fn set_current(theme: Rc<Theme>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chip_default_fg_meets_wcag_aa() {
+        // 下游实测教训：`(色.15%淡底, 同色前景)` 只有约 3:1。锁住亮/暗两套默认
+        // palette 的 chip 组合达到 WCAG AA（4.5:1），防止未来调色回归。
+        for (name, th) in [("light", Theme::default()), ("dark", Theme::dark())] {
+            let p = &th.palette;
+            let bg = composite_over(th.rich.chip_bg(p), p.surface);
+            let fg = th.rich.chip_fg(p);
+            let ratio = contrast_ratio(fg, bg);
+            assert!(ratio >= 4.5, "{name} 主题 chip 对比度 {ratio:.2} < 4.5");
+        }
+    }
 
     #[test]
     fn dark_theme_has_dark_bg_and_light_text() {

@@ -817,6 +817,7 @@ pub struct Element {
     on_drop: Option<DropFn>,
     context_menu: Option<crate::core::MenuFn>,
     window_drag: bool,
+    focusable: Option<bool>,
     enabled: Option<Signal<bool>>,
     en_cond: Option<Box<dyn Fn() -> bool>>,
     tooltip: Option<String>,
@@ -847,6 +848,7 @@ impl Element {
             on_drop: None,
             context_menu: None,
             window_drag: false,
+            focusable: None,
             enabled: None,
             en_cond: None,
             tooltip: None,
@@ -1035,6 +1037,15 @@ impl Element {
         self
     }
 
+    /// Tab 焦点环参与度覆盖（节点级，适用于任意控件）：`false` 强制退出焦点环、
+    /// `true` 强制加入。典型场景：词典正文含可折叠区默认可聚焦，但应用希望焦点
+    /// 常驻搜索框——`.focusable(false)` 退出。**仅影响 Tab 遍历**，不改变命中
+    /// 测试、鼠标交互与 `request_focus`。
+    pub fn focusable(mut self, on: bool) -> Self {
+        self.focusable = Some(on);
+        self
+    }
+
     /// 标记为窗口拖动区（自定义标题栏）：无边框窗口中在此区域按下可拖动窗口。
     /// 命中沿父链生效——标记标题栏容器即其内非交互空白处都可拖；落在子按钮/输入等
     /// 可聚焦控件上不拖（交控件处理）。仅在 `App::frameless()` 窗口有意义。
@@ -1098,6 +1109,35 @@ impl Element {
     /// ```
     pub fn rich(doc: RichDoc) -> Self {
         Self::base(Layout::None).widget(rich::RichText::new(doc))
+    }
+
+    /// RichText 专属配置入口（误用检测同 text_input/link）。
+    fn config_rich(mut self, f: impl FnOnce(&mut rich::RichText)) -> Self {
+        match self
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<rich::RichText>())
+        {
+            Some(r) => f(r),
+            None => debug_assert!(
+                false,
+                "on_span_click()/copy_menu() 只能用于 Element::rich(..)"
+            ),
+        }
+        self
+    }
+
+    /// 富文本 span 点击回调：文档中经 [`rich::Para::span_id`]/`styled_id` 标注 id 的
+    /// 文字被点击时触发，携带该 id（词典交叉引用跳转）。未标 id 的文字不响应、
+    /// 不显示手型。回调挂控件层，`RichDoc` 保持纯数据可 Clone。
+    pub fn on_span_click(self, f: impl FnMut(&str, &mut EventCtx) + 'static) -> Self {
+        self.config_rich(move |r| r.set_on_span_click(Box::new(f)))
+    }
+
+    /// 富文本内建右键「复制全部」菜单开关（默认开）。应用要挂自定义
+    /// `on_context_menu` 时先关掉它，避免内建菜单抢占右键。
+    pub fn copy_menu(self, on: bool) -> Self {
+        self.config_rich(move |r| r.set_copy_menu(on))
     }
 
     // ---- 图片 ----
@@ -2527,6 +2567,7 @@ impl Element {
             on_drop: self.on_drop,
             context_menu: self.context_menu,
             window_drag: self.window_drag,
+            focusable: self.focusable,
             tooltip: self.tooltip,
             focused: false,
             clip_children: self.clip_children,

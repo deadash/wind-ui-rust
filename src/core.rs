@@ -198,6 +198,10 @@ pub struct Node {
     /// 是否为窗口拖动区（自定义标题栏）：无边框窗口中在此区域按下可拖动窗口。
     /// 命中沿父链继承（标记容器即其内非交互区均可拖），但落在子交互控件上不拖动。
     pub window_drag: bool,
+    /// Tab 焦点环参与度覆盖：`None` 按 `Widget::focusable()`；`Some(false)` 强制
+    /// 退出焦点环（如词典正文——主焦点应常驻输入框）；`Some(true)` 强制加入。
+    /// **仅影响 Tab 遍历**：不改变命中测试、点击交互与 `request_focus` 语义。
+    pub focusable: Option<bool>,
     /// 悬停提示文本（None=无）。宿主在悬停延时后于指针附近绘制浮层；
     /// 像 `enabled`/`window_drag` 一样挂在节点上，适用于任意控件/容器。
     pub tooltip: Option<String>,
@@ -1605,7 +1609,8 @@ impl Tree {
                 // 禁用子树整体退出 Tab 导航（own_enabled 在递归中实现父链继承）。
                 return;
             }
-            if n.widget.focusable() {
+            // 节点级覆盖优先（.focusable(false) 退出焦点环），否则问控件本性。
+            if n.focusable.unwrap_or_else(|| n.widget.focusable()) {
                 out.push(id);
             }
             for &c in &n.children {

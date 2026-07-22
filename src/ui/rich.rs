@@ -17,16 +17,25 @@
 //!   ↑↓ 在折叠头间移动、Enter/Space 翻转（聚焦头绘焦点框）。
 //! - **主题**：颜色用 [`RichColor`] 语义角色（paint 时按当前 palette 解析，
 //!   运行时换主题自动跟随）或固定色；控件自身 chrome（箭头/分隔线/chip 默认色/
-//!   间距）走 `RichTheme` 覆盖层。
+//!   间距）走 `RichTheme` 覆盖层。chip 默认前景按 WCAG AA 对比度自适应派生。
+//! - **span 点击**：[`Para::span_id`]/`styled_id` 标注 id，回调经
+//!   [`super::Element::on_span_click`] 挂控件层（文档保持纯数据）；悬停手型 +
+//!   前景提亮。词典交叉引用即此。
+//! - **中文排版**：CJK 避头尾（闭合标点不落行首、开括不孤悬行尾）、悬挂缩进
+//!   [`Para::hanging`]（编号义项续行对齐释义首字）、段距按段覆盖
+//!   [`Para::spacing_before`]。
+//! - **复制**：内建右键「复制全部」菜单 + Ctrl+C（[`RichDoc::plain_text`]，含
+//!   chip 与折叠区文字）；`Element::copy_menu(false)` 可关闭。
 //!
-//! 已知限制（后续分期）：span 级点击/悬停（词典交叉引用）、行数截断 clamp、
-//! 划选复制、展开高度动画、CJK 避头尾。
+//! 已知限制（后续分期）：行数截断 clamp、划选复制（字符级选区；Frag 已预埋
+//! line/block 源锚点）、展开高度动画。
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::core::{EventCtx, Widget};
-use crate::event::{CursorShape, Event, Key, PointerKind};
+use crate::event::{CursorShape, Event, Key, KeyEvent, MenuItem, MouseButton, PointerKind};
 use crate::geometry::{Color, Point, Rect, Size};
 use crate::render::{Canvas, Paint};
 use crate::signal::Signal;
@@ -158,6 +167,10 @@ struct RichSpan {
     named: Option<String>,
     /// 内联样式（覆盖命名样式的对应字段）。
     style: SpanStyle,
+    /// 交互标识：设置后该 span 可点击（词典交叉引用），点击经
+    /// [`super::Element::on_span_click`] 回调携带此 id。文档保持纯数据——
+    /// 回调挂控件层而非 span 上，`RichDoc` 因此仍可 Clone/比较/缓存。
+    id: Option<Rc<str>>,
 }
 
 /// 段落：span 序列 + 段级排版参数。
@@ -166,6 +179,10 @@ pub struct Para {
     spans: Vec<RichSpan>,
     /// 段首行缩进（逻辑 px，相对当前块缩进基线）。
     indent: i32,
+    /// 续行缩进（悬挂缩进；None = 与 `indent` 相同即整段缩进）。
+    hanging: Option<i32>,
+    /// 段前间距覆盖（None = 用 `RichTheme::para_spacing` 全局值）。
+    spacing_before: Option<i32>,
 }
 
 impl Para {
@@ -178,6 +195,7 @@ impl Para {
             text: s.into(),
             named: None,
             style: SpanStyle::default(),
+            id: None,
         });
         self
     }
@@ -187,6 +205,7 @@ impl Para {
             text: s.into(),
             named: Some(name.into()),
             style: SpanStyle::default(),
+            id: None,
         });
         self
     }
@@ -196,6 +215,7 @@ impl Para {
             text: s.into(),
             named: None,
             style,
+            id: None,
         });
         self
     }
@@ -210,12 +230,55 @@ impl Para {
             text: s.into(),
             named: Some(name.into()),
             style,
+            id: None,
+        });
+        self
+    }
+    /// 可点击文字（内联样式）：`id` 经 [`super::Element::on_span_click`] 回调传出。
+    /// 词典交叉引用（"参见 X""近义词 Y"）即此。悬停显示手型 + 前景提亮。
+    pub fn span_id(
+        mut self,
+        id: impl Into<String>,
+        s: impl Into<String>,
+        style: SpanStyle,
+    ) -> Self {
+        self.spans.push(RichSpan {
+            text: s.into(),
+            named: None,
+            style,
+            id: Some(Rc::from(id.into())),
+        });
+        self
+    }
+    /// 可点击文字（命名样式）：同 [`Para::span_id`]，样式取自样式表。
+    pub fn styled_id(
+        mut self,
+        name: impl Into<String>,
+        id: impl Into<String>,
+        s: impl Into<String>,
+    ) -> Self {
+        self.spans.push(RichSpan {
+            text: s.into(),
+            named: Some(name.into()),
+            style: SpanStyle::default(),
+            id: Some(Rc::from(id.into())),
         });
         self
     }
     /// 段缩进（逻辑 px）。
     pub fn indent(mut self, px: i32) -> Self {
         self.indent = px;
+        self
+    }
+    /// 悬挂缩进：换行后的续行左缘（逻辑 px，相对当前块缩进基线）。
+    /// 编号义项场景："1. 释义…" 设 hanging 为编号宽，续行对齐释义首字。
+    pub fn hanging(mut self, px: i32) -> Self {
+        self.hanging = Some(px);
+        self
+    }
+    /// 段前间距覆盖（逻辑 px）：如词头段与释义段之间要比释义段间更宽/更窄。
+    pub fn spacing_before(mut self, px: i32) -> Self {
+        self.spacing_before = Some(px);
         self
     }
 }
@@ -274,6 +337,38 @@ impl RichDoc {
         self.blocks.push(RichBlock::Divider);
         self
     }
+    /// 全文纯文本（复制用）：段落/折叠头逐行拼接，chip 文字包含在内；
+    /// 折叠区内容**包含**——复制语义取全文，与视觉折叠态无关。
+    pub fn plain_text(&self) -> String {
+        fn walk(blocks: &[RichBlock], out: &mut String) {
+            for b in blocks {
+                match b {
+                    RichBlock::Para(p) => {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        for s in &p.spans {
+                            out.push_str(&s.text);
+                        }
+                    }
+                    RichBlock::Divider => {}
+                    RichBlock::Section(sec) => {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        for s in &sec.header.spans {
+                            out.push_str(&s.text);
+                        }
+                        walk(&sec.children, out);
+                    }
+                }
+            }
+        }
+        let mut out = String::new();
+        walk(&self.blocks, &mut out);
+        out
+    }
+
     /// 追加一个可折叠区。`collapsed` 为展开态信号（true = 收起），头部点击自动翻转；
     /// 子块经嵌套 builder 构造（其命名样式并入本文档，同名后定义覆盖）。
     pub fn section(
@@ -361,6 +456,14 @@ struct Frag {
     style: FragStyle,
     /// Section 折叠箭头（fg 走 RichTheme.chevron）。
     chevron: bool,
+    /// 可点击 span 的标识（词典交叉引用）。同一 span 换行拆出的多个碎片共享同一 Rc。
+    id: Option<Rc<str>>,
+    /// 源锚点：视觉行号 / 块号（文档序）。划选复制阶段的基础设施预埋——
+    /// 拼装选中文本时按行号插换行、按块号插段落分隔，不必重新铺映射管道。
+    #[allow(dead_code)]
+    line: u32,
+    #[allow(dead_code)]
+    block: u32,
 }
 
 /// 布局缓存键。任何影响几何的输入都在此；颜色不在（paint 时解析，换主题不重排）。
@@ -401,6 +504,8 @@ struct Item {
     ascent: f32,
     /// chip 内边距 (横, 纵)；非 chip 为 0。
     pad: (i32, i32),
+    /// 可点击 span 标识（透传到 Frag）。
+    id: Option<Rc<str>>,
 }
 
 impl Item {
@@ -415,6 +520,51 @@ impl Item {
     }
     fn box_descent(&self) -> f32 {
         (self.text_h as f32 - self.ascent) + self.pad.1 as f32
+    }
+}
+
+/// 闭合类标点：不得落在行首（避头）。仅单字符 token 有意义——ASCII 标点通常
+/// 随 Latin 词成一个 token，列入无害。
+fn is_close_punct(s: &str) -> bool {
+    let mut ch = s.chars();
+    match (ch.next(), ch.next()) {
+        (Some(c), None) => matches!(
+            c,
+            '。' | '；'
+                | '，'
+                | '、'
+                | '！'
+                | '？'
+                | '：'
+                | '）'
+                | '」'
+                | '』'
+                | '】'
+                | '〉'
+                | '》'
+                | '％'
+                | '%'
+                | '…'
+                | ','
+                | '.'
+                | ';'
+                | ':'
+                | '!'
+                | '?'
+                | ')'
+                | ']'
+                | '}'
+        ),
+        _ => false,
+    }
+}
+
+/// 开括类标点：不得孤悬行尾（避尾）。
+fn is_open_punct(s: &str) -> bool {
+    let mut ch = s.chars();
+    match (ch.next(), ch.next()) {
+        (Some(c), None) => matches!(c, '（' | '「' | '『' | '【' | '〈' | '《' | '(' | '[' | '{'),
+        _ => false,
     }
 }
 
@@ -503,6 +653,9 @@ struct Walker<'a> {
     natural_w: i32,
     /// 是否已排过块（控制段前间距）。
     any_block: bool,
+    /// 视觉行 / 块计数（Frag 源锚点）。
+    line_no: u32,
+    block_no: u32,
 }
 
 impl Walker<'_> {
@@ -534,7 +687,14 @@ impl Walker<'_> {
     }
 
     /// 测量一个碎片为待排项。
-    fn item(&mut self, text: &str, style: &FragStyle, chevron: bool, space: bool) -> Item {
+    fn item(
+        &mut self,
+        text: &str,
+        style: &FragStyle,
+        chevron: bool,
+        space: bool,
+        id: Option<Rc<str>>,
+    ) -> Item {
         let ts = style.ts();
         let sz = self.m.size(text, &ts);
         let lm = self.m.metrics(text, &ts);
@@ -555,6 +715,7 @@ impl Walker<'_> {
             text_h: sz.h,
             ascent: lm.ascent,
             pad,
+            id,
         }
     }
 
@@ -588,10 +749,14 @@ impl Walker<'_> {
                 ascent: it.ascent,
                 style: it.style,
                 chevron: it.chevron,
+                id: it.id,
+                line: self.line_no,
+                block: self.block_no,
             });
         }
         self.natural_w = self.natural_w.max(x);
         self.y += (asc + desc).ceil() as i32;
+        self.line_no += 1;
     }
 
     /// 排一个段落（含 Section 头部复用：`extra` 为前置附加项，如折叠箭头）。
@@ -603,7 +768,11 @@ impl Walker<'_> {
         indent: i32,
         extra: Option<Item>,
     ) {
-        let x0 = indent + p.indent;
+        // 悬挂缩进：首行用 indent，续行用 hanging（未设时同 indent）。
+        // 词典编号义项即此："1. 释义…" 换行后续行对齐释义首字而非编号。
+        let x_first = indent + p.indent;
+        let x_rest = indent + p.hanging.unwrap_or(p.indent);
+        let mut x0 = x_first;
         let mut line: Vec<Item> = Vec::new();
         let mut x = x0;
         if let Some(it) = extra {
@@ -615,8 +784,8 @@ impl Walker<'_> {
             let fs = self.resolve(span, styles, base);
             if fs.chip {
                 // 胶囊整体不拆分。
-                let it = self.item(&span.text, &fs, false, false);
-                self.place(&mut line, &mut x, x0, it);
+                let it = self.item(&span.text, &fs, false, false, span.id.clone());
+                self.place(&mut line, &mut x, &mut x0, x_rest, it);
                 continue;
             }
             for (kind, tok) in tokenize(&span.text) {
@@ -628,6 +797,7 @@ impl Walker<'_> {
                             let lh = fs.ts().line_height_px().unwrap_or(fs.size).ceil() as i32;
                             self.y += lh;
                         }
+                        x0 = x_rest;
                         x = x0;
                     }
                     TokKind::Space => {
@@ -635,13 +805,13 @@ impl Walker<'_> {
                         if line.is_empty() {
                             continue;
                         }
-                        let it = self.item(tok, &fs, false, true);
+                        let it = self.item(tok, &fs, false, true, span.id.clone());
                         x += it.box_w();
                         line.push(it);
                     }
                     TokKind::Word => {
-                        let it = self.item(tok, &fs, false, false);
-                        self.place(&mut line, &mut x, x0, it);
+                        let it = self.item(tok, &fs, false, false, span.id.clone());
+                        self.place(&mut line, &mut x, &mut x0, x_rest, it);
                     }
                 }
             }
@@ -650,11 +820,37 @@ impl Walker<'_> {
     }
 
     /// 装行：放不下且行非空 → 先落定当前行再放（贪心断行）。
-    fn place(&mut self, line: &mut Vec<Item>, x: &mut i32, x0: i32, it: Item) {
+    ///
+    /// CJK 避头尾：闭合标点（。；，、）等）不落行首——触发换行时强制附着当前
+    /// 行尾（溢出一字宽可接受，好过标点孤悬行首）；行尾的开括类标点（（「『等）
+    /// 随后续内容一起下行（不孤悬行尾）。
+    fn place(&mut self, line: &mut Vec<Item>, x: &mut i32, x0: &mut i32, x_rest: i32, it: Item) {
         if let Some(w) = self.wrap_w {
-            if !line.is_empty() && *x + it.box_w() > w {
-                self.flush_line(line, x0);
-                *x = x0;
+            let overflow = !line.is_empty() && *x + it.box_w() > w;
+            if overflow {
+                if is_close_punct(&it.text) {
+                    // 避头：附着当前行尾。
+                    *x += it.box_w();
+                    line.push(it);
+                    return;
+                }
+                // 避尾：行尾连续开括类标点随新行携带（至少给原行留一项，防空转）。
+                let mut carried: Vec<Item> = Vec::new();
+                while line.len() > 1 {
+                    let Some(last) = line.last() else { break };
+                    if !last.space && is_open_punct(&last.text) {
+                        carried.push(line.pop().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                self.flush_line(line, *x0);
+                *x0 = x_rest;
+                *x = *x0;
+                for c in carried.into_iter().rev() {
+                    *x += c.box_w();
+                    line.push(c);
+                }
             }
         }
         *x += it.box_w();
@@ -671,10 +867,12 @@ impl Walker<'_> {
     ) {
         let spacing = self.th.rich.para_spacing();
         for b in blocks {
+            self.block_no += 1;
             match b {
                 RichBlock::Para(p) => {
                     if self.any_block {
-                        self.y += spacing;
+                        // 段前间距：段级覆盖优先，回退主题全局值。
+                        self.y += p.spacing_before.unwrap_or(spacing);
                     }
                     self.any_block = true;
                     self.para(p, styles, base, indent, None);
@@ -700,12 +898,13 @@ impl Walker<'_> {
                             text: String::new(),
                             named: None,
                             style: SpanStyle::default(),
+                            id: None,
                         },
                         styles,
                         base,
                     );
                     fs.fg = None;
-                    let chev = self.item(glyph, &fs, true, false);
+                    let chev = self.item(glyph, &fs, true, false, None);
                     self.para(&sec.header, styles, base, indent, Some(chev));
                     // 命中区宽度：宽度受限时撑满可用宽（好点）；Wrap 宽在收尾统一补齐。
                     let w = self.wrap_w.map(|w| w - indent).unwrap_or(0);
@@ -743,6 +942,8 @@ fn layout_doc(
         y: 0,
         natural_w: 0,
         any_block: false,
+        line_no: 0,
+        block_no: 0,
     };
     w.blocks(&doc.blocks, &doc.styles, base, 0);
     let natural_w = w.natural_w;
@@ -802,6 +1003,12 @@ fn has_section(blocks: &[RichBlock]) -> bool {
     blocks.iter().any(|b| matches!(b, RichBlock::Section(_)))
 }
 
+/// 通道向白插值（悬停提亮）。
+fn lighten(c: Color, t: f32) -> Color {
+    let ch = |x: u8| (x as f32 + (255.0 - x as f32) * t).round() as u8;
+    Color::rgba(ch(c.r), ch(c.g), ch(c.b), c.a)
+}
+
 // ---------------------------------------------------------------------------
 // 控件
 // ---------------------------------------------------------------------------
@@ -818,7 +1025,19 @@ pub struct RichText {
     pressed_header: Cell<Option<usize>>,
     /// 键盘焦点指向的折叠头下标（↑↓ 移动、Enter/Space 翻转；使用时按 headers 长度钳制）。
     focus_header: Cell<usize>,
+    /// 悬停中的可点击 span 碎片下标（frags 序；视觉提亮 + 手型光标）。
+    hover_span: Cell<Option<usize>>,
+    /// 按下时锁定的可点击 span 碎片下标。
+    pressed_span: Cell<Option<usize>>,
+    /// span 点击回调（`Element::on_span_click` 注入；参数为 span 的 id）。
+    on_span_click: Option<SpanClickFn>,
+    /// 是否内建右键「复制全部」菜单（默认开；`Element::copy_menu(false)` 关闭，
+    /// 以便应用挂自己的 `on_context_menu`）。
+    copy_menu: bool,
 }
+
+/// span 点击回调类型：携带被点 span 的 id。
+pub type SpanClickFn = Box<dyn FnMut(&str, &mut EventCtx)>;
 
 impl RichText {
     pub fn new(doc: RichDoc) -> Self {
@@ -829,7 +1048,20 @@ impl RichText {
             hover_header: Cell::new(None),
             pressed_header: Cell::new(None),
             focus_header: Cell::new(0),
+            hover_span: Cell::new(None),
+            pressed_span: Cell::new(None),
+            on_span_click: None,
+            copy_menu: true,
         }
+    }
+
+    /// 注入 span 点击回调（供 `Element::on_span_click`）。
+    pub fn set_on_span_click(&mut self, f: SpanClickFn) {
+        self.on_span_click = Some(f);
+    }
+    /// 内建右键复制菜单开关（供 `Element::copy_menu`）。
+    pub fn set_copy_menu(&mut self, on: bool) {
+        self.copy_menu = on;
     }
 
     fn layout_key(&self, wrap_w: Option<i32>, style: &Style, th: &Theme) -> LayoutKey {
@@ -890,6 +1122,23 @@ impl RichText {
         let lay = cache.as_ref()?;
         lay.headers.iter().position(|(r, _)| r.contains(local))
     }
+
+    /// 命中测试可点击 span 碎片（`pos` 为绝对坐标）。比折叠头更具体，优先判定。
+    fn span_at(&self, pos: Point) -> Option<usize> {
+        let content = self.last_content.get();
+        let local = Point::new(pos.x - content.x, pos.y - content.y);
+        let cache = self.cache.borrow();
+        let lay = cache.as_ref()?;
+        lay.frags
+            .iter()
+            .position(|f| f.id.is_some() && f.rect.contains(local))
+    }
+
+    /// 取第 `idx` 个碎片的 span id（克隆 Rc，借用即释）。
+    fn span_id_of(&self, idx: usize) -> Option<Rc<str>> {
+        let cache = self.cache.borrow();
+        cache.as_ref()?.frags.get(idx)?.id.clone()
+    }
 }
 
 impl Widget for RichText {
@@ -925,6 +1174,13 @@ impl Widget for RichText {
         let cache = self.cache.borrow();
         let Some(lay) = cache.as_ref() else { return };
 
+        // 悬停的可点击 span：同 id 的所有碎片（换行拆片）一起提亮。
+        let hovered_id = self
+            .hover_span
+            .get()
+            .and_then(|i| lay.frags.get(i))
+            .and_then(|f| f.id.clone());
+
         for f in &lay.frags {
             let st = &f.style;
             let rect = Rect::new(
@@ -951,7 +1207,7 @@ impl Widget for RichText {
                 );
             }
             // 前景：禁用统一置灰（与 Label 同纪律）。
-            let fg = if !enabled {
+            let mut fg = if !enabled {
                 pal.text_disabled
             } else if f.chevron {
                 th.rich.chevron(pal)
@@ -962,6 +1218,11 @@ impl Widget for RichText {
                     None => super::text_fg(true, style, &th),
                 }
             };
+            // 悬停提亮（可点击 span）：向白插值 25%——亮暗主题下都表现为「变亮」，
+            // 与 accent 家族的 hover 变体观感一致。
+            if enabled && f.id.is_some() && f.id == hovered_id {
+                fg = lighten(fg, 0.25);
+            }
             let text_rect = Rect::new(
                 content.x + f.text_rect.x,
                 content.y + f.text_rect.y,
@@ -1019,11 +1280,16 @@ impl Widget for RichText {
     }
 
     fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
-        // 键盘：↑↓ 在折叠头间移动焦点，Enter/Space 翻转当前头（与 Accordion 约定一致）。
         if let Event::Key(k) = ev {
             if !k.pressed {
                 return false;
             }
+            // Ctrl+C：复制全文纯文本（内建右键菜单经 SendKey 回投到此；VK_C=0x43）。
+            if k.ctrl && k.key == Key::Other(0x43) {
+                ctx.clipboard_set(&self.doc.plain_text());
+                return true;
+            }
+            // ↑↓ 在折叠头间移动焦点，Enter/Space 翻转当前头（与 Accordion 约定一致）。
             let n = self
                 .cache
                 .borrow()
@@ -1057,6 +1323,12 @@ impl Widget for RichText {
         let Event::Pointer(p) = ev else { return false };
         match p.kind {
             PointerKind::Move | PointerKind::Enter => {
+                let over_span = self.span_at(p.pos);
+                if over_span != self.hover_span.get() {
+                    self.hover_span.set(over_span);
+                    // 可点击 span 有提亮反馈，悬停变化需重绘；折叠头无 hover 视觉则不必。
+                    ctx.mark_dirty();
+                }
                 let over = self.header_at(p.pos);
                 if over != self.hover_header.get() {
                     self.hover_header.set(over);
@@ -1064,10 +1336,34 @@ impl Widget for RichText {
                 false
             }
             PointerKind::Leave => {
+                if self.hover_span.take().is_some() {
+                    ctx.mark_dirty();
+                }
                 self.hover_header.set(None);
                 false
             }
-            PointerKind::Down => {
+            PointerKind::Down if p.button == MouseButton::Right => {
+                // 内建右键复制：先聚焦（菜单项以 SendKey(Ctrl+C) 回投焦点节点），再弹菜单。
+                if !self.copy_menu {
+                    return false;
+                }
+                ctx.request_focus();
+                let copy = KeyEvent {
+                    key: Key::Other(0x43),
+                    pressed: true,
+                    shift: false,
+                    ctrl: true,
+                };
+                ctx.show_context_menu(p.pos, vec![MenuItem::key("复制全部", copy, true)]);
+                true
+            }
+            PointerKind::Down if p.button == MouseButton::Left => {
+                // 可点击 span 比折叠头更具体，优先命中（折叠头内也可嵌交叉引用）。
+                if let Some(idx) = self.span_at(p.pos) {
+                    self.pressed_span.set(Some(idx));
+                    ctx.capture();
+                    return true;
+                }
                 let Some(idx) = self.header_at(p.pos) else {
                     return false;
                 };
@@ -1075,7 +1371,21 @@ impl Widget for RichText {
                 ctx.capture();
                 true
             }
-            PointerKind::Up => {
+            PointerKind::Up if p.button == MouseButton::Left => {
+                if let Some(idx) = self.pressed_span.take() {
+                    ctx.release_capture();
+                    // 同一 id 内抬起即触发（换行拆片后跨碎片抬起也算点中）。
+                    let pressed_id = self.span_id_of(idx);
+                    let over_id = self.span_at(p.pos).and_then(|i| self.span_id_of(i));
+                    if let (Some(a), Some(b)) = (pressed_id, over_id) {
+                        if a == b {
+                            if let Some(cb) = self.on_span_click.as_mut() {
+                                cb(&a, ctx);
+                            }
+                        }
+                    }
+                    return true;
+                }
                 let Some(idx) = self.pressed_header.take() else {
                     return false;
                 };
@@ -1097,11 +1407,16 @@ impl Widget for RichText {
     }
 
     fn cursor(&self) -> CursorShape {
-        if self.hover_header.get().is_some() {
+        if self.hover_span.get().is_some() || self.hover_header.get().is_some() {
             CursorShape::Hand
         } else {
             CursorShape::Arrow
         }
+    }
+
+    fn wants_right_click(&self) -> bool {
+        // 内建「复制全部」右键菜单（可经 Element::copy_menu(false) 关闭）。
+        self.copy_menu
     }
 
     fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
@@ -1204,6 +1519,170 @@ mod tests {
 
         tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
         assert_eq!(node_h(&tree, root), 34, "收起后高度只剩正文 + 头");
+    }
+
+    #[test]
+    fn hanging_indent_applies_to_continuation_lines() {
+        // "aa bb cc" 宽 40：aa+空(26) 后 bb 溢出换行；续行左缘应为 hanging=10。
+        let doc = RichDoc::new().para(Para::new().text("aa bb cc").hanging(10));
+        let rt = RichText::new(doc);
+        let style = Style::default();
+        rt.measure(Size::new(40, 0), &style, &mut crate::text::NullTextEngine);
+        let cache = rt.cache.borrow();
+        let frags = &cache.as_ref().unwrap().frags;
+        assert_eq!(frags[0].rect.x, 0, "首行从 indent 起");
+        assert!(
+            frags[1..].iter().all(|f| f.rect.x >= 10),
+            "续行应从 hanging=10 起"
+        );
+        assert_eq!(frags[1].rect.x, 10, "续行行首对齐 hanging");
+    }
+
+    #[test]
+    fn spacing_before_overrides_theme_default() {
+        let doc = RichDoc::new()
+            .para("a")
+            .para(Para::new().text("b").spacing_before(20));
+        let (tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        // 14 + 20 + 14 = 48（默认段距 6 时应为 34）。
+        assert_eq!(node_h(&tree, node), 48, "段级间距覆盖应生效");
+    }
+
+    #[test]
+    fn kinsoku_close_punct_sticks_to_line_end() {
+        // 宽 20 只装下两个 CJK 字（18px）；"，" 本会掉行首，避头规则应附着行尾。
+        let doc = RichDoc::new().para("汉汉，");
+        let rt = RichText::new(doc);
+        let style = Style::default();
+        let sz = rt.measure(Size::new(20, 0), &style, &mut crate::text::NullTextEngine);
+        assert_eq!(sz.h, 14, "闭合标点应附着行尾，不产生第二行");
+        let cache = rt.cache.borrow();
+        let frags = &cache.as_ref().unwrap().frags;
+        assert!(frags.iter().all(|f| f.rect.y == 0), "三个碎片同在首行");
+    }
+
+    #[test]
+    fn kinsoku_open_punct_carries_to_next_line() {
+        // 宽 20："汉（" 装满首行后下个 "汉" 换行——"（" 不得孤悬行尾，应随之下行。
+        let doc = RichDoc::new().para("汉（汉");
+        let rt = RichText::new(doc);
+        let style = Style::default();
+        rt.measure(Size::new(20, 0), &style, &mut crate::text::NullTextEngine);
+        let cache = rt.cache.borrow();
+        let frags = &cache.as_ref().unwrap().frags;
+        let open = frags.iter().find(|f| f.text == "（").unwrap();
+        assert_eq!((open.rect.x, open.rect.y), (0, 14), "开括应移到次行行首");
+    }
+
+    #[test]
+    fn plain_text_includes_chips_and_collapsed_sections() {
+        let collapsed = signal(true);
+        let doc = RichDoc::new()
+            .para(
+                Para::new()
+                    .span("n.", SpanStyle::new().chip())
+                    .text(" 苹果"),
+            )
+            .section("例句", collapsed, |d| d.para("An apple a day."));
+        assert_eq!(
+            doc.plain_text(),
+            "n. 苹果\n例句\nAn apple a day.",
+            "chip 文字与折叠区内容都应包含"
+        );
+    }
+
+    #[test]
+    fn span_click_fires_with_id_and_plain_text_ignores() {
+        let hit = signal(0);
+        let h2 = hit;
+        let doc = RichDoc::new().para(Para::new().text("参见 ").span_id(
+            "fruit",
+            "fruit",
+            SpanStyle::new().underline(),
+        ));
+        let (mut tree, _node) = build(
+            Element::rich(doc).on_span_click(move |id, _| {
+                assert_eq!(id, "fruit");
+                h2.set(h2.get() + 1);
+            }),
+            300,
+            300,
+        );
+        let (mut hover, mut cap) = (None, None);
+        // "参见 " 宽 3*9=27（空格并入 x 前进），fruit 从 x=36 起宽 5*9=45。
+        let on_span = crate::geometry::Point::new(40, 7);
+        let off_span = crate::geometry::Point::new(5, 7);
+        for at in [off_span, on_span] {
+            tree.dispatch_pointer(
+                PointerEvent::single(PointerKind::Down, at, MouseButton::Left),
+                &mut hover,
+                &mut cap,
+            );
+            tree.dispatch_pointer(
+                PointerEvent::single(PointerKind::Up, at, MouseButton::Left),
+                &mut hover,
+                &mut cap,
+            );
+        }
+        assert_eq!(hit.get(), 1, "仅点中标 id 的文字触发一次回调");
+    }
+
+    #[test]
+    fn right_click_offers_copy_and_ctrl_c_copies_plain_text() {
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc as StdRc;
+        struct Clip(StdRc<StdRefCell<String>>);
+        impl crate::core::ClipboardProvider for Clip {
+            fn get_text(&self) -> Option<String> {
+                Some(self.0.borrow().clone())
+            }
+            fn set_text(&self, text: &str) {
+                *self.0.borrow_mut() = text.to_string();
+            }
+        }
+        let doc = RichDoc::new().para("苹果").para("释义");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = StdRc::new(StdRefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(Clip(clip.clone())));
+
+        // 右键应弹出「复制全部」菜单。
+        let (mut hover, mut cap) = (None, None);
+        let at = crate::geometry::Point::new(10, 5);
+        let res = tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Down, at, MouseButton::Right),
+            &mut hover,
+            &mut cap,
+        );
+        let menu = res.menu.expect("右键应请求菜单");
+        assert_eq!(menu.items.len(), 1);
+        assert_eq!(menu.items[0].label, "复制全部");
+
+        // 菜单项经 SendKey(Ctrl+C) 回投焦点节点 → 剪贴板收到纯文本。
+        tree.dispatch_key(
+            crate::event::KeyEvent {
+                key: Key::Other(0x43),
+                pressed: true,
+                shift: false,
+                ctrl: true,
+            },
+            Some(node),
+        );
+        assert_eq!(&*clip.borrow(), "苹果\n释义", "Ctrl+C 应复制全文纯文本");
+    }
+
+    #[test]
+    fn focusable_override_removes_from_tab_order() {
+        let doc = RichDoc::new().section("头", signal(false), |d| d.para("体"));
+        let mut tree = Tree::new();
+        let root = Element::col()
+            .child(Element::rich(doc).focusable(false))
+            .build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        assert!(
+            tree.focusable_order().is_empty(),
+            ".focusable(false) 应使含 Section 的富文本退出 Tab 焦点环"
+        );
     }
 
     #[test]

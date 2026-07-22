@@ -234,12 +234,18 @@ fn main() {
                             .text("  ")
                             .styled("phonetic", "/ˈæp.əl/"),
                     )
+                    .style("ref", SpanStyle::new().fg(RichColor::Accent).underline())
                     .para(
                         Para::new()
                             .styled("pos", "n.")
                             .text(" 苹果；苹果树。参见 ")
-                            .span("fruit", SpanStyle::new().fg(RichColor::Accent).underline())
+                            .styled_id("ref", "fruit", "fruit")
                             .text(" 词条。"),
+                    )
+                    .para(
+                        Para::new()
+                            .text("1. 悬挂缩进演示：这一条编号义项足够长，换行后的续行会对齐到释义首字而不是编号底下。")
+                            .hanging(14),
                     )
                     .divider()
                     .para(
@@ -259,6 +265,7 @@ fn main() {
                         ))
                     }),
             )
+            .on_span_click(|id, ctx| ctx.toast(format!("跳转词条：{id}")))
             .width_match(),
         ))
         .child(card(
