@@ -25,6 +25,8 @@ thread_local! {
     static DAMAGE: Cell<Option<Rect>> = const { Cell::new(None) };
     /// 本帧是否需整窗重绘（节点外的 request_repaint，或无法局部化的情况）。
     static DAMAGE_FULL: Cell<bool> = const { Cell::new(false) };
+    /// 本帧是否有控件请求「下一帧重排」（布局动画：高度补间等每帧改变几何）。
+    static RELAYOUT: Cell<bool> = const { Cell::new(false) };
 }
 
 /// 本帧动画脏区。`Full`=需整窗重绘；`Rect`=仅该区域；`None`=无动画脏区。
@@ -47,6 +49,21 @@ pub fn request_repaint() {
         }),
         None => DAMAGE_FULL.with(|c| c.set(true)),
     }
+}
+
+/// 控件请求「下一帧重排 + 重绘」（paint 内调用）。供**布局动画**（高度补间等每帧
+/// 改变几何的动画）使用：与 `request_repaint` 不同，它让宿主下一帧走
+/// `needs_relayout` 正规门——重排后按结构签名升级整窗、并执行 hover 重同步/
+/// 隐藏交互复位。若绕过此门直接打整窗脏（measure 期调 `request_repaint` 的效果），
+/// 动画期间光标静止悬停的控件不会随内容位移重新判定 hover。
+pub fn request_relayout() {
+    RELAYOUT.with(|c| c.set(true));
+    request_repaint();
+}
+
+/// 宿主：取走「下一帧重排」请求（帧收尾时消费）。
+pub(crate) fn take_relayout() -> bool {
+    RELAYOUT.with(|c| c.replace(false))
 }
 
 /// 绘制遍历：进入某节点绘制前设置其矩形（逻辑坐标），使该节点内的 `request_repaint`
@@ -99,6 +116,7 @@ pub(crate) fn reset_request() {
     DAMAGE.with(|c| c.set(None));
     DAMAGE_FULL.with(|c| c.set(false));
     PAINT_RECT.with(|c| c.set(None));
+    RELAYOUT.with(|c| c.set(false));
 }
 
 /// 宿主/平台：本帧是否有控件请求了动画。

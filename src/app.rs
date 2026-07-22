@@ -1576,6 +1576,11 @@ impl AppHandler for UiHost {
             let pixmap = target.as_pixmap().expect("软目标必有 pixmap");
             self.render_partial(pixmap, size, s, damage.unwrap());
             self.pending_damage = next_damage(&mut self.needs_full);
+            // 布局动画（高度补间等）请求下一帧重排：走 needs_relayout 正规门，
+            // 重排后按结构签名升级整窗并执行 hover 重同步。
+            if crate::anim::take_relayout() {
+                self.needs_relayout = true;
+            }
             if crate::render::prof::enabled() {
                 eprintln!(
                     "[prof] partial {:.2}ms  {}",
@@ -1992,6 +1997,10 @@ impl AppHandler for UiHost {
             self.seed_back(pixmap, size);
         }
         self.pending_damage = next_damage(&mut self.needs_full);
+        // 布局动画请求下一帧重排（同局部路径：走 needs_relayout 正规门）。
+        if crate::anim::take_relayout() {
+            self.needs_relayout = true;
+        }
         if crate::render::prof::enabled() {
             eprintln!(
                 "[prof] full {:.2}ms  {}",

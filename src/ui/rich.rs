@@ -14,7 +14,10 @@
 //! - **折叠**：Section 的展开态是 `Signal<bool>`（状态与文档分离，翻转不失效
 //!   碎片测量缓存）；折叠 = 布局器不下钻子块——不产出碎片即不测量、不绘制、
 //!   不命中。头部整行可点击（悬停手型光标）；含 Section 时控件可 Tab 聚焦，
-//!   ↑↓ 在折叠头间移动、Enter/Space 翻转（聚焦头绘焦点框）。
+//!   ↑↓ 在折叠头间移动、Enter/Space 翻转（聚焦头绘焦点框）。展开/收起带
+//!   卷帘高度动画（`AnimTheme::normal` 时长）：子块按目标状态完整排版、对外
+//!   只占补间高度，溢出部分 paint 按 `ClipRegion` 裁剪；动画期布局缓存恒
+//!   miss（每帧重排，落定后再排一次得稳定布局）；全局动画关闭时瞬时落定。
 //! - **主题**：颜色用 [`RichColor`] 语义角色（paint 时按当前 palette 解析，
 //!   运行时换主题自动跟随）或固定色；控件自身 chrome（箭头/分隔线/chip 默认色/
 //!   间距）走 `RichTheme` 覆盖层。chip 默认前景按 WCAG AA 对比度自适应派生。
@@ -34,12 +37,14 @@
 //! - **动态文档**：[`super::Element::rich_rc`] 绑定 `Signal<RichDoc>`（词典切
 //!   词条），信号版本变化时整篇换文档、失效布局缓存与选区。
 //!
-//! 已知限制（后续分期）：Latin 词内字符级选区（需每碎片字符偏移表）、展开高度动画。
+//! 已知限制（后续分期）：Latin 词内字符级选区（需每碎片字符偏移表）；动画期
+//! 隐藏带内的碎片仍参与命中测试（约 200ms 的暂态，可接受）。
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::anim::{Easing, Transition};
 use crate::core::{EventCtx, Widget};
 use crate::event::{CursorShape, Event, Key, KeyEvent, MenuItem, MouseButton, PointerKind};
 use crate::geometry::{Color, Point, Rect, Size};
@@ -493,6 +498,28 @@ struct Frag {
     block: u32,
 }
 
+/// Section 高度补间状态。以折叠 Signal 为身份键——跨重排、跨 `rich_rc` 换文档
+/// 前后都稳定（应用复用同一信号时动画自然衔接）。`Transition` 是 Copy，
+/// 布局器按下标先取副本、排完子块再写回，避开与 `&mut self` 的借用冲突。
+#[derive(Clone, Copy)]
+struct SectAnim {
+    sig: Signal<bool>,
+    /// 展示高度补间：目标 = 展开时子块全高、收起时 0。`from` 为 NAN 表示尚未
+    /// 初始化（首次遇到以目标值静止落定，首帧不动画）。
+    h: Transition<f32>,
+}
+
+/// 动画期的子块裁剪区：`[lo, hi)` 碎片区间、区起 y0、当前露出高、全高。
+/// paint 据此对区间内碎片 clip（卷帘渐次露出），分隔线落在隐藏带的跳过。
+#[derive(Clone, Copy)]
+struct ClipRegion {
+    lo: usize,
+    hi: usize,
+    y0: i32,
+    reveal: i32,
+    full: i32,
+}
+
 /// 布局缓存键。任何影响几何的输入都在此；颜色不在（paint 时解析，换主题不重排）。
 #[derive(Clone, PartialEq, Debug)]
 struct LayoutKey {
@@ -512,6 +539,11 @@ struct LayoutKey {
 /// 布局产物。
 struct RichLayout {
     frags: Vec<Frag>,
+    /// 动画期的子块裁剪区（空 = 无动画进行中）。
+    clips: Vec<ClipRegion>,
+    /// 本布局产于动画进行期：缓存命中判定视为恒 miss，直到动画落定后
+    /// 再重排一次得到稳定布局（否则会冻结在最后一个动画帧上）。
+    animated: bool,
     /// 折叠头命中区（相对 content；宽度撑满可用宽）+ 对应折叠信号。
     headers: Vec<(Rect, Signal<bool>)>,
     /// 分隔线 (x缩进, y)；绘制时延展到 content 右缘。
@@ -688,6 +720,10 @@ struct Walker<'a> {
     /// 视觉行 / 块计数（Frag 源锚点）。
     line_no: u32,
     block_no: u32,
+    /// 各 Section 高度补间（控件持有，跨帧存活）。
+    anims: &'a mut Vec<SectAnim>,
+    /// 动画期裁剪区。
+    clips: Vec<ClipRegion>,
 }
 
 impl Walker<'_> {
@@ -1021,7 +1057,25 @@ impl Walker<'_> {
                     let w = self.wrap_w.map(|w| w - indent).unwrap_or(0);
                     self.headers
                         .push((Rect::new(indent, y0, w, self.y - y0), sec.collapsed));
-                    if !collapsed {
+                    // —— 展开高度动画（卷帘）——
+                    // 子块始终按目标状态完整排版；对外只占用补间后的高度，
+                    // 溢出部分由 paint 按 ClipRegion 裁剪渐次露出/收拢。
+                    let ai = match self.anims.iter().position(|a| a.sig == sec.collapsed) {
+                        Some(i) => i,
+                        None => {
+                            self.anims.push(SectAnim {
+                                sig: sec.collapsed,
+                                h: Transition::new(f32::NAN),
+                            });
+                            self.anims.len() - 1
+                        }
+                    };
+                    let mut anim = self.anims[ai].h;
+                    // 收拢动画进行中也要排出子块（正在被卷起的内容仍可见）。
+                    let closing = collapsed && anim.value().is_finite() && anim.value() > 0.5;
+                    let cy0 = self.y;
+                    let frag_lo = self.frags.len();
+                    if !collapsed || closing {
                         self.blocks(
                             &sec.children,
                             styles,
@@ -1029,6 +1083,34 @@ impl Walker<'_> {
                             indent + self.th.rich.section_indent(),
                         );
                     }
+                    let full = (self.y - cy0) as f32;
+                    let target = if collapsed { 0.0 } else { full };
+                    if !anim.value().is_finite() {
+                        // 首次遇到：静止落定，首帧不动画。
+                        anim = Transition::new(target);
+                    } else if (anim.target() <= 0.5) != (target <= 0.5) {
+                        // 折叠态翻转：起卷帘动画。
+                        anim.retarget(target, self.th.anim.normal(), Easing::EaseInOut);
+                    } else if (anim.target() - target).abs() > 0.5 && !anim.is_active() {
+                        // 内容/宽度变化导致全高漂移（非折叠切换）：静止跟随，不动画。
+                        anim = Transition::new(target);
+                    }
+                    // 布局期只读取值（无副作用）：下一帧的请求由 paint 经
+                    // anim::request_relayout 走宿主 needs_relayout 正规门发出，
+                    // 保证动画每帧都执行结构签名升级与 hover 重同步。
+                    let reveal = anim.value().clamp(0.0, full);
+                    let reveal_px = reveal.round() as i32;
+                    if (reveal + 0.5) < full {
+                        self.clips.push(ClipRegion {
+                            lo: frag_lo,
+                            hi: self.frags.len(),
+                            y0: cy0,
+                            reveal: reveal_px,
+                            full: full as i32,
+                        });
+                        self.y = cy0 + reveal_px;
+                    }
+                    self.anims[ai].h = anim;
                 }
             }
         }
@@ -1042,6 +1124,7 @@ fn layout_doc(
     base: &Style,
     m: &mut dyn Measurer,
     th: &Theme,
+    anims: &mut Vec<SectAnim>,
 ) -> RichLayout {
     let mut w = Walker {
         m,
@@ -1055,6 +1138,8 @@ fn layout_doc(
         any_block: false,
         line_no: 0,
         block_no: 0,
+        anims,
+        clips: Vec::new(),
     };
     w.blocks(&doc.blocks, &doc.styles, base, 0);
     let natural_w = w.natural_w;
@@ -1065,8 +1150,12 @@ fn layout_doc(
             r.w = (natural_w - r.x).max(0);
         }
     }
+    let clips = w.clips;
+    let animated = !clips.is_empty() || w.anims.iter().any(|a| a.h.is_active());
     RichLayout {
         frags: w.frags,
+        clips,
+        animated,
         headers,
         dividers: w.dividers,
         size: Size::new(natural_w, w.y),
@@ -1186,6 +1275,8 @@ pub struct RichText {
     /// 是否内建右键「复制全部」菜单（默认开；`Element::copy_menu(false)` 关闭，
     /// 以便应用挂自己的 `on_context_menu`）。
     copy_menu: bool,
+    /// 各 Section 高度补间（以折叠 Signal 为身份，跨重排存活）。
+    sect_anims: RefCell<Vec<SectAnim>>,
     /// 动态文档源（`Element::rich_rc` 绑定）：`on_update` 检测版本变化换文档。
     doc_sig: Option<Signal<RichDoc>>,
     /// 已消化的文档信号版本。
@@ -1212,6 +1303,7 @@ impl RichText {
             hover_text: Cell::new(false),
             hover_exp: Cell::new(false),
             copy_menu: true,
+            sect_anims: RefCell::new(Vec::new()),
             doc_sig: None,
             doc_version: Cell::new(0),
         }
@@ -1259,7 +1351,10 @@ impl RichText {
         let mut cache = self.cache.borrow_mut();
         let hit = cache.as_ref().is_some_and(|l| {
             let k = &l.key;
-            k.wrap_w == wrap_w
+            // 动画期产物恒 miss：高度补间每帧变化，且落定后还需一次重排
+            // 得到无裁剪的稳定布局（否则冻结在最后一个动画帧）。
+            !l.animated
+                && k.wrap_w == wrap_w
                 && k.family.as_deref() == style.font_family.as_deref()
                 && k.size_bits == style.font_size.to_bits()
                 && k.weight == style.font_weight
@@ -1270,7 +1365,8 @@ impl RichText {
         });
         if !hit {
             let key = self.layout_key(wrap_w, style, &th, scale);
-            *cache = Some(layout_doc(&self.doc, key, style, m, &th));
+            let mut anims = self.sect_anims.borrow_mut();
+            *cache = Some(layout_doc(&self.doc, key, style, m, &th, &mut anims));
             // 重排后碎片下标不再稳定，选区随之失效。
             self.sel.set(None);
         }
@@ -1441,6 +1537,11 @@ impl Widget for RichText {
         let cache = self.cache.borrow();
         let Some(lay) = cache.as_ref() else { return };
 
+        // 高度动画进行中：请求下一帧重排（经正规门，见 anim::request_relayout）。
+        if lay.animated {
+            crate::anim::request_relayout();
+        }
+
         // 选区高亮：先于文字整片铺底（空白碎片也在碎片列表里，词隙不断档）。
         if let Some((a, b)) = self.sel.get() {
             let (a, b) = (a.min(b), a.max(b).min(lay.frags.len().saturating_sub(1)));
@@ -1463,7 +1564,16 @@ impl Widget for RichText {
             .and_then(|i| lay.frags.get(i))
             .and_then(|f| f.id.clone());
 
-        for f in &lay.frags {
+        for (idx, f) in lay.frags.iter().enumerate() {
+            // 动画期：落在收拢/展开区间内的碎片按当前露出高度裁剪（卷帘）。
+            let mut saves = 0;
+            for r in &lay.clips {
+                if idx >= r.lo && idx < r.hi {
+                    canvas.save();
+                    canvas.clip_rect(Rect::new(content.x, content.y + r.y0, content.w, r.reveal));
+                    saves += 1;
+                }
+            }
             let st = &f.style;
             let rect = Rect::new(
                 content.x + f.rect.x,
@@ -1527,6 +1637,9 @@ impl Widget for RichText {
                 let y = text_rect.y as f32 + f.ascent * 0.66;
                 canvas.draw_line(x0, y, x1, y, 1.0, &Paint::fill(fg));
             }
+            for _ in 0..saves {
+                canvas.restore();
+            }
         }
         // 分隔线延展到 content 右缘。
         let dcol = if enabled {
@@ -1535,6 +1648,14 @@ impl Widget for RichText {
             pal.divider
         };
         for &(dx, dy) in &lay.dividers {
+            // 动画期：落在收拢隐藏带内的分隔线不画。
+            if lay
+                .clips
+                .iter()
+                .any(|r| dy >= r.y0 + r.reveal && dy < r.y0 + r.full)
+            {
+                continue;
+            }
             let y = (content.y + dy) as f32 + 0.5;
             canvas.draw_line(
                 (content.x + dx) as f32,
@@ -1767,6 +1888,8 @@ impl Widget for RichText {
             self.doc = sig.get();
             *self.cache.borrow_mut() = None;
             self.sel.set(None);
+            // 换文档不做高度动画：清空补间状态，新文档首帧静止落定。
+            self.sect_anims.borrow_mut().clear();
             // 悬停/按下/键盘焦点都是旧文档碎片下标——不复位会在新文档上产生
             // 幽灵提亮/手型（切词条时鼠标恰停在被点 span 上，必现场景）。
             self.reset_interaction();
@@ -1885,6 +2008,9 @@ mod tests {
 
     #[test]
     fn section_collapse_shrinks_and_click_toggles() {
+        // 本测试断言折叠后的最终高度，关掉高度动画使补间瞬时落定
+        //（thread-local 开关，不影响并行测试线程；尾部复位）。
+        crate::anim::set_enabled(false);
         let collapsed = signal(false);
         let doc = RichDoc::new()
             .para("正文")
@@ -1910,6 +2036,38 @@ mod tests {
 
         tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
         assert_eq!(node_h(&tree, root), 34, "收起后高度只剩正文 + 头");
+        crate::anim::set_enabled(true);
+    }
+
+    #[test]
+    fn section_height_animates_on_collapse() {
+        crate::anim::set_enabled(true);
+        crate::anim::set_clock_ms(1_000);
+        let collapsed = signal(false);
+        let doc = RichDoc::new()
+            .para("正文")
+            .section("例句", collapsed, |d| d.para("第一句"));
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        assert_eq!(node_h(&tree, node), 54, "首帧静止落定，不动画");
+
+        let dur = crate::theme::current().anim.normal() as u64;
+        collapsed.set(true);
+        // 切换帧：补间刚起步，高度仍在起点。
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        assert_eq!(node_h(&tree, node), 54, "动画起点应保持展开高度");
+
+        // 半程：高度介于两态之间（EaseInOut 半程恰为中点）。
+        crate::anim::set_clock_ms(1_000 + dur / 2);
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        let mid = node_h(&tree, node);
+        assert!(mid > 34 && mid < 54, "半程高度应介于 34..54，实得 {mid}");
+
+        // 结束后：落定收起高度，且再排一次得到无裁剪稳定布局。
+        crate::anim::set_clock_ms(1_000 + dur + 100);
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        assert_eq!(node_h(&tree, node), 34, "动画结束应落定收起高度");
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        assert_eq!(node_h(&tree, node), 34, "落定后布局应稳定");
     }
 
     #[test]

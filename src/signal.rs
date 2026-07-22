@@ -113,6 +113,15 @@ pub struct Signal<T> {
     _t: PhantomData<fn() -> T>,
 }
 
+/// 句柄相等 = 指向同一 slot（含代际）。供以 Signal 为身份键的场景
+/// （如富文本按折叠信号识别各 Section 的动画状态）。
+impl<T> PartialEq for Signal<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+    }
+}
+impl<T> Eq for Signal<T> {}
+
 impl<T> Clone for Signal<T> {
     fn clone(&self) -> Self {
         *self
