@@ -29,9 +29,12 @@
 //!   复制全文，Ctrl+Shift+C 强制全文）；右键菜单随选区态提供「复制/复制全部/全选」
 //!   （`Element::copy_menu(false)` 关闭）。拼装经 Frag 的 line/block 源锚点：跨块补
 //!   换行、块内软换行按 CJK/Latin 边界补空格。选区随重排失效（碎片下标不稳定）。
+//! - **行数截断**：[`Para::clamp`]（长释义预览）——未展开时最多排 N 行，截断处
+//!   缀「… 展开」可点击标记；展开态是 `Signal<bool>`，同折叠的状态分离纪律。
+//! - **动态文档**：[`super::Element::rich_rc`] 绑定 `Signal<RichDoc>`（词典切
+//!   词条），信号版本变化时整篇换文档、失效布局缓存与选区。
 //!
-//! 已知限制（后续分期）：Latin 词内字符级选区（需每碎片字符偏移表）、行数截断
-//! clamp、展开高度动画。
+//! 已知限制（后续分期）：Latin 词内字符级选区（需每碎片字符偏移表）、展开高度动画。
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -177,7 +180,7 @@ struct RichSpan {
 }
 
 /// 段落：span 序列 + 段级排版参数。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Para {
     spans: Vec<RichSpan>,
     /// 段首行缩进（逻辑 px，相对当前块缩进基线）。
@@ -186,6 +189,10 @@ pub struct Para {
     hanging: Option<i32>,
     /// 段前间距覆盖（None = 用 `RichTheme::para_spacing` 全局值）。
     spacing_before: Option<i32>,
+    /// 行数截断：未展开时最多排这么多行，截断处缀「… 展开」可点击标记。
+    max_lines: Option<usize>,
+    /// clamp 展开态（true = 已展开不截断）。状态与文档分离，同 Section 折叠。
+    clamp_expanded: Option<Signal<bool>>,
 }
 
 impl Para {
@@ -282,6 +289,14 @@ impl Para {
     /// 段前间距覆盖（逻辑 px）：如词头段与释义段之间要比释义段间更宽/更窄。
     pub fn spacing_before(mut self, px: i32) -> Self {
         self.spacing_before = Some(px);
+        self
+    }
+    /// 行数截断（长释义预览）：`expanded` 为 false 时最多排 `max_lines` 行，
+    /// 截断处缀「… 展开」可点击标记（点击置 true，段落展开为全文）。
+    /// 状态与文档分离——同 Section 折叠的 Signal 纪律。
+    pub fn clamp(mut self, max_lines: usize, expanded: Signal<bool>) -> Self {
+        self.max_lines = Some(max_lines.max(1));
+        self.clamp_expanded = Some(expanded);
         self
     }
 }
@@ -399,6 +414,8 @@ impl RichDoc {
 trait Measurer {
     fn size(&mut self, text: &str, ts: &TextStyle) -> Size;
     fn metrics(&mut self, text: &str, ts: &TextStyle) -> LineMetrics;
+    /// DPI 缩放因子：测量结果随之有物理取整差异，须入布局缓存键。
+    fn scale(&self) -> f32;
 }
 
 struct EngineMeasurer<'a>(&'a mut dyn TextEngine);
@@ -409,6 +426,9 @@ impl Measurer for EngineMeasurer<'_> {
     fn metrics(&mut self, text: &str, ts: &TextStyle) -> LineMetrics {
         self.0.line_metrics(text, ts)
     }
+    fn scale(&self) -> f32 {
+        self.0.scale()
+    }
 }
 
 struct CanvasMeasurer<'a>(&'a mut dyn Canvas);
@@ -418,6 +438,9 @@ impl Measurer for CanvasMeasurer<'_> {
     }
     fn metrics(&mut self, text: &str, ts: &TextStyle) -> LineMetrics {
         self.0.text_line_metrics(text, ts)
+    }
+    fn scale(&self) -> f32 {
+        self.0.dpi_scale()
     }
 }
 
@@ -447,7 +470,6 @@ impl FragStyle {
 }
 
 /// 已排版碎片。坐标相对控件 content 左上角（逻辑 px）。
-#[derive(Debug)]
 struct Frag {
     text: String,
     /// 碎片全框（chip 含内边距）。
@@ -461,6 +483,8 @@ struct Frag {
     chevron: bool,
     /// 可点击 span 的标识（词典交叉引用）。同一 span 换行拆出的多个碎片共享同一 Rc。
     id: Option<Rc<str>>,
+    /// clamp 截断标记「… 展开」：点击置该信号为 true（段落展开）。
+    expand: Option<Signal<bool>>,
     /// 源锚点：视觉行号 / 块号（文档序）。划选复制阶段的基础设施预埋——
     /// 拼装选中文本时按行号插换行、按块号插段落分隔，不必重新铺映射管道。
     #[allow(dead_code)]
@@ -477,7 +501,9 @@ struct LayoutKey {
     size_bits: u32,
     weight: u16,
     line_height_bits: Option<u32>,
-    /// 各 Section 折叠态快照（文档序）。
+    /// DPI 缩放（测量结果随之有物理取整差异；跨 DPI 显示器拖动时借此失效重排）。
+    scale_bits: u32,
+    /// 各 Section 折叠态 + 各段 clamp 展开态快照（文档序，与布局遍历一致）。
     collapsed: Vec<bool>,
     /// 主题间距参数（para_spacing, section_indent）。
     spacing: (i32, i32),
@@ -510,6 +536,8 @@ struct Item {
     pad: (i32, i32),
     /// 可点击 span 标识（透传到 Frag）。
     id: Option<Rc<str>>,
+    /// clamp 展开标记（透传到 Frag）。
+    expand: Option<Signal<bool>>,
 }
 
 impl Item {
@@ -720,6 +748,7 @@ impl Walker<'_> {
             ascent: lm.ascent,
             pad,
             id,
+            expand: None,
         }
     }
 
@@ -750,6 +779,7 @@ impl Walker<'_> {
                 style: it.style,
                 chevron: it.chevron,
                 id: it.id,
+                expand: it.expand,
                 line: self.line_no,
                 block: self.block_no,
             });
@@ -779,18 +809,37 @@ impl Walker<'_> {
             x += it.box_w();
             line.push(it);
         }
+        // clamp：未展开时只排 max_lines 行，最后一行将溢出处截断缀「… 展开」。
+        let clamp = match (p.max_lines, p.clamp_expanded) {
+            (Some(n), Some(sig)) if !sig.get() => Some((n, sig)),
+            _ => None,
+        };
+        let start_line = self.line_no;
         let spans = p.spans.clone();
-        for span in &spans {
+        'spans: for span in &spans {
             let fs = self.resolve(span, styles, base);
             if fs.chip {
                 // 胶囊整体不拆分。
                 let it = self.item(&span.text, &fs, false, false, span.id.clone());
+                if let Some((n, sig)) = clamp {
+                    if self.clamp_would_exceed(&line, x, n, start_line, &it) {
+                        self.truncate_line(&mut line, &mut x, base, sig);
+                        break 'spans;
+                    }
+                }
                 self.place(&mut line, &mut x, &mut x0, x_rest, it);
                 continue;
             }
             for (kind, tok) in tokenize(&span.text) {
                 match kind {
                     TokKind::Newline => {
+                        if let Some((n, sig)) = clamp {
+                            // 硬换行也吃行数：已在最后一行则就地截断。
+                            if (self.line_no - start_line) as usize + 1 >= n {
+                                self.truncate_line(&mut line, &mut x, base, sig);
+                                break 'spans;
+                            }
+                        }
                         self.flush_line(&mut line, x0);
                         // 连续空行：flush 空行无高度，显式补一行高。
                         if line.is_empty() && x == x0 {
@@ -811,12 +860,74 @@ impl Walker<'_> {
                     }
                     TokKind::Word => {
                         let it = self.item(tok, &fs, false, false, span.id.clone());
+                        if let Some((n, sig)) = clamp {
+                            if self.clamp_would_exceed(&line, x, n, start_line, &it) {
+                                self.truncate_line(&mut line, &mut x, base, sig);
+                                break 'spans;
+                            }
+                        }
                         self.place(&mut line, &mut x, &mut x0, x_rest, it);
                     }
                 }
             }
         }
         self.flush_line(&mut line, x0);
+    }
+
+    /// clamp 判定：正在排最后一个允许行、且放入 `it` 会触发换行。
+    /// 闭合标点走避头附着不换行，放行。
+    fn clamp_would_exceed(
+        &self,
+        line: &[Item],
+        x: i32,
+        max_lines: usize,
+        start_line: u32,
+        it: &Item,
+    ) -> bool {
+        let Some(w) = self.wrap_w else { return false };
+        if ((self.line_no - start_line) as usize + 1) < max_lines {
+            return false;
+        }
+        !line.is_empty() && x + it.box_w() > w && !is_close_punct(&it.text)
+    }
+
+    /// 截断收尾：行尾腾出宽度，缀可点击的「… 展开」标记。
+    fn truncate_line(
+        &mut self,
+        line: &mut Vec<Item>,
+        x: &mut i32,
+        base: &Style,
+        sig: Signal<bool>,
+    ) {
+        let fs = FragStyle {
+            size: base.font_size,
+            weight: base.font_weight,
+            family: base.font_family.clone(),
+            line_height: base.line_height,
+            fg: Some(RichColor::Accent),
+            bg: None,
+            underline: false,
+            strike: false,
+            chip: false,
+        };
+        let mut ell = self.item("… 展开", &fs, false, false, None);
+        ell.expand = Some(sig);
+        if let Some(w) = self.wrap_w {
+            // 从行尾弹出内容给标记腾位（至少留一项，防清空整行）。
+            while line.len() > 1 && *x + ell.box_w() > w {
+                if let Some(popped) = line.pop() {
+                    *x -= popped.box_w();
+                }
+            }
+            // 腾位后行尾若是空白，一并去掉（标记不该跟在空格后）。
+            while line.len() > 1 && line.last().map(|i| i.space).unwrap_or(false) {
+                if let Some(popped) = line.pop() {
+                    *x -= popped.box_w();
+                }
+            }
+        }
+        *x += ell.box_w();
+        line.push(ell);
     }
 
     /// 装行：放不下且行非空 → 先落定当前行再放（贪心断行）。
@@ -963,32 +1074,63 @@ fn layout_doc(
     }
 }
 
-/// 收集各 Section 折叠态快照（文档序，与布局遍历一致）。
+/// 收集影响布局的运行态快照（文档序，与布局遍历一致）：Section 折叠态 +
+/// 段落 clamp 展开态。折叠区内的状态仅在展开时收集（与布局跳过一致）。
 fn collect_collapsed(blocks: &[RichBlock], out: &mut Vec<bool>) {
     for b in blocks {
-        if let RichBlock::Section(sec) = b {
-            let c = sec.collapsed.get();
-            out.push(c);
-            if !c {
-                collect_collapsed(&sec.children, out);
+        match b {
+            RichBlock::Para(p) => {
+                if let Some(sig) = p.clamp_expanded {
+                    out.push(sig.get());
+                }
+            }
+            RichBlock::Divider => {}
+            RichBlock::Section(sec) => {
+                // 头部段落无论折叠与否都参与布局，其 clamp 信号必须入快照，
+                // 否则点击头部的「… 展开」后缓存恒判命中（stale）、视觉无反应。
+                if let Some(sig) = sec.header.clamp_expanded {
+                    out.push(sig.get());
+                }
+                let c = sec.collapsed.get();
+                out.push(c);
+                if !c {
+                    collect_collapsed(&sec.children, out);
+                }
             }
         }
     }
 }
 
-/// 当前折叠态是否与快照一致（与 `collect_collapsed` 同序遍历，**零分配**——
+/// 当前运行态是否与快照一致（与 `collect_collapsed` 同序遍历，**零分配**——
 /// 缓存命中判定的快路径，避免每帧为比对而堆分配 Vec）。
 fn collapsed_matches(blocks: &[RichBlock], snap: &[bool]) -> bool {
     fn walk(blocks: &[RichBlock], snap: &[bool], i: &mut usize) -> bool {
         for b in blocks {
-            if let RichBlock::Section(sec) = b {
-                let c = sec.collapsed.get();
-                if snap.get(*i) != Some(&c) {
-                    return false;
+            match b {
+                RichBlock::Para(p) => {
+                    if let Some(sig) = p.clamp_expanded {
+                        if snap.get(*i) != Some(&sig.get()) {
+                            return false;
+                        }
+                        *i += 1;
+                    }
                 }
-                *i += 1;
-                if !c && !walk(&sec.children, snap, i) {
-                    return false;
+                RichBlock::Divider => {}
+                RichBlock::Section(sec) => {
+                    if let Some(sig) = sec.header.clamp_expanded {
+                        if snap.get(*i) != Some(&sig.get()) {
+                            return false;
+                        }
+                        *i += 1;
+                    }
+                    let c = sec.collapsed.get();
+                    if snap.get(*i) != Some(&c) {
+                        return false;
+                    }
+                    *i += 1;
+                    if !c && !walk(&sec.children, snap, i) {
+                        return false;
+                    }
                 }
             }
         }
@@ -1039,9 +1181,15 @@ pub struct RichText {
     selecting: Cell<bool>,
     /// 指针悬停在正文文字上（I 形光标；span/折叠头的手型优先）。
     hover_text: Cell<bool>,
+    /// 指针悬停在「… 展开」标记上（手型光标）。
+    hover_exp: Cell<bool>,
     /// 是否内建右键「复制全部」菜单（默认开；`Element::copy_menu(false)` 关闭，
     /// 以便应用挂自己的 `on_context_menu`）。
     copy_menu: bool,
+    /// 动态文档源（`Element::rich_rc` 绑定）：`on_update` 检测版本变化换文档。
+    doc_sig: Option<Signal<RichDoc>>,
+    /// 已消化的文档信号版本。
+    doc_version: Cell<u64>,
 }
 
 /// span 点击回调类型：携带被点 span 的 id。
@@ -1062,8 +1210,20 @@ impl RichText {
             sel: Cell::new(None),
             selecting: Cell::new(false),
             hover_text: Cell::new(false),
+            hover_exp: Cell::new(false),
             copy_menu: true,
+            doc_sig: None,
+            doc_version: Cell::new(0),
         }
+    }
+
+    /// 绑定动态文档信号（词典切词条）：`layout_root` 前经 `on_update` 检测版本、
+    /// 换入新文档并失效布局缓存/选区。须配合 `Element::reactive()`（`rich_rc` 已代办）。
+    pub fn new_dynamic(sig: Signal<RichDoc>) -> Self {
+        let mut rt = Self::new(sig.get());
+        rt.doc_version = Cell::new(sig.version());
+        rt.doc_sig = Some(sig);
+        rt
     }
 
     /// 注入 span 点击回调（供 `Element::on_span_click`）。
@@ -1075,7 +1235,7 @@ impl RichText {
         self.copy_menu = on;
     }
 
-    fn layout_key(&self, wrap_w: Option<i32>, style: &Style, th: &Theme) -> LayoutKey {
+    fn layout_key(&self, wrap_w: Option<i32>, style: &Style, th: &Theme, scale: f32) -> LayoutKey {
         let mut collapsed = Vec::new();
         collect_collapsed(&self.doc.blocks, &mut collapsed);
         LayoutKey {
@@ -1084,16 +1244,18 @@ impl RichText {
             size_bits: style.font_size.to_bits(),
             weight: style.font_weight,
             line_height_bits: style.line_height.map(f32::to_bits),
+            scale_bits: scale.to_bits(),
             collapsed,
             spacing: (th.rich.para_spacing(), th.rich.section_indent()),
         }
     }
 
-    /// 确保缓存布局与 (宽度, 字体, 折叠态, 主题间距) 匹配，不匹配则重排。
+    /// 确保缓存布局与 (宽度, 字体, DPI, 折叠/展开态, 主题间距) 匹配，不匹配则重排。
     /// 命中判定走引用比较（零分配）——这是每帧 measure/paint 的常态路径；
     /// 只有真正 miss 时才构造拥有所有权的 `LayoutKey` 并重排。
     fn ensure_layout(&self, wrap_w: Option<i32>, style: &Style, m: &mut dyn Measurer) {
         let th = crate::theme::current();
+        let scale = m.scale();
         let mut cache = self.cache.borrow_mut();
         let hit = cache.as_ref().is_some_and(|l| {
             let k = &l.key;
@@ -1102,11 +1264,12 @@ impl RichText {
                 && k.size_bits == style.font_size.to_bits()
                 && k.weight == style.font_weight
                 && k.line_height_bits == style.line_height.map(f32::to_bits)
+                && k.scale_bits == scale.to_bits()
                 && k.spacing == (th.rich.para_spacing(), th.rich.section_indent())
                 && collapsed_matches(&self.doc.blocks, &k.collapsed)
         });
         if !hit {
-            let key = self.layout_key(wrap_w, style, &th);
+            let key = self.layout_key(wrap_w, style, &th, scale);
             *cache = Some(layout_doc(&self.doc, key, style, m, &th));
             // 重排后碎片下标不再稳定，选区随之失效。
             self.sel.set(None);
@@ -1151,6 +1314,19 @@ impl RichText {
     fn span_id_of(&self, idx: usize) -> Option<Rc<str>> {
         let cache = self.cache.borrow();
         cache.as_ref()?.frags.get(idx)?.id.clone()
+    }
+
+    /// 命中「… 展开」标记（`pos` 为绝对坐标），返回其展开信号。
+    fn expander_at(&self, pos: Point) -> Option<Signal<bool>> {
+        let content = self.last_content.get();
+        let local = Point::new(pos.x - content.x, pos.y - content.y);
+        let cache = self.cache.borrow();
+        cache
+            .as_ref()?
+            .frags
+            .iter()
+            .find(|f| f.expand.is_some() && f.rect.contains(local))
+            .and_then(|f| f.expand)
     }
 
     /// 最近碎片（划选定位）：先按垂直距离找行、再按水平距离找片——指针在行间
@@ -1205,7 +1381,7 @@ impl RichText {
         let mut out = String::new();
         let mut prev: Option<&Frag> = None;
         for f in frags {
-            if f.chevron {
+            if f.chevron || f.expand.is_some() {
                 continue;
             }
             if let Some(p) = prev {
@@ -1470,6 +1646,7 @@ impl Widget for RichText {
                 if over != self.hover_header.get() {
                     self.hover_header.set(over);
                 }
+                self.hover_exp.set(self.expander_at(p.pos).is_some());
                 self.hover_text.set(self.over_frag(p.pos));
                 false
             }
@@ -1479,6 +1656,7 @@ impl Widget for RichText {
                 }
                 self.hover_header.set(None);
                 self.hover_text.set(false);
+                self.hover_exp.set(false);
                 false
             }
             PointerKind::Down if p.button == MouseButton::Right => {
@@ -1509,6 +1687,12 @@ impl Widget for RichText {
                 // 任何左键按下先清旧选区（与编辑器习惯一致）。
                 if self.sel.take().is_some() {
                     ctx.mark_dirty();
+                }
+                // 「… 展开」标记最具体，按下即展开（Signal 自动重绘，布局键随
+                // 展开态失效重排）。
+                if let Some(sig) = self.expander_at(p.pos) {
+                    sig.set(true);
+                    return true;
                 }
                 // 可点击 span 比折叠头更具体，优先命中（折叠头内也可嵌交叉引用）。
                 if let Some(idx) = self.span_at(p.pos) {
@@ -1573,6 +1757,23 @@ impl Widget for RichText {
         }
     }
 
+    fn on_update(&mut self, _ctx: &mut EventCtx) {
+        // 动态文档：信号版本变化 → 换文档、清布局缓存与选区（碎片全部作废）。
+        // 展开/折叠 Signal 由应用与文档一起管理，跨词条自然复位或延续由应用决定。
+        let Some(sig) = self.doc_sig else { return };
+        let v = sig.version();
+        if v != self.doc_version.get() {
+            self.doc_version.set(v);
+            self.doc = sig.get();
+            *self.cache.borrow_mut() = None;
+            self.sel.set(None);
+            // 悬停/按下/键盘焦点都是旧文档碎片下标——不复位会在新文档上产生
+            // 幽灵提亮/手型（切词条时鼠标恰停在被点 span 上，必现场景）。
+            self.reset_interaction();
+            self.focus_header.set(0);
+        }
+    }
+
     fn reset_interaction(&mut self) {
         // 显隐翻转时复位交互态：拖选/按下若残留，再次显示后单纯悬停就会
         // 误入"延伸选区"分支（capture 已被别处接管、Up 永远到不了本控件）。
@@ -1582,6 +1783,7 @@ impl Widget for RichText {
         self.hover_span.set(None);
         self.hover_header.set(None);
         self.hover_text.set(false);
+        self.hover_exp.set(false);
     }
 
     fn focusable(&self) -> bool {
@@ -1590,7 +1792,10 @@ impl Widget for RichText {
     }
 
     fn cursor(&self) -> CursorShape {
-        if self.hover_span.get().is_some() || self.hover_header.get().is_some() {
+        if self.hover_span.get().is_some()
+            || self.hover_header.get().is_some()
+            || self.hover_exp.get()
+        {
             CursorShape::Hand
         } else if self.hover_text.get() {
             // 正文可划选，I 形光标提示。
@@ -2008,6 +2213,144 @@ mod tests {
             labels,
             vec!["复制", "复制全部", "全选"],
             "有选区时应提供三项且右键不清选区"
+        );
+    }
+
+    #[test]
+    fn clamp_truncates_with_expander_and_click_expands() {
+        // 宽 60、每字 9px：一行 6 字。"汉"×20 全文 4 行（56px）；clamp(2) 截为 2 行，
+        // 末行腾位后缀「… 展开」（4 字符 → 34px）。
+        let expanded = signal(false);
+        let doc = RichDoc::new().para(Para::new().text("汉".repeat(20)).clamp(2, expanded));
+        let (mut tree, node) = build(Element::rich(doc).width(60), 300, 300);
+        assert_eq!(node_h(&tree, node), 28, "clamp(2) 应只排两行");
+        // 点击「… 展开」标记（次行 x≈18..52、y∈[14,28)）。
+        press_at(&mut tree, PointerKind::Down, 30, 20);
+        press_at(&mut tree, PointerKind::Up, 30, 20);
+        assert!(expanded.get(), "点击展开标记应置信号为 true");
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        assert_eq!(node_h(&tree, node), 56, "展开后应排出全文四行");
+    }
+
+    #[test]
+    fn clamp_expander_excluded_from_copy() {
+        let expanded = signal(false);
+        let doc = RichDoc::new().para(Para::new().text("汉".repeat(20)).clamp(2, expanded));
+        let rt = RichText::new(doc);
+        let style = Style::default();
+        rt.measure(Size::new(60, 0), &style, &mut crate::text::NullTextEngine);
+        let n = rt.cache.borrow().as_ref().unwrap().frags.len();
+        rt.sel.set(Some((0, n - 1)));
+        let text = rt.selected_text().unwrap();
+        assert!(!text.contains("展开"), "「… 展开」标记不应进入复制文本");
+        assert!(text.starts_with("汉"), "选区应为正文内容");
+    }
+
+    #[test]
+    fn dpi_scale_change_invalidates_layout() {
+        // 自定义 Measurer 模拟 DPI 变化（Null 引擎恒 1.0，无法直接驱动）。
+        struct ScaledNull(f32);
+        impl Measurer for ScaledNull {
+            fn size(&mut self, text: &str, ts: &TextStyle) -> Size {
+                crate::text::NullTextEngine.measure(text, ts, None)
+            }
+            fn metrics(&mut self, text: &str, ts: &TextStyle) -> LineMetrics {
+                crate::text::NullTextEngine.line_metrics(text, ts)
+            }
+            fn scale(&self) -> f32 {
+                self.0
+            }
+        }
+        let rt = RichText::new(RichDoc::new().para("汉汉"));
+        let style = Style::default();
+        rt.ensure_layout(Some(200), &style, &mut ScaledNull(1.0));
+        rt.sel.set(Some((0, 1)));
+        // 同宽同字体、仅 scale 变 → 必须 miss 重排（测量物理取整随 DPI 而变）。
+        rt.ensure_layout(Some(200), &style, &mut ScaledNull(1.5));
+        assert!(
+            rt.sel.get().is_none(),
+            "DPI 变化应使布局缓存失效（选区被清即证明重排）"
+        );
+    }
+
+    #[test]
+    fn rich_rc_swaps_document_on_signal_change() {
+        let doc_sig = signal(RichDoc::new().para("一"));
+        let mut tree = Tree::new();
+        let root = Element::col()
+            .child(Element::rich_rc(doc_sig).width(200))
+            .build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        let node = tree.get(root).unwrap().children[0];
+        assert_eq!(node_h(&tree, node), 14, "初始单段一行");
+
+        doc_sig.set(RichDoc::new().para("一").para("二").para("三"));
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        assert_eq!(
+            node_h(&tree, node),
+            14 + 6 + 14 + 6 + 14,
+            "信号换文档后应按新文档重排（三段 + 两处段距）"
+        );
+    }
+
+    #[test]
+    fn section_header_clamp_signal_enters_snapshot() {
+        // 头部段落设 clamp：其信号必须进布局快照，否则展开后缓存恒 stale。
+        let exp = signal(false);
+        let doc = RichDoc::new().section(
+            Para::new().text("很长的头部".repeat(10)).clamp(1, exp),
+            signal(false),
+            |d| d.para("体"),
+        );
+        let mut snap = Vec::new();
+        collect_collapsed(&doc.blocks, &mut snap);
+        assert_eq!(snap.len(), 2, "快照应含头部 clamp + 折叠态两项");
+        assert!(collapsed_matches(&doc.blocks, &snap), "快照应自洽");
+        exp.set(true);
+        assert!(
+            !collapsed_matches(&doc.blocks, &snap),
+            "头部 clamp 信号翻转后旧快照必须失配（触发重排）"
+        );
+    }
+
+    #[test]
+    fn rich_rc_doc_swap_resets_hover_state() {
+        // 切词条时鼠标常停在被点 span 上：换文档必须复位悬停态，否则新文档
+        // 同下标碎片会被幽灵提亮/显示手型。
+        let doc_sig = signal(RichDoc::new().para(Para::new().span_id(
+            "x",
+            "链接",
+            SpanStyle::new().underline(),
+        )));
+        let mut tree = Tree::new();
+        let root = Element::col()
+            .child(Element::rich_rc(doc_sig).width(200))
+            .build(&mut tree);
+        tree.root = Some(root);
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        let node = tree.get(root).unwrap().children[0];
+
+        // 悬停到可点击 span 上 → 手型。
+        let (mut hover, mut cap) = (None, None);
+        tree.dispatch_pointer(
+            PointerEvent::single(
+                PointerKind::Move,
+                crate::geometry::Point::new(5, 7),
+                MouseButton::Left,
+            ),
+            &mut hover,
+            &mut cap,
+        );
+        assert_eq!(tree.cursor_at(node), CursorShape::Hand, "悬停 span 应手型");
+
+        // 换文档（新文档无可点击 span）→ 悬停态应被复位，不再手型。
+        doc_sig.set(RichDoc::new().para("纯文本"));
+        tree.layout_root(Size::new(300, 300), &mut crate::text::NullTextEngine);
+        assert_eq!(
+            tree.cursor_at(node),
+            CursorShape::Arrow,
+            "换文档后旧悬停下标应复位（无幽灵手型）"
         );
     }
 

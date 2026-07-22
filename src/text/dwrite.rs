@@ -203,6 +203,10 @@ impl TextEngine for DWriteEngine {
         self.scale = new;
     }
 
+    fn scale(&self) -> f32 {
+        self.scale
+    }
+
     fn measure(&mut self, text: &str, ts: &TextStyle, max_width: Option<f32>) -> Size {
         let size = ts.size;
         if text.is_empty() {

@@ -118,6 +118,11 @@ impl LineMetrics {
 pub trait TextEngine {
     /// 设置 DPI 缩放因子。
     fn set_scale(&mut self, _scale: f32) {}
+    /// 当前 DPI 缩放因子。测量结果随 scale 有物理取整差异，缓存了测量产物的
+    /// 布局（如富文本）须把它计入缓存键，否则跨 DPI 显示器拖动后沿用旧几何。
+    fn scale(&self) -> f32 {
+        1.0
+    }
     /// 文字尺寸。`max_width=None` 单行不换行；`Some(w)` 在宽度 w 内换行并返回多行尺寸。
     fn measure(&mut self, text: &str, ts: &TextStyle, max_width: Option<f32>) -> Size;
     /// `text` 按 `ts` 单行排版后的基线度量。传入实际文本（而非样本串）是有意的：

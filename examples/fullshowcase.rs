@@ -211,8 +211,9 @@ fn main() {
     // 手风琴：单开互斥共享索引（初值 0 = 默认展开第一面板）。
     let acc_sel = signal(0i32);
     let nav_msg = signal(String::from("（点下方导航行试试）"));
-    // 富文本演示：例句组折叠态。
+    // 富文本演示：例句组折叠态 + 长释义 clamp 展开态。
     let rich_collapsed = signal(false);
+    let rich_expanded = signal(false);
     // 链接 on_click 演示：点击计数写入动态标签。
     let link_msg = signal(String::from("（点下方“点我计数”试试）"));
     let link_n = signal(0u32);
@@ -246,6 +247,11 @@ fn main() {
                         Para::new()
                             .text("1. 悬挂缩进演示：这一条编号义项足够长，换行后的续行会对齐到释义首字而不是编号底下。")
                             .hanging(14),
+                    )
+                    .para(
+                        Para::new()
+                            .styled("example", "行数截断演示：这一段长释义默认只显示两行，超出的内容被截断，行尾出现可点击的展开标记；点击后整段展开为全文，再看就是完整内容了。ECDICT 的 translation 字段偶尔很长，侧栏预览正需要这种收敛。")
+                            .clamp(2, rich_expanded),
                     )
                     .divider()
                     .para(

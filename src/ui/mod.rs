@@ -1111,6 +1111,15 @@ impl Element {
         Self::base(Layout::None).widget(rich::RichText::new(doc))
     }
 
+    /// 动态富文本：绑定 `Signal<RichDoc>`，信号变化时整篇换文档（词典切词条）。
+    /// 布局缓存与选区随之失效；折叠/clamp 的 Signal 在应用侧持有，跨词条是否
+    /// 复位由应用决定。范式同 [`Element::label_rc`]。
+    pub fn rich_rc(doc: Signal<RichDoc>) -> Self {
+        Self::base(Layout::None)
+            .widget(rich::RichText::new_dynamic(doc))
+            .reactive()
+    }
+
     /// RichText 专属配置入口（误用检测同 text_input/link）。
     fn config_rich(mut self, f: impl FnOnce(&mut rich::RichText)) -> Self {
         match self
