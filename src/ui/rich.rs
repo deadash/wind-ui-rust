@@ -28,8 +28,9 @@
 //!   [`Para::hanging`]（编号义项续行对齐释义首字）、段距按段覆盖
 //!   [`Para::spacing_before`]。
 //! - **划选复制**：碎片级选区（CJK 逐字成片＝中文天然字符级；Latin 整词吸附；
-//!   chip 整体）——拖拽高亮、原地单击清除、Ctrl+A 全选；Ctrl+C 复制选区（无选区
-//!   复制全文，Ctrl+Shift+C 强制全文）；右键菜单随选区态提供「复制/复制全部/全选」
+//!   chip 整体）——拖拽高亮、原地单击清除、**双击选词**（CJK 取连续汉字串至
+//!   标点/空白止，Latin 单词）、**三击选视觉行**、Ctrl+A 全选；Ctrl+C 复制选区
+//!   （无选区复制全文，Ctrl+Shift+C 强制全文）；右键菜单随选区态提供「复制/复制全部/全选」
 //!   （`Element::copy_menu(false)` 关闭）。拼装经 Frag 的 line/block 源锚点：跨块补
 //!   换行、块内软换行按 CJK/Latin 边界补空格。选区随重排失效（碎片下标不稳定）。
 //! - **行数截断**：[`Para::clamp`]（长释义预览）——未展开时最多排 N 行，截断处
@@ -1268,6 +1269,9 @@ pub struct RichText {
     sel: Cell<Option<(usize, usize)>>,
     /// 是否正在拖拽划选（Down 起、Up 止，期间 Move 更新延伸点）。
     selecting: Cell<bool>,
+    /// 拖选锚点碎片（Down 只记录、不落选区——拖出锚点碎片才成选区，
+    /// 按下即选中单字不符合通用划选手感）。
+    drag_anchor: Cell<Option<usize>>,
     /// 指针悬停在正文文字上（I 形光标；span/折叠头的手型优先）。
     hover_text: Cell<bool>,
     /// 指针悬停在「… 展开」标记上（手型光标）。
@@ -1300,6 +1304,7 @@ impl RichText {
             on_span_click: None,
             sel: Cell::new(None),
             selecting: Cell::new(false),
+            drag_anchor: Cell::new(None),
             hover_text: Cell::new(false),
             hover_exp: Cell::new(false),
             copy_menu: true,
@@ -1464,6 +1469,63 @@ impl RichText {
             .as_ref()
             .map(|l| l.frags.iter().any(|f| f.rect.contains(local)))
             .unwrap_or(false)
+    }
+
+    /// 双击选词：命中 CJK 字则向两侧吞并同块内连续的 CJK 字碎片（到标点/空白/
+    /// 样式边界止——中文无空格分词，连续汉字串即编辑器惯例的"词"）；Latin 词
+    /// 经 tokenize 本就是单碎片，standalone 标点/chip 选自身。
+    fn word_range_at(&self, idx: usize) -> (usize, usize) {
+        fn cjk_word(f: &Frag) -> bool {
+            !f.chevron
+                && f.expand.is_none()
+                && !f.style.chip
+                && f.text.chars().next().map(is_cjk).unwrap_or(false)
+                && !is_close_punct(&f.text)
+                && !is_open_punct(&f.text)
+        }
+        let cache = self.cache.borrow();
+        let Some(lay) = cache.as_ref() else {
+            return (idx, idx);
+        };
+        let frags = &lay.frags;
+        let Some(f0) = frags.get(idx) else {
+            return (idx, idx);
+        };
+        if !cjk_word(f0) {
+            return (idx, idx);
+        }
+        let block = f0.block;
+        let mut lo = idx;
+        while lo > 0 && frags[lo - 1].block == block && cjk_word(&frags[lo - 1]) {
+            lo -= 1;
+        }
+        let mut hi = idx;
+        while hi + 1 < frags.len() && frags[hi + 1].block == block && cjk_word(&frags[hi + 1]) {
+            hi += 1;
+        }
+        (lo, hi)
+    }
+
+    /// 三击选行：命中碎片所在**视觉行**的全部碎片（line_no 全局递增，同行必同块）。
+    fn line_range_at(&self, idx: usize) -> (usize, usize) {
+        let cache = self.cache.borrow();
+        let Some(lay) = cache.as_ref() else {
+            return (idx, idx);
+        };
+        let frags = &lay.frags;
+        let Some(f0) = frags.get(idx) else {
+            return (idx, idx);
+        };
+        let line = f0.line;
+        let mut lo = idx;
+        while lo > 0 && frags[lo - 1].line == line {
+            lo -= 1;
+        }
+        let mut hi = idx;
+        while hi + 1 < frags.len() && frags[hi + 1].line == line {
+            hi += 1;
+        }
+        (lo, hi)
     }
 
     /// 选区纯文本：按阅读序拼接选中碎片；跨块补换行，块内软换行按 CJK/Latin
@@ -1747,11 +1809,13 @@ impl Widget for RichText {
         match p.kind {
             PointerKind::Move | PointerKind::Enter => {
                 // 拖拽划选中：更新延伸点（capture 保证界外 Move 也送达）。
+                // 未拖出锚点碎片前不产生选区；拖回锚点碎片则选区消失。
                 if self.selecting.get() {
-                    if let (Some((anchor, ext)), Some(i)) = (self.sel.get(), self.frag_near(p.pos))
+                    if let (Some(anchor), Some(i)) = (self.drag_anchor.get(), self.frag_near(p.pos))
                     {
-                        if i != ext {
-                            self.sel.set(Some((anchor, i)));
+                        let new = (i != anchor).then_some((anchor, i));
+                        if new != self.sel.get() {
+                            self.sel.set(new);
                             ctx.mark_dirty();
                         }
                     }
@@ -1826,26 +1890,39 @@ impl Widget for RichText {
                     ctx.capture();
                     return true;
                 }
-                // 正文区：起划选。先聚焦——物理 Ctrl+C 与菜单 SendKey 都路由到焦点节点。
+                // 正文区：双击选词 / 三击选行（不进入拖选态——Up 各分支均不命中，
+                // 选区得以保留；交互控件的连点仍走上面的单击路径，行为不变）。
+                if p.click_count >= 2 {
+                    let Some(i) = self.frag_near(p.pos) else {
+                        return false;
+                    };
+                    ctx.request_focus();
+                    let range = if p.click_count >= 3 {
+                        self.line_range_at(i)
+                    } else {
+                        self.word_range_at(i)
+                    };
+                    self.sel.set(Some(range));
+                    ctx.mark_dirty();
+                    return true;
+                }
+                // 起划选：只记锚点，不落选区（拖出锚点碎片才出现高亮）。
+                // 先聚焦——物理 Ctrl+C 与菜单 SendKey 都路由到焦点节点。
                 let Some(i) = self.frag_near(p.pos) else {
                     return false;
                 };
                 ctx.request_focus();
-                self.sel.set(Some((i, i)));
+                self.drag_anchor.set(Some(i));
                 self.selecting.set(true);
                 ctx.capture();
                 true
             }
             PointerKind::Up if p.button == MouseButton::Left => {
                 if self.selecting.get() {
+                    // 锚点延迟落地后，原地单击本就无选区，Up 只收尾。
                     self.selecting.set(false);
+                    self.drag_anchor.set(None);
                     ctx.release_capture();
-                    // 原地单击（未拖出锚点碎片）不留选区。
-                    if let Some((a, b)) = self.sel.get() {
-                        if a == b {
-                            self.sel.set(None);
-                        }
-                    }
                     ctx.mark_dirty();
                     return true;
                 }
@@ -1901,6 +1978,7 @@ impl Widget for RichText {
         // 显隐翻转时复位交互态：拖选/按下若残留，再次显示后单纯悬停就会
         // 误入"延伸选区"分支（capture 已被别处接管、Up 永远到不了本控件）。
         self.selecting.set(false);
+        self.drag_anchor.set(None);
         self.pressed_span.set(None);
         self.pressed_header.set(None);
         self.hover_span.set(None);
@@ -2510,6 +2588,141 @@ mod tests {
             CursorShape::Arrow,
             "换文档后旧悬停下标应复位（无幽灵手型）"
         );
+    }
+
+    /// 构造带连击计数的按下事件。
+    fn multi_click(pos: crate::geometry::Point, count: u8) -> PointerEvent {
+        PointerEvent {
+            kind: PointerKind::Down,
+            pos,
+            button: MouseButton::Left,
+            click_count: count,
+        }
+    }
+
+    #[test]
+    fn press_without_drag_selects_nothing() {
+        // 左键按下（未拖动）不得产生选区——按下即选中单字不符合通用手感。
+        let doc = RichDoc::new().para("苹果").para("第二段");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+        let (mut hover, mut cap) = (None, None);
+        tree.dispatch_pointer(
+            PointerEvent::single(
+                PointerKind::Down,
+                crate::geometry::Point::new(4, 7),
+                MouseButton::Left,
+            ),
+            &mut hover,
+            &mut cap,
+        );
+        // 按住未拖：Ctrl+C 应复制全文（无选区），而非按下处的单字。
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "苹果\n第二段", "按下未拖动不应产生选区");
+    }
+
+    #[test]
+    fn drag_back_to_anchor_clears_selection() {
+        let doc = RichDoc::new().para("苹果很甜");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+        let (mut hover, mut cap) = (None, None);
+        let pt = |x| crate::geometry::Point::new(x, 7);
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Down, pt(4), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Move, pt(20), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        // 拖回锚点碎片：选区应消失。
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Move, pt(4), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Up, pt(4), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(
+            &*clip.borrow(),
+            "苹果很甜",
+            "拖回锚点后无选区，复制回退全文"
+        );
+    }
+
+    #[test]
+    fn double_click_selects_cjk_word_run() {
+        // "苹果，很甜"：苹果 | ， | 很甜 —— 双击"苹"应选到"，"为止的连续汉字。
+        let doc = RichDoc::new().para("苹果，很甜");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+
+        let (mut hover, mut cap) = (None, None);
+        let at = crate::geometry::Point::new(5, 7);
+        // 双击 = 单击 Down/Up 后再来一发 count=2 的 Down。
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Down, at, MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Up, at, MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_pointer(multi_click(at, 2), &mut hover, &mut cap);
+        // Up 不应清掉双击选区。
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Up, at, MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "苹果", "双击应选中标点前的连续汉字串");
+    }
+
+    #[test]
+    fn double_click_on_latin_selects_single_word() {
+        let doc = RichDoc::new().para("hello world");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+        let (mut hover, mut cap) = (None, None);
+        // "hello" 宽 5×8.4→42px，点 (10,7) 落在词内。
+        tree.dispatch_pointer(
+            multi_click(crate::geometry::Point::new(10, 7), 2),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "hello", "双击 Latin 词应只选该词");
+    }
+
+    #[test]
+    fn triple_click_selects_visual_line() {
+        // 两段："苹果，很甜" 与 "第二段"；三击首段应选整行、不含第二段。
+        let doc = RichDoc::new().para("苹果，很甜").para("第二段");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+        let (mut hover, mut cap) = (None, None);
+        tree.dispatch_pointer(
+            multi_click(crate::geometry::Point::new(5, 7), 3),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "苹果，很甜", "三击应选中整个视觉行");
     }
 
     #[test]
