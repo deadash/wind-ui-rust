@@ -29,7 +29,7 @@
 //!   [`Para::spacing_before`]。
 //! - **划选复制**：碎片级选区（CJK 逐字成片＝中文天然字符级；Latin 整词吸附；
 //!   chip 整体）——拖拽高亮、原地单击清除、**双击选词**（CJK 取连续汉字串至
-//!   标点/空白止，Latin 单词）、**三击选视觉行**、Ctrl+A 全选；Ctrl+C 复制选区
+//!   标点/空白止，Latin 单词）、**三击选段落**（跨软换行，同浏览器）、Ctrl+A 全选；Ctrl+C 复制选区
 //!   （无选区复制全文，Ctrl+Shift+C 强制全文）；右键菜单随选区态提供「复制/复制全部/全选」
 //!   （`Element::copy_menu(false)` 关闭）。拼装经 Frag 的 line/block 源锚点：跨块补
 //!   换行、块内软换行按 CJK/Latin 边界补空格。选区随重排失效（碎片下标不稳定）。
@@ -1506,8 +1506,9 @@ impl RichText {
         (lo, hi)
     }
 
-    /// 三击选行：命中碎片所在**视觉行**的全部碎片（line_no 全局递增，同行必同块）。
-    fn line_range_at(&self, idx: usize) -> (usize, usize) {
+    /// 三击选段：命中碎片所在**段落**（block）的全部碎片，含软换行的续行——
+    /// 与浏览器三击行为一致（"选视觉行"是代码编辑器的习惯，阅读型内容跟网页）。
+    fn para_range_at(&self, idx: usize) -> (usize, usize) {
         let cache = self.cache.borrow();
         let Some(lay) = cache.as_ref() else {
             return (idx, idx);
@@ -1516,13 +1517,13 @@ impl RichText {
         let Some(f0) = frags.get(idx) else {
             return (idx, idx);
         };
-        let line = f0.line;
+        let block = f0.block;
         let mut lo = idx;
-        while lo > 0 && frags[lo - 1].line == line {
+        while lo > 0 && frags[lo - 1].block == block {
             lo -= 1;
         }
         let mut hi = idx;
-        while hi + 1 < frags.len() && frags[hi + 1].line == line {
+        while hi + 1 < frags.len() && frags[hi + 1].block == block {
             hi += 1;
         }
         (lo, hi)
@@ -1898,7 +1899,7 @@ impl Widget for RichText {
                     };
                     ctx.request_focus();
                     let range = if p.click_count >= 3 {
-                        self.line_range_at(i)
+                        self.para_range_at(i)
                     } else {
                         self.word_range_at(i)
                     };
@@ -2709,10 +2710,11 @@ mod tests {
     }
 
     #[test]
-    fn triple_click_selects_visual_line() {
-        // 两段："苹果，很甜" 与 "第二段"；三击首段应选整行、不含第二段。
-        let doc = RichDoc::new().para("苹果，很甜").para("第二段");
-        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+    fn triple_click_selects_whole_paragraph() {
+        // 首段 8 字在 40px 宽折成两行（软换行）；三击应选**整段**（跨软换行、
+        // 不跨段）——与浏览器三击选段落的习惯一致。
+        let doc = RichDoc::new().para("苹果很甜苹果很甜").para("第二段");
+        let (mut tree, node) = build(Element::rich(doc).width(40), 300, 300);
         let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
         tree.clipboard = Some(Box::new(TestClip(clip.clone())));
         let (mut hover, mut cap) = (None, None);
@@ -2722,7 +2724,11 @@ mod tests {
             &mut cap,
         );
         tree.dispatch_key(ctrl_key(0x43, false), Some(node));
-        assert_eq!(&*clip.borrow(), "苹果，很甜", "三击应选中整个视觉行");
+        assert_eq!(
+            &*clip.borrow(),
+            "苹果很甜苹果很甜",
+            "三击应选整段（含软换行续行），不含第二段"
+        );
     }
 
     #[test]
