@@ -523,6 +523,8 @@ pub struct RichTheme {
     pub chip_bg: Option<Color>,
     /// 胶囊默认文字色（span 未指定 fg 时）。
     pub chip_fg: Option<Color>,
+    /// 划选选区底色（含 alpha；与输入框选区同默认）。
+    pub selection: Option<Color>,
     /// 段前间距（逻辑 px）。
     pub para_spacing: Option<i32>,
     /// 折叠区子内容缩进（逻辑 px）。
@@ -589,6 +591,10 @@ impl RichTheme {
             }
         }
         p.text
+    }
+    pub fn selection(&self, p: &Palette) -> Color {
+        self.selection
+            .unwrap_or(Color::rgba(p.accent.r, p.accent.g, p.accent.b, 0x55))
     }
     pub fn para_spacing(&self) -> i32 {
         self.para_spacing.unwrap_or(6)

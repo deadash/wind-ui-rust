@@ -24,11 +24,14 @@
 //! - **中文排版**：CJK 避头尾（闭合标点不落行首、开括不孤悬行尾）、悬挂缩进
 //!   [`Para::hanging`]（编号义项续行对齐释义首字）、段距按段覆盖
 //!   [`Para::spacing_before`]。
-//! - **复制**：内建右键「复制全部」菜单 + Ctrl+C（[`RichDoc::plain_text`]，含
-//!   chip 与折叠区文字）；`Element::copy_menu(false)` 可关闭。
+//! - **划选复制**：碎片级选区（CJK 逐字成片＝中文天然字符级；Latin 整词吸附；
+//!   chip 整体）——拖拽高亮、原地单击清除、Ctrl+A 全选；Ctrl+C 复制选区（无选区
+//!   复制全文，Ctrl+Shift+C 强制全文）；右键菜单随选区态提供「复制/复制全部/全选」
+//!   （`Element::copy_menu(false)` 关闭）。拼装经 Frag 的 line/block 源锚点：跨块补
+//!   换行、块内软换行按 CJK/Latin 边界补空格。选区随重排失效（碎片下标不稳定）。
 //!
-//! 已知限制（后续分期）：行数截断 clamp、划选复制（字符级选区；Frag 已预埋
-//! line/block 源锚点）、展开高度动画。
+//! 已知限制（后续分期）：Latin 词内字符级选区（需每碎片字符偏移表）、行数截断
+//! clamp、展开高度动画。
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -497,7 +500,8 @@ struct Item {
     text: String,
     style: FragStyle,
     chevron: bool,
-    /// 空白碎片：行首丢弃、不触发换行、无视觉时不产出 Frag。
+    /// 空白碎片：行首丢弃、不触发换行、行尾裁剪；行中照常产出 Frag
+    /// （划选复制靠它保住词间空格，选区高亮靠它填词隙）。
     space: bool,
     text_w: i32,
     text_h: i32,
@@ -735,12 +739,8 @@ impl Walker<'_> {
             let top = self.y + (asc - it.box_ascent()).round() as i32;
             let rect = Rect::new(x, top, it.box_w(), it.box_h());
             x += it.box_w();
-            // 纯空白且无视觉的碎片只推进 x，不产出。
-            let visual =
-                it.style.bg.is_some() || it.style.chip || it.style.underline || it.style.strike;
-            if it.space && !visual {
-                continue;
-            }
+            // 空白碎片也产出：绘制阶段跳过其文字，但划选复制需要它保住词间空格，
+            // 选区高亮也靠它填满词隙。（行尾空白已在上方 pop，不会残留。）
             let text_rect = Rect::new(rect.x + it.pad.0, rect.y + it.pad.1, it.text_w, it.text_h);
             self.frags.push(Frag {
                 text: it.text,
@@ -1031,6 +1031,14 @@ pub struct RichText {
     pressed_span: Cell<Option<usize>>,
     /// span 点击回调（`Element::on_span_click` 注入；参数为 span 的 id）。
     on_span_click: Option<SpanClickFn>,
+    /// 划选选区：(锚点, 延伸点) 碎片下标（无序存储，使用时排序）。
+    /// 粒度为碎片级——CJK 逐字成片即中文天然字符级；Latin 整词吸附；chip 整体。
+    /// 布局重排（宽度/折叠/字体变化）时失效清空（碎片下标已不稳定）。
+    sel: Cell<Option<(usize, usize)>>,
+    /// 是否正在拖拽划选（Down 起、Up 止，期间 Move 更新延伸点）。
+    selecting: Cell<bool>,
+    /// 指针悬停在正文文字上（I 形光标；span/折叠头的手型优先）。
+    hover_text: Cell<bool>,
     /// 是否内建右键「复制全部」菜单（默认开；`Element::copy_menu(false)` 关闭，
     /// 以便应用挂自己的 `on_context_menu`）。
     copy_menu: bool,
@@ -1051,6 +1059,9 @@ impl RichText {
             hover_span: Cell::new(None),
             pressed_span: Cell::new(None),
             on_span_click: None,
+            sel: Cell::new(None),
+            selecting: Cell::new(false),
+            hover_text: Cell::new(false),
             copy_menu: true,
         }
     }
@@ -1097,6 +1108,8 @@ impl RichText {
         if !hit {
             let key = self.layout_key(wrap_w, style, &th);
             *cache = Some(layout_doc(&self.doc, key, style, m, &th));
+            // 重排后碎片下标不再稳定，选区随之失效。
+            self.sel.set(None);
         }
     }
 
@@ -1139,6 +1152,84 @@ impl RichText {
         let cache = self.cache.borrow();
         cache.as_ref()?.frags.get(idx)?.id.clone()
     }
+
+    /// 最近碎片（划选定位）：先按垂直距离找行、再按水平距离找片——指针在行间
+    /// 空隙或行首行尾外侧时吸附到最近处，与文本编辑器的划选手感一致。
+    fn frag_near(&self, pos: Point) -> Option<usize> {
+        let content = self.last_content.get();
+        let local = Point::new(pos.x - content.x, pos.y - content.y);
+        let cache = self.cache.borrow();
+        let lay = cache.as_ref()?;
+        let mut best: Option<(i32, i32, usize)> = None;
+        for (i, f) in lay.frags.iter().enumerate() {
+            let dy = if local.y < f.rect.y {
+                f.rect.y - local.y
+            } else if local.y >= f.rect.y + f.rect.h {
+                local.y - (f.rect.y + f.rect.h) + 1
+            } else {
+                0
+            };
+            let dx = if local.x < f.rect.x {
+                f.rect.x - local.x
+            } else if local.x >= f.rect.x + f.rect.w {
+                local.x - (f.rect.x + f.rect.w) + 1
+            } else {
+                0
+            };
+            if best.map(|(by, bx, _)| (dy, dx) < (by, bx)).unwrap_or(true) {
+                best = Some((dy, dx, i));
+            }
+        }
+        best.map(|(_, _, i)| i)
+    }
+
+    /// 指针是否精确落在某个碎片上（I 形光标判定；不吸附）。
+    fn over_frag(&self, pos: Point) -> bool {
+        let content = self.last_content.get();
+        let local = Point::new(pos.x - content.x, pos.y - content.y);
+        let cache = self.cache.borrow();
+        cache
+            .as_ref()
+            .map(|l| l.frags.iter().any(|f| f.rect.contains(local)))
+            .unwrap_or(false)
+    }
+
+    /// 选区纯文本：按阅读序拼接选中碎片；跨块补换行，块内软换行按 CJK/Latin
+    /// 边界决定是否补空格（折行时被丢弃的词间空格在此还原）。箭头不入文。
+    fn selected_text(&self) -> Option<String> {
+        let (a, b) = self.sel.get()?;
+        let (a, b) = (a.min(b), a.max(b));
+        let cache = self.cache.borrow();
+        let lay = cache.as_ref()?;
+        let frags = lay.frags.get(a..=b)?;
+        let mut out = String::new();
+        let mut prev: Option<&Frag> = None;
+        for f in frags {
+            if f.chevron {
+                continue;
+            }
+            if let Some(p) = prev {
+                if f.block != p.block {
+                    out.push('\n');
+                } else if f.line != p.line {
+                    let cjk_join = p.text.chars().last().map(is_cjk).unwrap_or(false)
+                        && f.text.chars().next().map(is_cjk).unwrap_or(false);
+                    if !cjk_join {
+                        out.push(' ');
+                    }
+                }
+            }
+            out.push_str(&f.text);
+            prev = Some(f);
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    /// 复制：有选区取选区，否则取全文。
+    fn copy_text(&self) -> String {
+        self.selected_text()
+            .unwrap_or_else(|| self.doc.plain_text())
+    }
 }
 
 impl Widget for RichText {
@@ -1173,6 +1264,21 @@ impl Widget for RichText {
         let pal = &th.palette;
         let cache = self.cache.borrow();
         let Some(lay) = cache.as_ref() else { return };
+
+        // 选区高亮：先于文字整片铺底（空白碎片也在碎片列表里，词隙不断档）。
+        if let Some((a, b)) = self.sel.get() {
+            let (a, b) = (a.min(b), a.max(b).min(lay.frags.len().saturating_sub(1)));
+            let selc = th.rich.selection(pal);
+            for f in lay.frags.iter().take(b + 1).skip(a) {
+                canvas.fill_rect(
+                    (content.x + f.rect.x) as f32,
+                    (content.y + f.rect.y) as f32,
+                    f.rect.w as f32,
+                    f.rect.h as f32,
+                    &Paint::fill(selc),
+                );
+            }
+        }
 
         // 悬停的可点击 span：同 id 的所有碎片（换行拆片）一起提亮。
         let hovered_id = self
@@ -1284,9 +1390,29 @@ impl Widget for RichText {
             if !k.pressed {
                 return false;
             }
-            // Ctrl+C：复制全文纯文本（内建右键菜单经 SendKey 回投到此；VK_C=0x43）。
+            // Ctrl+C：有选区复制选区、无则复制全文；Ctrl+Shift+C：强制复制全文。
+            // 内建右键菜单经 SendKey 回投到此（VK_C=0x43）。
             if k.ctrl && k.key == Key::Other(0x43) {
-                ctx.clipboard_set(&self.doc.plain_text());
+                let text = if k.shift {
+                    self.doc.plain_text()
+                } else {
+                    self.copy_text()
+                };
+                ctx.clipboard_set(&text);
+                return true;
+            }
+            // Ctrl+A：全选（VK_A=0x41）。
+            if k.ctrl && k.key == Key::Other(0x41) {
+                let n = self
+                    .cache
+                    .borrow()
+                    .as_ref()
+                    .map(|l| l.frags.len())
+                    .unwrap_or(0);
+                if n > 0 {
+                    self.sel.set(Some((0, n - 1)));
+                    ctx.mark_dirty();
+                }
                 return true;
             }
             // ↑↓ 在折叠头间移动焦点，Enter/Space 翻转当前头（与 Accordion 约定一致）。
@@ -1323,6 +1449,17 @@ impl Widget for RichText {
         let Event::Pointer(p) = ev else { return false };
         match p.kind {
             PointerKind::Move | PointerKind::Enter => {
+                // 拖拽划选中：更新延伸点（capture 保证界外 Move 也送达）。
+                if self.selecting.get() {
+                    if let (Some((anchor, ext)), Some(i)) = (self.sel.get(), self.frag_near(p.pos))
+                    {
+                        if i != ext {
+                            self.sel.set(Some((anchor, i)));
+                            ctx.mark_dirty();
+                        }
+                    }
+                    return true;
+                }
                 let over_span = self.span_at(p.pos);
                 if over_span != self.hover_span.get() {
                     self.hover_span.set(over_span);
@@ -1333,6 +1470,7 @@ impl Widget for RichText {
                 if over != self.hover_header.get() {
                     self.hover_header.set(over);
                 }
+                self.hover_text.set(self.over_frag(p.pos));
                 false
             }
             PointerKind::Leave => {
@@ -1340,38 +1478,72 @@ impl Widget for RichText {
                     ctx.mark_dirty();
                 }
                 self.hover_header.set(None);
+                self.hover_text.set(false);
                 false
             }
             PointerKind::Down if p.button == MouseButton::Right => {
-                // 内建右键复制：先聚焦（菜单项以 SendKey(Ctrl+C) 回投焦点节点），再弹菜单。
+                // 内建右键复制：先聚焦（菜单项以 SendKey 回投焦点节点），再弹菜单。
+                // 右键不清选区——「划选 → 右键 → 复制」是主路径。
                 if !self.copy_menu {
                     return false;
                 }
                 ctx.request_focus();
-                let copy = KeyEvent {
-                    key: Key::Other(0x43),
+                let key = |vk: u32, shift: bool| KeyEvent {
+                    key: Key::Other(vk),
                     pressed: true,
-                    shift: false,
+                    shift,
                     ctrl: true,
                 };
-                ctx.show_context_menu(p.pos, vec![MenuItem::key("复制全部", copy, true)]);
+                let mut items = Vec::new();
+                if self.sel.get().is_some() {
+                    items.push(MenuItem::key("复制", key(0x43, false), true));
+                    items.push(MenuItem::key("复制全部", key(0x43, true), true));
+                } else {
+                    items.push(MenuItem::key("复制全部", key(0x43, false), true));
+                }
+                items.push(MenuItem::key("全选", key(0x41, false), true));
+                ctx.show_context_menu(p.pos, items);
                 true
             }
             PointerKind::Down if p.button == MouseButton::Left => {
+                // 任何左键按下先清旧选区（与编辑器习惯一致）。
+                if self.sel.take().is_some() {
+                    ctx.mark_dirty();
+                }
                 // 可点击 span 比折叠头更具体，优先命中（折叠头内也可嵌交叉引用）。
                 if let Some(idx) = self.span_at(p.pos) {
                     self.pressed_span.set(Some(idx));
                     ctx.capture();
                     return true;
                 }
-                let Some(idx) = self.header_at(p.pos) else {
+                if let Some(idx) = self.header_at(p.pos) {
+                    self.pressed_header.set(Some(idx));
+                    ctx.capture();
+                    return true;
+                }
+                // 正文区：起划选。先聚焦——物理 Ctrl+C 与菜单 SendKey 都路由到焦点节点。
+                let Some(i) = self.frag_near(p.pos) else {
                     return false;
                 };
-                self.pressed_header.set(Some(idx));
+                ctx.request_focus();
+                self.sel.set(Some((i, i)));
+                self.selecting.set(true);
                 ctx.capture();
                 true
             }
             PointerKind::Up if p.button == MouseButton::Left => {
+                if self.selecting.get() {
+                    self.selecting.set(false);
+                    ctx.release_capture();
+                    // 原地单击（未拖出锚点碎片）不留选区。
+                    if let Some((a, b)) = self.sel.get() {
+                        if a == b {
+                            self.sel.set(None);
+                        }
+                    }
+                    ctx.mark_dirty();
+                    return true;
+                }
                 if let Some(idx) = self.pressed_span.take() {
                     ctx.release_capture();
                     // 同一 id 内抬起即触发（换行拆片后跨碎片抬起也算点中）。
@@ -1401,6 +1573,17 @@ impl Widget for RichText {
         }
     }
 
+    fn reset_interaction(&mut self) {
+        // 显隐翻转时复位交互态：拖选/按下若残留，再次显示后单纯悬停就会
+        // 误入"延伸选区"分支（capture 已被别处接管、Up 永远到不了本控件）。
+        self.selecting.set(false);
+        self.pressed_span.set(None);
+        self.pressed_header.set(None);
+        self.hover_span.set(None);
+        self.hover_header.set(None);
+        self.hover_text.set(false);
+    }
+
     fn focusable(&self) -> bool {
         // 仅当文档含可折叠 Section 时参与 Tab 导航（纯静态文本不占焦点位）。
         has_section(&self.doc.blocks)
@@ -1409,6 +1592,9 @@ impl Widget for RichText {
     fn cursor(&self) -> CursorShape {
         if self.hover_span.get().is_some() || self.hover_header.get().is_some() {
             CursorShape::Hand
+        } else if self.hover_text.get() {
+            // 正文可划选，I 形光标提示。
+            CursorShape::Text
         } else {
             CursorShape::Arrow
         }
@@ -1654,8 +1840,9 @@ mod tests {
             &mut cap,
         );
         let menu = res.menu.expect("右键应请求菜单");
-        assert_eq!(menu.items.len(), 1);
+        assert_eq!(menu.items.len(), 2, "无选区：复制全部 + 全选");
         assert_eq!(menu.items[0].label, "复制全部");
+        assert_eq!(menu.items[1].label, "全选");
 
         // 菜单项经 SendKey(Ctrl+C) 回投焦点节点 → 剪贴板收到纯文本。
         tree.dispatch_key(
@@ -1668,6 +1855,160 @@ mod tests {
             Some(node),
         );
         assert_eq!(&*clip.borrow(), "苹果\n释义", "Ctrl+C 应复制全文纯文本");
+    }
+
+    /// 测试用剪贴板桩。
+    struct TestClip(std::rc::Rc<std::cell::RefCell<String>>);
+    impl crate::core::ClipboardProvider for TestClip {
+        fn get_text(&self) -> Option<String> {
+            Some(self.0.borrow().clone())
+        }
+        fn set_text(&self, text: &str) {
+            *self.0.borrow_mut() = text.to_string();
+        }
+    }
+
+    fn ctrl_key(vk: u32, shift: bool) -> crate::event::KeyEvent {
+        crate::event::KeyEvent {
+            key: Key::Other(vk),
+            pressed: true,
+            shift,
+            ctrl: true,
+        }
+    }
+
+    fn press_at(tree: &mut Tree, kind: PointerKind, x: i32, y: i32) {
+        let (mut hover, mut cap) = (None, None);
+        // 划选序列需要跨调用保持 capture，故调用方自管 hover/cap 时不用本助手。
+        tree.dispatch_pointer(
+            PointerEvent::single(kind, crate::geometry::Point::new(x, y), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+    }
+
+    #[test]
+    fn drag_selection_copies_fragment_range() {
+        // "汉字词典" 单行 4 片（每片 9px：汉 0..9、字 9..18、词 18..27、典 27..36）。
+        let doc = RichDoc::new().para("汉字词典");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+
+        let (mut hover, mut cap) = (None, None);
+        let pt = |x| crate::geometry::Point::new(x, 7);
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Down, pt(2), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Move, pt(20), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Up, pt(20), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "汉字词", "拖选 0..=2 片应复制前三字");
+    }
+
+    #[test]
+    fn select_all_copy_preserves_spaces_and_paragraph_breaks() {
+        let doc = RichDoc::new().para("aa bb").para("汉汉");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+        tree.dispatch_key(ctrl_key(0x41, false), Some(node));
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "aa bb\n汉汉", "词间空格保留、段间换行分隔");
+    }
+
+    #[test]
+    fn soft_wrap_copy_joins_lines_sensibly() {
+        // Latin 折行（空格在行尾被丢）：复制时按边界补回空格。
+        let doc = RichDoc::new().para("aa bb");
+        let (mut tree, node) = build(Element::rich(doc).width(40), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+        tree.dispatch_key(ctrl_key(0x41, false), Some(node));
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "aa bb", "Latin 软换行应补空格");
+
+        // CJK 折行：直接续排，不插分隔。
+        let doc = RichDoc::new().para("汉汉汉汉");
+        let (mut tree, node) = build(Element::rich(doc).width(20), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+        tree.dispatch_key(ctrl_key(0x41, false), Some(node));
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "汉汉汉汉", "CJK 软换行不应插分隔符");
+    }
+
+    #[test]
+    fn click_clears_selection_and_copy_falls_back_to_all() {
+        let doc = RichDoc::new().para("汉").para("字");
+        let (mut tree, node) = build(Element::rich(doc).width(200), 300, 300);
+        let clip = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        tree.clipboard = Some(Box::new(TestClip(clip.clone())));
+
+        // 拖选第一段（frag0 → frag0 不算：拖到段内另一点仍是同片会被清，
+        // 故拖跨两片再拖回单片场景不在此测；直接 Ctrl+A 后局部收窄不易，
+        // 用 Down(片0)+Move(片0 外仍片0)+Up 得单片=清空来验证"原地单击不留选区"）。
+        press_at(&mut tree, PointerKind::Down, 4, 7);
+        press_at(&mut tree, PointerKind::Up, 4, 7);
+        tree.dispatch_key(ctrl_key(0x43, false), Some(node));
+        assert_eq!(&*clip.borrow(), "汉\n字", "原地单击不留选区，复制回退全文");
+    }
+
+    #[test]
+    fn relayout_invalidates_selection() {
+        let doc = RichDoc::new().para("汉汉汉汉");
+        let rt = RichText::new(doc);
+        let style = Style::default();
+        rt.measure(Size::new(200, 0), &style, &mut crate::text::NullTextEngine);
+        rt.sel.set(Some((0, 3)));
+        // 宽度变化 → 布局键 miss → 重排 → 选区失效。
+        rt.measure(Size::new(100, 0), &style, &mut crate::text::NullTextEngine);
+        assert!(rt.sel.get().is_none(), "重排后选区应清空");
+    }
+
+    #[test]
+    fn right_click_with_selection_offers_copy_selection() {
+        let doc = RichDoc::new().para("汉字词典");
+        let (mut tree, _node) = build(Element::rich(doc).width(200), 300, 300);
+        let (mut hover, mut cap) = (None, None);
+        let pt = |x| crate::geometry::Point::new(x, 7);
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Down, pt(2), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Move, pt(20), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Up, pt(20), MouseButton::Left),
+            &mut hover,
+            &mut cap,
+        );
+        let res = tree.dispatch_pointer(
+            PointerEvent::single(PointerKind::Down, pt(10), MouseButton::Right),
+            &mut hover,
+            &mut cap,
+        );
+        let menu = res.menu.expect("右键应请求菜单");
+        let labels: Vec<&str> = menu.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["复制", "复制全部", "全选"],
+            "有选区时应提供三项且右键不清选区"
+        );
     }
 
     #[test]
