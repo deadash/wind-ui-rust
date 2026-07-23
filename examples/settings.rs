@@ -1,5 +1,5 @@
 //! 设置界面：综合验证 IconButton / grid / Chip / TagField / 搜索框 / Dialog 脚手架 / Table
-//! 七项新能力，复刻输入法设置窗（侧栏 + 内容 + 标点表格对话框 + 中文配对对话框）。
+//! 七项新能力，复刻桌面应用设置窗（侧栏 + 内容 + 标点表格对话框 + 中文配对对话框）。
 //!
 //! 交互窗口：cargo run --example settings
 //! 截屏主窗：cargo run --example settings -- --screenshot artifacts/settings.png
@@ -201,13 +201,13 @@ fn main() {
             Element::row()
                 .cross(Align::Center)
                 .spacing(10)
-                .child(icon_box(Color::hex(ACCENT), "风", 40))
+                .child(icon_box(Color::hex(ACCENT), "W", 40))
                 .child(
                     Element::col()
                         .weight(1.0)
                         .spacing(2)
                         .child(
-                            Element::label("清风输入法")
+                            Element::label("windui")
                                 .font_size(15.0)
                                 .font_weight(700)
                                 .fg(Color::hex(FG))
@@ -481,7 +481,7 @@ fn main() {
         .child(pairs_dialog)
         .child(edit_dialog);
 
-    App::new("清风输入法 设置", 1000, 680)
+    App::new("应用设置 — windui 示例", 1000, 680)
         .bg(Color::hex(0xF0F2F4))
         .screenshot_from_args()
         .content(root)

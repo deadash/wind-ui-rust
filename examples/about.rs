@@ -1,5 +1,5 @@
 //! 「关于」界面：综合验证 Toast / Badge / 描边按钮 / 可点击卡片四项新能力，
-//! 复刻输入法关于页设计。
+//! 复刻常见桌面应用的关于页设计。
 //!
 //! 交互窗口：cargo run --example about
 //! 截屏：    cargo run --example about -- --screenshot artifacts/about.png
@@ -57,13 +57,13 @@ fn main() {
     let header = Element::row()
         .width_match()
         .spacing(20)
-        .child(icon_box(Color::hex(0x4C8BF5), "风", 96))
+        .child(icon_box(Color::hex(0x4C8BF5), "W", 96))
         .child(
             Element::col()
                 .weight(1.0)
                 .spacing(10)
                 .child(
-                    Element::label("清风输入法")
+                    Element::label("windui")
                         .font_size(26.0)
                         .font_weight(700)
                         .fg(Color::hex(0x1F2328))
@@ -78,7 +78,7 @@ fn main() {
                         .child(Element::button("检查更新").small().outline()),
                 )
                 .child(
-                    Element::label("轻量、快速、可定制的开源中文输入法")
+                    Element::label("轻量、快速的跨平台 GUI 库")
                         .font_size(13.5)
                         .fg(Color::hex(0x8A9099))
                         .width_match()
@@ -127,9 +127,9 @@ fn main() {
                 )))
                 .child(Element::stack().weight(1.0).child(card(
                     Color::hex(0x12B7F5),
-                    "Q",
-                    "QQ 交流群",
-                    "1085293418",
+                    "☺",
+                    "社区讨论",
+                    "提问、交流与反馈",
                 ))),
         );
 
@@ -143,7 +143,7 @@ fn main() {
         .child(header)
         .child(grid)
         .child(
-            Element::label("© 2026 WindInput Contributors · MIT License")
+            Element::label("© 2026 windui Contributors · MIT License")
                 .font_size(12.5)
                 .fg(Color::hex(0xAEB4BC))
                 .width_match()
@@ -157,7 +157,7 @@ fn main() {
         .bg(Color::hex(0xF0F2F4))
         .child(panel);
 
-    App::new("关于 — 清风输入法", 620, 560)
+    App::new("关于 — windui 示例", 620, 560)
         .bg(Color::hex(0xF0F2F4))
         .screenshot_from_args()
         .content(ui)

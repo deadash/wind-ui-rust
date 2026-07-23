@@ -108,9 +108,9 @@ mod tests {
     #[test]
     fn argv_round_trip() {
         let argv = vec![
-            "wind_setting.exe".to_string(),
+            "demo_app.exe".to_string(),
             "--page".to_string(),
-            "input".to_string(),
+            "general".to_string(),
         ];
         let bytes = encode_argv(&argv);
         assert_eq!(decode_argv(&bytes), argv);
@@ -125,20 +125,17 @@ mod tests {
     fn argv_with_protocol_url() {
         let argv = vec![
             "exe".to_string(),
-            "windinput://import/theme?url=https://x/a.yaml".to_string(),
+            "demoapp://import/theme?url=https://x/a.yaml".to_string(),
         ];
         assert_eq!(decode_argv(&encode_argv(&argv)), argv);
     }
 
     #[test]
     fn naming_includes_app_id() {
-        assert_eq!(
-            mutex_name("wind_setting_dev"),
-            r"Local\wind_setting_dev_si_mutex"
-        );
-        assert_eq!(class_name("wind_setting_dev"), "wind_setting_dev_si_win");
-        assert!(socket_path("wind_setting_dev")
+        assert_eq!(mutex_name("demo_app_dev"), r"Local\demo_app_dev_si_mutex");
+        assert_eq!(class_name("demo_app_dev"), "demo_app_dev_si_win");
+        assert!(socket_path("demo_app_dev")
             .to_string_lossy()
-            .ends_with("wind_setting_dev_si.sock"));
+            .ends_with("demo_app_dev_si.sock"));
     }
 }
