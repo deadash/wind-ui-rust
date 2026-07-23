@@ -1690,19 +1690,14 @@ impl Element {
     /// `selected` 绑定当前选中索引，`pages` 为 (标题, 页面) 列表。
     /// 标题接受 `impl Into<String>`，与 `dropdown`/`list` 的选项类型一致。
     pub fn tabs(selected: Signal<usize>, pages: Vec<(impl Into<String>, Element)>) -> Self {
-        let mut bar = Element::row()
-            .width_match()
-            .height(40)
-            .spacing(6)
-            .cross(Align::Stretch);
+        let mut items = Vec::new();
         let mut content = Element::stack().fill().weight(1.0);
         for (i, (title, page)) in pages.into_iter().enumerate() {
-            let tab = containers::TabButton::new(title.into(), selected, i);
-            bar = bar.child(Element::base(Layout::None).widget(tab));
+            items.push(containers::TabItem::new(title.into()));
             let sel2 = selected;
             content = content.child(page.fill().visible_when(move || sel2.get() == i));
         }
-        Element::col().fill().spacing(10).child(bar).child(content)
+        Self::tabs_frame(items, selected, content, containers::TabStyle::Underline)
     }
 
     /// 带前置图标的标签页：`pages` 为 (标题, 图标内容, 页面) 列表。其余同 `tabs`。
@@ -1711,19 +1706,43 @@ impl Element {
         selected: Signal<usize>,
         pages: Vec<(impl Into<String>, ImageContent, Element)>,
     ) -> Self {
-        let mut bar = Element::row()
-            .width_match()
-            .height(40)
-            .spacing(6)
-            .cross(Align::Stretch);
+        let mut items = Vec::new();
         let mut content = Element::stack().fill().weight(1.0);
         for (i, (title, icon, page)) in pages.into_iter().enumerate() {
-            let tab = containers::TabButton::new(title.into(), selected, i).with_icon(icon);
-            bar = bar.child(Element::base(Layout::None).widget(tab));
+            items.push(containers::TabItem::new(title.into()).with_icon(icon));
             let sel2 = selected;
             content = content.child(page.fill().visible_when(move || sel2.get() == i));
         }
-        Element::col().fill().spacing(10).child(bar).child(content)
+        Self::tabs_frame(items, selected, content, containers::TabStyle::Underline)
+    }
+
+    /// 胶囊式标签页：选中项为 accent 实底圆角胶囊、白字，胶囊在标签间滑动；无基线。
+    /// 签名与 [`tabs`](Self::tabs) 一致，仅视觉风格不同。
+    pub fn tabs_pill(selected: Signal<usize>, pages: Vec<(impl Into<String>, Element)>) -> Self {
+        let mut items = Vec::new();
+        let mut content = Element::stack().fill().weight(1.0);
+        for (i, (title, page)) in pages.into_iter().enumerate() {
+            items.push(containers::TabItem::new(title.into()));
+            let sel2 = selected;
+            content = content.child(page.fill().visible_when(move || sel2.get() == i));
+        }
+        Self::tabs_frame(items, selected, content, containers::TabStyle::Pill)
+    }
+
+    /// `tabs` / `tabs_icons` / `tabs_pill` 的共同骨架：整条标签条是**一个**
+    /// [`containers::TabBar`] 自绘节点（滑动选中滑块要跨标签的布局信息，拆成多节点就
+    /// 拿不到），下方是内容区。条高与（下划线风格的）贯穿基线均由 TabBar 自己按主题决定，
+    /// 故这里不设固定高、也不额外加 divider。
+    fn tabs_frame(
+        items: Vec<containers::TabItem>,
+        selected: Signal<usize>,
+        content: Element,
+        style: containers::TabStyle,
+    ) -> Self {
+        let bar = Element::base(Layout::None)
+            .widget(containers::TabBar::new(items, selected).with_style(style))
+            .width_match();
+        Element::col().fill().spacing(16).child(bar).child(content)
     }
 
     /// 模态对话框：全窗半透明遮罩 + 居中内容，遮罩吞掉指针事件实现模态。

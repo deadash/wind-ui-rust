@@ -2127,6 +2127,40 @@ mod tests {
         assert_eq!(cap, None, "释放应取消捕获");
     }
 
+    /// 标签条：走**完整事件分发链路**验证点选切页（dispatch → 命中 → on_event →
+    /// index_at → 信号）。TabBar 的其余测试都直接调 `index_at`/`key_target` 等内部方法，
+    /// 单元通过并不能证明真实指针事件能落到它身上——本例补上这一段。
+    #[test]
+    fn tab_bar_pointer_click_switches_page_through_dispatch() {
+        let sel = signal(1);
+        let root = Element::tabs(
+            sel,
+            vec![
+                ("甲", Element::label("page A")),
+                ("乙", Element::label("page B")),
+            ],
+        );
+        let mut tree = Tree::new();
+        let id = root.build(&mut tree);
+        tree.root = Some(id);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(400, 300), &mut te);
+
+        // tabs = col[标签条, 内容区]；标签条是首个子节点。
+        let bar = tree.get(id).unwrap().children[0];
+        let b = tree.abs_bounds(bar);
+        // 首项左缘内侧一点，必落在第 0 项（不依赖具体文字度量）。
+        let p = Point::new(b.x + 2, b.y + b.h / 2);
+        let (mut hover, mut cap) = (None, None);
+
+        tree.dispatch_pointer(ptr(PointerKind::Move, p), &mut hover, &mut cap);
+        assert_eq!(hover, Some(bar), "移动到标签条上应命中标签条节点");
+
+        tree.dispatch_pointer(ptr(PointerKind::Down, p), &mut hover, &mut cap);
+        tree.dispatch_pointer(ptr(PointerKind::Up, p), &mut hover, &mut cap);
+        assert_eq!(sel.get(), 0, "点击首个标签应把选中索引切到 0");
+    }
+
     /// 构建 [下层按钮 + 上层全覆盖容器]，返回 (tree, 按钮 id, 按钮中心点)。
     /// `opaque_bg`=true 时上层容器带背景（应吞命中），false 时为透明纯容器（应穿透）。
     fn overlay_tree(clicks: Signal<i32>, opaque_bg: bool) -> (Tree, NodeId, Point) {

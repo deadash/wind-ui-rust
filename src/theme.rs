@@ -401,6 +401,16 @@ pub struct TabTheme {
     pub accent: Option<Color>,
     pub inactive: Option<Color>,
     pub hover: Option<Color>,
+    /// 标签条底部贯穿基线色。
+    pub baseline: Option<Color>,
+    /// 悬停标签的淡底色（含 alpha）。
+    pub hover_bg: Option<Color>,
+    /// 选中指示条高度（px）。
+    pub indicator_h: Option<f32>,
+    /// 标签条整体高度（逻辑 px）。
+    pub height: Option<i32>,
+    /// 选中标签的字重（measure 恒按此字重，避免选中态改变布局）。
+    pub selected_weight: Option<u16>,
 }
 
 impl TabTheme {
@@ -412,6 +422,24 @@ impl TabTheme {
     }
     pub fn hover(&self, p: &Palette) -> Color {
         self.hover.unwrap_or(p.text)
+    }
+    pub fn baseline(&self, p: &Palette) -> Color {
+        self.baseline.unwrap_or(p.divider)
+    }
+    /// 悬停淡底：默认取**主题文字色**的低 alpha（与 `Clickable` 叠层同范式，明暗主题自适应）。
+    /// 刻意不取 accent——accent 已是选中态语义，hover 是临时态，用它会抢过选中项、
+    /// 造成视觉层级倒置。
+    pub fn hover_bg(&self, p: &Palette) -> Color {
+        self.hover_bg.unwrap_or(p.text.scale_alpha(0.08))
+    }
+    pub fn indicator_h(&self) -> f32 {
+        self.indicator_h.unwrap_or(2.0)
+    }
+    pub fn height(&self) -> i32 {
+        self.height.unwrap_or(44)
+    }
+    pub fn selected_weight(&self) -> u16 {
+        self.selected_weight.unwrap_or(600)
     }
 }
 

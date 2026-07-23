@@ -1,7 +1,7 @@
 //! 列表 ListView：可滚动的单选行列表。
 //!
-//! `Element::list` 复用滚动容器，每项是一个 [`ListRow`]——与 TabButton 同构：
-//! 共享 `Rc<Cell<usize>>` 选中索引，点击设置自身索引，选中/悬停高亮。
+//! `Element::list` 复用滚动容器，每项是一个 [`ListRow`]：共享 `Signal<usize>` 选中索引，
+//! 点击设置自身索引，选中/悬停高亮。
 
 use std::cell::Cell;
 
@@ -24,7 +24,8 @@ const PAD_X: i32 = 12;
 const ICON_GAP: i32 = 8;
 
 /// 单个列表行：点击设置共享选中索引，选中/悬停高亮。可选前置图标（复用 `ImageContent`）。
-/// 事件契约与 `containers::TabButton` 同构，两者应保持同步。
+/// 选中模型与 `containers::TabBar` 同源（共享 `Signal<usize>`），但列表每行是独立节点，
+/// 标签条则整条一个自绘节点（指示条要跨项布局），二者的事件路径不再同构。
 /// 圆角 pill 选中样式的内缩与圆角（逻辑 px）。侧栏导航等用，更贴近现代设计稿。
 const PILL_INSET_X: f32 = 6.0;
 const PILL_INSET_Y: f32 = 3.0;
