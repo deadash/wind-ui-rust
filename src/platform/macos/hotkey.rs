@@ -42,5 +42,9 @@ impl HotkeyState {
     }
 
     /// 运行期热键操作（改绑/启停）。macOS 未实现——注册本就未生效，静默忽略。
+    ///
+    /// 桩暂无调用点：win32 在意图消费点调 `apply`，macOS 侧的窗口层还没接热键意图管线。
+    /// 待 macOS 实现全局热键时连同调用点一并补上，届时删掉此 `allow`。
+    #[allow(dead_code)]
     pub(crate) fn apply(&mut self, _id: usize, _op: crate::event::HotkeyOp) {}
 }

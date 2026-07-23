@@ -111,6 +111,10 @@ impl HotkeyCtx {
         self.op = Some(WindowOp::Hide);
     }
     /// 取出回调声明的意图（供平台层在**释放窗口状态借用之后**执行）。
+    ///
+    /// 唯一调用点在 win32 的热键派发路径；macOS 尚未接入全局热键
+    /// （见 `platform/macos/hotkey.rs`），那侧编译时无调用点会被判为 dead code。
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub(crate) fn take_op(&mut self) -> Option<WindowOp> {
         self.op.take()
     }
