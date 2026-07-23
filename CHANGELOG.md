@@ -5,9 +5,88 @@
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-23
+
+本版本新增 RichText 富文本控件与全局热键管线，并把文字属性收进 `TextStyle`——后者改动了
+`TextEngine` / `Canvas` 两个 trait 的签名，自定义渲染后端需要跟随调整（见 Changed 的破坏性条目）。
+
 ### Added
+- **`RichText` 富文本控件**（`Element::rich` / `rich_rc`）：段落 + 碎片（span）模型，配套能力如下。
+  - **排版**：CJK 避头尾（闭合标点不落行首、开括类不孤悬行尾）、`Para::hanging` 悬挂缩进
+    （编号义项续行对齐释义首字）、`Para::spacing_before` 按段覆盖段距。
+  - **span 点击**：`Para::span_id` / `styled_id` 标注纯数据 id，回调经 `Element::on_span_click`
+    挂在控件层——`RichDoc` 保持 `Clone` / 可比较 / 可缓存。悬停手型 + 同 id 跨行碎片一起提亮。
+  - **划选复制**：碎片级选区（CJK 逐字、Latin 整词吸附、chip 整体）、选区高亮、`Ctrl+C` 复制选区、
+    `Ctrl+Shift+C` 强制全文、`Ctrl+A` 全选，右键菜单按选区态给「复制 / 复制全部 / 全选」。
+    跨块补换行、块内软换行按 CJK/Latin 边界补空格。
+  - **双击选词 / 三击选段**：双击对 CJK 吞并同块内连续汉字碎片（至标点/空白/chip 边界止），
+    三击选中命中碎片所在段落全部碎片（含软换行续行、不跨段），对齐浏览器习惯。
+  - **折叠 Section**：可 `Tab` 聚焦，`↑↓` 在折叠头间移动、`Enter`/`Space` 翻转；展开/收起为
+    卷帘高度动画（收拢中按目标状态完整排版，对外只占补间高度）。
+  - **行数截断**：`Para::clamp(max_lines, expanded)` 未展开只排 N 行，行尾缀可点击的「… 展开」标记
+    （不计入复制文本）。
+  - **动态文档**：`Element::rich_rc(Signal<RichDoc>)` 整篇换文档，同步失效布局缓存与选区、复位悬停
+    与键盘焦点下标。
+  - `RichDoc::plain_text`（含 chip 与折叠区文字）与内建右键「复制全部」菜单，`Element::copy_menu(false)` 可关闭。
+- **全局热键**：`App::hotkey` 注册全局热键、`App::start_hidden` 启动不显示窗口、
+  `EventCtx::show_window` / `hide_window`，`WindowOp` 增 `Show` / `Hide`。回调只拿意图不拿句柄
+  （`HotkeyCtx` 仅持 `Option<WindowOp>`），窗口操作在平台层释放借用后执行。注册失败不阻止启动。
+  Windows 走 `RegisterHotKey` + `WM_HOTKEY`；macOS 待补。
+- **热键运行期改绑**：`App::hotkey_rc` 返回 `HotkeyHandle`，`rebind(hotkey)` / `set_enabled(bool)`
+  运行期即时生效（此前仅启动期一次性注册，改热键须重启）。改绑失败回滚重注册旧组合，
+  `set_enabled(false)` 注销把组合归还系统。
+- **主题运行期动态更新**：`ThemeHandle::update(|t| ...)` 局部改主题（换强调色/调字号一行完成，
+  下一帧全树跟随）；新增 `Brush::RoleAlpha(Role, alpha)`、`Element::bg_role_alpha` 与
+  `Role::InputBg` / `InputBorder`，把构建期取色改为角色延迟解析——徽章/chip/标签输入/对话框面板/
+  表格编辑格换主题后自动跟随，不再停在旧主题色。
+- **关闭即隐藏**：`App::hide_on_close()` 把 `ESC` 与标题栏关闭按钮转为隐藏窗口，退出留给托盘菜单
+  （常驻托盘类应用的常见期望）。拦截器优先级高于它——`close_handler` 返回 `false` 时窗口既不关也不隐。
+- **文字排版三项**：`Element::line_height(倍数)`（取倍数使行距随字号与 DPI 缩放）、
+  `Element::max_width(px)`（测量前收窄可用宽，内容据此换行而非事后裁切）、
+  `Element::border_edges(Edges)` 单边边框（页签下划线、分区底线不必再用 1px 色块拼）。
 - **字体族**：`Element::font_family(name)` 指定字体族名（Windows/macOS 均生效）。字体未安装时静默回退系统默认，不报错也不 panic。
+- **节点级焦点覆盖**：`Element::focusable(bool)` 控制 `Tab` 遍历是否纳入该节点（不改命中/拖动/`request_focus` 语义）。
+- **胶囊式标签条**：`TabStyle::Pill` 与 `Element::tabs_pill`——accent 实底胶囊 + 白字滑动。
+- **下拉项富信息**：`MenuItem` 新增 `subtitle` / `badge` / `trailing_icon`，展开态支持两行项与徽章胶囊，
+  尾随图标点击独立于主项 action；收起态同步显示选中项徽章。新增 `DropdownItem` 与
+  `Element::dropdown_items`，纯文本 `Vec<String>` 旧用法零改动。
+- **表格整行双击激活**：`Element::on_row_activate`（释放 `Up` 时触发）。
 - **无边框窗口圆角**：`frameless()` 窗口在 Win11 上显式声明 `DWMWA_WINDOW_CORNER_PREFERENCE`，与系统其余窗口一致；Win10 上 DWM 不识别该属性、返回错误码并被忽略，无需版本判断。macOS 由 AppKit 天然保持圆角。
+
+### Changed
+- **（破坏性）文字属性收进 `TextStyle`**：`TextEngine::measure` / `line_metrics` 与
+  `Canvas::measure_text` / `draw_text` 改为接收 `&TextStyle`，字族/字号/字重/行高一并传递；
+  原先的线程局部字重注入（`text::set_weight` / `current_weight`）随之删除——那让字重成了隐式全局
+  状态，漏复位就会让后续无关文字跟着变粗。自定义 `TextEngine` / `Canvas` 实现需按新签名调整；
+  控件调用方改为 `&TextStyle::of(style)`，比原先的散开参数更短。
+- **（破坏性）`TrayCtx` 改意图队列**：不再持有 `hwnd`/`uid`，四个方法只累积 `TrayAction`，由平台层在
+  释放借用后执行；macOS `TrayCtx` 同步改 `&mut self`，使两平台签名一致。
+- **标签条重做为下划线式**：`TabButton` 逐节点 → 单个自绘 `TabBar`，选中项为整格宽指示条 + 贯穿基线，
+  切换时横向滑动；去掉选中焦点框与悬停淡底，选中态加粗且按选中字重恒定测量以免布局抖动。
+  整条为一个焦点节点、内部 `Left`/`Right` 移动，符合 tablist roving tabindex 约定。
+- **chip 前景对比度**：默认前景按 WCAG AA 自适应——从 accent 向正文色插值直到对实际底色 ≥4.5:1
+  （「同色淡底 + 同色前景」实测仅约 3:1）。
+- **事件路径时间源**：新增 `EventCtx::now_ms` 作为事件回调中的推荐时间源。
+
+### Fixed
+- **托盘回调重入 UB**：`WM_TRAYICON` 在持有 `&mut WindowState` 期间跑用户回调，而回调经 `TrayCtx`
+  直接调 `ShowWindow`/`DestroyWindow`、右键还调模态的 `TrackPopupMenu`，重入 `wnd_proc` 后再取一次
+  `&mut WindowState` 即别名 UB；其中 `quit()` 的 `DestroyWindow` 会同步 drop 掉正在执行的闭包本身，
+  属 use-after-free。改为意图队列后消除。顺带修正点托盘图标唤不起最小化窗口（`SW_SHOW` → `WindowOp::Show`）。
+- **帧时钟在事件路径冻结**：`clock_ms()` 此前只在 render 前刷新，空闲不出帧期间停在上一帧，
+  两次交互之间的静默期被整段计入时长判定（长按、双击、拖动速度均受影响）。`on_pointer`/`on_key`
+  入口也同步帧时钟。
+- **步进器点击即进快速加**：长按起点改由按下后首帧 paint 用刚刷新的帧时钟锚定，不再在事件路径读冻结时钟。
+- **清屏色不随主题热切换**：未经 `App::bg` 显式固定时，`UiHost` 每帧跟随 `palette.bg`——修「切暗色主题后
+  清屏/局部重绘仍是亮色底」。`theme()` 不再覆盖显式 `bg`（`.bg(c).theme(t)` 与反序同义）。
+- **下拉徽章灰字灰底**：Neutral 意图徽章前景改用 `text_muted`。
+- **最小化/最大化动画期左上角内容被拉伸**：flip-model 交换链下 `ResizeBuffers` 到重绘落地之间存在真空期，
+  DWM 会采样旧尺寸缓冲并按 `DXGI_SCALING_STRETCH` 从左上角拉伸。非拖拽的最大化/还原改同步重绘
+  （拖拽缩放中保持异步以免拖累手感）、跳过 `SIZE_MINIMIZED`、交换链 Scaling 改 `NONE`。
+- **单实例转发失败被挡在门外**：首实例退出中或僵死时 `WM_COPYDATA` 同步发送会把二次实例一起挂住；
+  改用 `SendMessageTimeoutW(SMTO_ABORTIFHUNG)` 探测送达失败并回退为正常启动新窗口。
+- **表格多行单元格顶部对齐**：多行分支由 stack 改为 row + `cross(Center)`，同行折行撑高时单行文本格竖直居中。
+- **富文本布局缓存每帧堆分配**：`ensure_layout` 命中判定改引用比较 + 零分配快路径，仅 miss 时构造 `LayoutKey`。
 
 ## [0.8.3] - 2026-07-13
 
@@ -165,7 +244,16 @@
 - **windows-rs 0.58 → 0.62 迁移**：`implement` 宏改由 `windows-core` 提供；可空句柄参数
   语义化为 `Option<T>`；`BOOL` 迁至 `windows::core`；COM 实现入参 `Option<&T>` → `Ref<'_, T>`。
 
-[Unreleased]: https://github.com/huanfeng/wind-ui-rust/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/huanfeng/wind-ui-rust/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.8.3...v0.9.0
+[0.8.3]: https://github.com/huanfeng/wind-ui-rust/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/huanfeng/wind-ui-rust/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/huanfeng/wind-ui-rust/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.7.0...v0.8.0
+[0.7.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.6.0...v0.7.0
+[0.6.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.5.0...v0.6.0
+[0.5.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.4.1...v0.5.0
+[0.4.1]: https://github.com/huanfeng/wind-ui-rust/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.1.0...v0.2.0
