@@ -3153,4 +3153,36 @@ mod tests {
         handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(50, 50));
         assert_eq!(got.get(), 7, "render 前排空 pump，消息写入状态");
     }
+
+    /// 复现离屏截图路径（`--click`）：先 render 暖布局，再经 `handler.on_pointer` 合成
+    /// Down+Up，断言点击真的切了标签页。走的是宿主完整链路（坐标换算、dispatch、
+    /// 状态维护），比直接调 `tree.dispatch_pointer` 更贴近 `run_offscreen` 实况。
+    #[test]
+    fn offscreen_pointer_click_switches_tab_through_handler() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        let sel = crate::signal::signal(1usize);
+        let tabs = Element::tabs(
+            sel,
+            vec![("甲", Element::label("A")), ("乙", Element::label("B"))],
+        );
+        let app = App::new("t", 300, 200).content(tabs);
+        let mut handler = app.into_handler_for_test();
+        handler.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        // 首帧 render：暖布局（与 run_offscreen 首个 render 对应）。
+        handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        // 合成点击首项（scale=1，物理=逻辑）。首项左缘内侧，padding≥8 必落在第 0 项。
+        let at = Point::new(6, 20);
+        handler.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            at,
+            MouseButton::Left,
+        ));
+        handler.on_pointer(PointerEvent::single(PointerKind::Up, at, MouseButton::Left));
+        assert_eq!(sel.get(), 0, "离屏合成点击首个标签应把选中索引切到 0");
+    }
 }
