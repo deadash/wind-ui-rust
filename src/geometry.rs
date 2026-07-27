@@ -74,13 +74,42 @@ impl Rect {
     pub fn is_empty(&self) -> bool {
         self.w <= 0 || self.h <= 0
     }
-    /// 按缩放因子转为物理像素矩形。按边界（右/下）取整，避免四分量独立 round 漂移。
+    /// 按缩放因子转为物理像素矩形（**就近**取整）。按边界（右/下）取整，避免四分量独立 round 漂移。
+    ///
+    /// 语义是「不得超出」+「相邻无缝」：相邻逻辑矩形物理化后严丝合缝、既不留缝也不重叠，
+    /// 空矩形恒为空。裁剪 mask、图片 dst、脏区等定位/限制类用途都用它。
+    ///
+    /// 需要「必须容纳得下」（物理宽高不小于 `size × scale`）的场景用 [`Rect::scaled_out`]。
     pub fn scaled(&self, s: f32) -> Rect {
         let x0 = (self.x as f32 * s).round() as i32;
         let y0 = (self.y as f32 * s).round() as i32;
         let x1 = (self.right() as f32 * s).round() as i32;
         let y1 = (self.bottom() as f32 * s).round() as i32;
-        Rect::new(x0, y0, x1 - x0, y1 - y0)
+        Rect::new(x0, y0, (x1 - x0).max(0), (y1 - y0).max(0))
+    }
+
+    /// 按缩放因子转为物理像素矩形（**外扩**取整）：左/上 `floor`、右/下 `ceil`。
+    ///
+    /// 契约是物理宽高**不小于** `size × scale`——[`Rect::scaled`] 四条边各自 round，
+    /// 取整方向不一致时 `x1 - x0` 可能略小于 `w × scale`；文字测量阶段用
+    /// `ceil(物理宽 / scale)` 得到逻辑宽度，绘制阶段若反向换算出更窄的物理宽度，
+    /// DirectWrite/CoreText 就会把本应单行的文字最后一个字挤到下一行
+    /// （125%/175%/225% 等非整数 DPI 下尤其明显）。
+    ///
+    /// 代价是相邻矩形会重叠 1 物理像素、左上角可能比 `scaled()` 小 1 像素，
+    /// 故**只用于「容纳」语义**（排版最大宽度等），不要拿来做裁剪或定位。
+    ///
+    /// 空矩形恒返回空矩形：否则 `w == 0` 在非整数缩放下会外扩成 1 像素，
+    /// 调用方的 `is_empty()` 短路失效，完全滚出视野的内容会漏出 1 像素列。
+    pub fn scaled_out(&self, s: f32) -> Rect {
+        let x0 = (self.x as f32 * s).floor() as i32;
+        let y0 = (self.y as f32 * s).floor() as i32;
+        if self.is_empty() {
+            return Rect::new(x0, y0, 0, 0);
+        }
+        let x1 = (self.right() as f32 * s).ceil() as i32;
+        let y1 = (self.bottom() as f32 * s).ceil() as i32;
+        Rect::new(x0, y0, (x1 - x0).max(0), (y1 - y0).max(0))
     }
 
     /// 包含两矩形的最小外接矩形（空矩形被忽略）。
@@ -302,6 +331,128 @@ mod tests {
     fn rect_inset() {
         let r = Rect::new(0, 0, 100, 100).inset(Insets::all(10));
         assert_eq!(r, Rect::new(10, 10, 80, 80));
+    }
+
+    /// 常见 DPI 档位。125%/175%/225% 是 `x * s` 落在 .5 边界、四边取整方向最易分歧的档位。
+    const SCALES: [f32; 8] = [1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 3.0];
+
+    #[test]
+    fn rect_scaled_tiles_without_gap_or_overlap() {
+        // scaled() 的契约之一：相邻逻辑矩形物理化后严丝合缝。
+        // 留缝 → 元素之间出现 1px 亮线；重叠 → 后画的元素吃掉前一个 1 像素列。
+        // 裁剪 mask / 图片 dst / 脏区都依赖这个性质，勿改成外扩取整（那是 scaled_out 的活）。
+        for &s in &SCALES {
+            for x in -40..40 {
+                for w in 1..30 {
+                    let a = Rect::new(x, 0, w, 10).scaled(s);
+                    let b = Rect::new(x + w, 0, w, 10).scaled(s);
+                    assert_eq!(
+                        a.right(),
+                        b.x,
+                        "s={s} x={x} w={w}: 相邻矩形物理化后必须首尾相接，实得 {a:?} / {b:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rect_scaled_and_scaled_out_keep_empty() {
+        // 空矩形必须恒为空——clip_rect() 与 draw_image() 都靠 is_empty() 短路。
+        // 一旦零宽矩形被取整放大成 1 物理像素，完全滚出视野 / 尺寸为 0 的内容
+        // 会漏出 1 像素列，且白跑一遍 Mask 分配与合成。
+        for &s in &SCALES {
+            for v in -40..40 {
+                for r in [
+                    Rect::new(v, 3, 0, 20),  // 零宽
+                    Rect::new(3, v, 20, 0),  // 零高
+                    Rect::new(v, v, 0, 0),   // 全零
+                    Rect::new(v, v, -5, -5), // 负尺寸（intersect 之外的脏数据兜底）
+                ] {
+                    assert!(r.scaled(s).is_empty(), "s={s} {r:?}: scaled 后应仍为空");
+                    assert!(
+                        r.scaled_out(s).is_empty(),
+                        "s={s} {r:?}: scaled_out 后应仍为空"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rect_scaled_out_never_shrinks() {
+        // scaled_out() 的核心契约：物理宽高恒 >= 逻辑尺寸 × scale，一个像素都不能少。
+        for &s in &SCALES {
+            for x in -40..40 {
+                for w in 1..80 {
+                    let p = Rect::new(x, x + 7, w, w).scaled_out(s);
+                    let want = w as f32 * s;
+                    assert!(
+                        p.w as f32 >= want,
+                        "s={s} x={x} w={w}: 物理宽 {} < {want}",
+                        p.w
+                    );
+                    assert!(
+                        p.h as f32 >= want,
+                        "s={s} y={} h={w}: 物理高 {} < {want}",
+                        x + 7,
+                        p.h
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rect_scaled_out_contains_scaled() {
+        // scaled_out 恒为 scaled 的超集：把某条链路从 scaled 切到 scaled_out 只会放宽、
+        // 不会把已经画得下的内容截短。
+        for &s in &SCALES {
+            for x in -20..20 {
+                for w in 1..40 {
+                    let r = Rect::new(x, x + 5, w, w + 3);
+                    let (a, b) = (r.scaled(s), r.scaled_out(s));
+                    assert!(
+                        b.x <= a.x
+                            && b.y <= a.y
+                            && b.right() >= a.right()
+                            && b.bottom() >= a.bottom(),
+                        "s={s} {r:?}: scaled_out {b:?} 未包含 scaled {a:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn text_measure_roundtrip_never_clips_last_glyph() {
+        // issue #6 回归锚点：文字 measure 把物理宽度按 ceil(物理宽 / scale) 换回逻辑宽度，
+        // 布局据此给出 rect.w；绘制阶段算出的排版最大宽度必须仍装得下原始物理宽度，
+        // 否则 DirectWrite/CoreText 会把本应单行的文字最后一个字挤到下一行。
+        for &s in &SCALES {
+            for pw in 1..400 {
+                let logical_w = (pw as f32 / s).ceil() as i32; // measure 的回逻辑换算
+                for x in -20..20 {
+                    let layout_w = Rect::new(x, 0, logical_w, 20).scaled_out(s).w;
+                    assert!(
+                        layout_w >= pw,
+                        "s={s} x={x} 物理宽={pw} → 逻辑宽={logical_w} → 排版宽={layout_w}，装不下"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rect_scaled_may_shrink_hence_text_uses_scaled_out() {
+        // 反向锚定：证明上面那条不是空转——scaled() 确实会算出比 w×scale 更窄的物理宽度，
+        // 所以文字排版宽度必须走 scaled_out()，不能图省事用 rect.scaled(s).w。
+        let r = Rect::new(3, 0, 10, 10);
+        assert!(
+            (r.scaled(1.25).w as f32) < 10.0 * 1.25,
+            "125% 下 scaled() 应当截短"
+        );
+        assert!(r.scaled_out(1.25).w as f32 >= 10.0 * 1.25);
     }
 
     #[test]

@@ -278,7 +278,11 @@ impl TextEngine for CoreTextEngine {
         // 单行测量，判定是否需要折行（无换行符且整行宽 ≤ rect 宽 → 单行，支持水平滚动）。
         let probe = unsafe { CTLine::with_attributed_string(&attr) };
         let (line_w, ascent, descent, leading) = line_metrics(&probe);
-        let single = !text.contains('\n') && line_w <= prect.w as f64;
+        // 排版宽度用 scaled_out（外扩取整，恒 >= rect.w * s），与 measure 的 pmw = max_width * s
+        // 同源；prect.w 由四边各自 round 得来，可能略窄于 rect.w * s，使 measure 判定放得下的
+        // 文本在这里被提前折行（非整数 DPI 下末字掉到下一行）。定位仍用 prect。
+        let playout_w = rect.scaled_out(s).w as f64;
+        let single = !text.contains('\n') && line_w <= playout_w;
 
         CGContext::save_g_state(Some(&ctx));
         CGContext::set_allows_antialiasing(Some(&ctx), true);
@@ -314,7 +318,7 @@ impl TextEngine for CoreTextEngine {
             // 折行：framesetter 在 rect 宽内排版，段落样式负责水平对齐，整体垂直居中。
             let fs = unsafe { CTFramesetter::with_attributed_string(&attr) };
             let constraints = CGSize {
-                width: prect.w as f64,
+                width: playout_w,
                 height: f64::MAX,
             };
             let fit = unsafe {
@@ -335,9 +339,10 @@ impl TextEngine for CoreTextEngine {
                     x: prect.x as f64,
                     y: phf - (top_from_top + text_h),
                 },
-                // 高度多留 1px，避免末行被边界裁掉。
+                // 高度多留 1px，避免末行被边界裁掉。宽度与 constraints 同源，否则实际
+                // 排版宽度回落到 prect.w，suggest_frame_size 的换行结果对不上。
                 size: CGSize {
-                    width: prect.w as f64,
+                    width: playout_w,
                     height: text_h.ceil() + 1.0,
                 },
             };

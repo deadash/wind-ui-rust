@@ -323,8 +323,11 @@ impl TextEngine for DWriteEngine {
         let prect = rect.scaled(s);
         let pclip = clip.map(|c| c.scaled(s));
         let psize = size * s;
-        // 按物理 rect 宽度换行（与 measure 传入的物理 maxWidth 一致）。
-        let Some(layout) = self.layout(text, ts, psize, prect.w as f32) else {
+        // 换行宽度用 scaled_out（外扩取整，恒 >= rect.w * s），与 measure 传入的
+        // 物理 maxWidth（pmw = max_width * s）同源。用 prect.w 会因四边各自 round
+        // 而略窄于 rect.w * s，把本应单行的文字最后一字挤到下一行（非整数 DPI 典型）。
+        let layout_max_w = rect.scaled_out(s).w as f32;
+        let Some(layout) = self.layout(text, ts, psize, layout_max_w) else {
             return;
         };
         let mut m = DWRITE_TEXT_METRICS::default();
@@ -706,6 +709,45 @@ mod alpha_text_tests {
         );
         let d = darkest_red(&pm, 6, 40, 8, 40);
         assert!((96..=170).contains(&d), "50% 黑字块中心应为中灰，实得 {d}");
+    }
+
+    /// issue #6 回归：measure 判定为单行的文本，在非整数 DPI 下经 draw 的排版宽度
+    /// 换算后必须仍是单行。measure 把物理宽按 `ceil(物理宽 / scale)` 换回逻辑宽度，
+    /// 布局原样发回给 draw；draw 若用 `rect.scaled(s).w`（四边各自 round）当排版宽度，
+    /// 会比 `rect.w × scale` 略窄，DirectWrite 就把最后一个字挤到第二行。
+    #[test]
+    fn non_integer_dpi_keeps_measured_text_on_one_line() {
+        let mut eng = DWriteEngine::new();
+        let ts = crate::text::TextStyle::new(14.0);
+        // measure 的 ceil 会给出最多 1 逻辑像素的余量，多数文本宽度下正好吸收掉取整截短；
+        // 只有 `物理宽 / scale` 逼近整数时余量趋零才暴露。故扫一批长度找临界点，
+        // 而不是赌某一个字符串。
+        let full = "非整数DPI下不应折行的一行字abcdefghij0123456789";
+        let texts: Vec<String> = (4..=full.chars().count())
+            .map(|n| full.chars().take(n).collect())
+            .collect();
+        for s in [1.25f32, 1.5, 1.75, 2.25, 3.0] {
+            eng.set_scale(s);
+            for text in &texts {
+                let logical = eng.measure(text, &ts, None);
+                // x 取多个值：物理化取整的分歧只在 x*s 的小数部分落到特定区间时才暴露。
+                for x in 0..8 {
+                    let rect = Rect::new(x, 0, logical.w, logical.h);
+                    // 与 draw() 中排版宽度的算法保持同源。
+                    let layout_max_w = rect.scaled_out(s).w as f32;
+                    let layout = eng
+                        .layout(text, &ts, ts.size * s, layout_max_w)
+                        .expect("排版应成功");
+                    let mut m = DWRITE_TEXT_METRICS::default();
+                    unsafe { layout.GetMetrics(&mut m) }.expect("取度量应成功");
+                    assert_eq!(
+                        m.lineCount, 1,
+                        "s={s} x={x} {:?}: 逻辑宽 {} → 排版宽 {layout_max_w} 装不下 measure 出的单行文本",
+                        text, logical.w
+                    );
+                }
+            }
+        }
     }
 
     /// 测量缓存：相同输入命中不新增条目，不同字号/文本为不同键；结果稳定一致。
