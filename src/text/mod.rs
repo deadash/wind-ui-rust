@@ -174,3 +174,52 @@ impl TextEngine for NullTextEngine {
     ) {
     }
 }
+
+/// 测试用文字引擎：按 `\n` 显式换行与 `max_width` 折行，高度 = 行数 × 行高。
+///
+/// 与 [`NullTextEngine`] 互补——后者恒按单行返回，凡是依赖"文本变高"的布局
+/// （滚动区是否溢出、限高是否生效）用它测都会失真：内容永远只有一行高，
+/// 滚动条永远不出现，断言于是测了个寂寞。真实引擎（DirectWrite/CoreText）在
+/// 无窗口的测试环境下跑不起来，故以此桩近似其换行语义。
+///
+/// 宽度估算沿用 `NullTextEngine` 的 `字数 × 字号 × 0.6`，不追求与真实字体度量一致，
+/// 只保证"文本越长、行数越多、高度越大"这一单调性成立。
+pub struct LineAwareTextEngine;
+
+impl TextEngine for LineAwareTextEngine {
+    fn measure(&mut self, text: &str, ts: &TextStyle, max_width: Option<f32>) -> Size {
+        let char_w = ts.size * 0.6;
+        let line_h = ts.line_height_px().unwrap_or(ts.size);
+        let mut lines = 0usize;
+        let mut widest = 0.0f32;
+        for seg in text.split('\n') {
+            let w = seg.chars().count() as f32 * char_w;
+            match max_width {
+                // 超出可用宽 → 按整宽折行（向上取整）。
+                Some(mw) if mw > 0.0 && w > mw => {
+                    lines += (w / mw).ceil() as usize;
+                    widest = widest.max(mw);
+                }
+                _ => {
+                    lines += 1;
+                    widest = widest.max(w);
+                }
+            }
+        }
+        Size::new(
+            widest.ceil() as i32,
+            (lines.max(1) as f32 * line_h).ceil() as i32,
+        )
+    }
+    fn draw(
+        &mut self,
+        _pixmap: &mut Pixmap,
+        _text: &str,
+        _rect: Rect,
+        _color: Color,
+        _align: Align,
+        _ts: &TextStyle,
+        _clip: Option<Rect>,
+    ) {
+    }
+}

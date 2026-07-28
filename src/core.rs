@@ -31,6 +31,78 @@ pub type MenuFn = Box<dyn FnMut() -> Vec<crate::event::MenuItem>>;
 /// 失效矩形的抗锯齿外扩余量（逻辑像素）。与宿主局部重绘的余量同源。
 const DAMAGE_MARGIN: i32 = 2;
 
+/// 纵向滚动条几何（逻辑像素）。**唯一真相源**：`core` 的滚动容器绘制/命中、
+/// `ui::containers::VScrollbar`（多行输入框等自绘宿主）都从这里取值，避免两处漂移。
+///
+/// 此前 core 用 `track_w=6 / margin=2 / hit=10`、`VScrollbar` 用 `5 / 3 / 12`，
+/// 而 `VScrollbar` 的注释却声称"与 core paint 一致"——注释断言的一致性没有编译期约束，
+/// 抽成共享常量后才真正成立。
+pub mod scrollbar {
+    /// 轨道与滑块的视觉宽度。
+    pub const TRACK_W: f32 = 7.0;
+    /// 轨道距容器右缘（已计入 `WINDOW_EDGE_INSET`）的边距。
+    pub const MARGIN: f32 = 3.0;
+    /// 滑块最小高度：内容极长时不至于缩成一个点而抓不住。
+    pub const MIN_THUMB: f32 = 24.0;
+    /// 命中区宽度：比视觉宽度宽一倍有余，容忍手抖。
+    pub const HIT_W: i32 = 16;
+
+    /// 贴窗口右缘时滚动条整体额外内缩的距离。
+    ///
+    /// 无边框窗口在 `WM_NCHITTEST`（`platform::win32::handle_nchittest`）把客户区右缘
+    /// 8 逻辑 px 判为 `HTRIGHT` 缩放边框——落在那里的指针事件根本进不到客户区。滚动条
+    /// 原先画在 `[right-8, right-2]`，正好整条被压在缩放边框底下，看得见点不着。
+    ///
+    /// 取值恰为边框宽度本身，两个区间**边界相接而不重叠**：滚动条命中区止于
+    /// `right-8`，缩放边框始于 `right-8`。这是能让两者共存的最小内缩——再小一像素
+    /// 就会重新被边框吞掉，故不可低于 `win32::RESIZE_BORDER_LOGICAL`。
+    ///
+    /// 物理侧不会反超：边框物理宽 `(8 * dpi/96) as i32` 是**向下**取整，换算回逻辑坐标
+    /// 恒 ≤ 8，故任意 DPI（含非整数缩放）下这条边界都成立。
+    pub const WINDOW_EDGE_INSET: i32 = 8;
+
+    /// 滚动条在容器内实际占用的水平宽度（含内缩）。arrange 据此为内容让位。
+    pub fn occupied_w(edge_inset: i32) -> i32 {
+        (TRACK_W + MARGIN) as i32 + edge_inset
+    }
+
+    /// 滑块高度。绘制与拖动换算必须同源——否则拖起来会"跟不上鼠标"。
+    pub fn thumb_h(view_h: i32, content_h: i32) -> f32 {
+        if content_h <= 0 {
+            return MIN_THUMB;
+        }
+        let ratio = (view_h as f32 / content_h as f32).min(1.0);
+        (view_h as f32 * ratio).max(MIN_THUMB)
+    }
+
+    /// 拖动 1px 鼠标对应的 `scroll_y` 增量所依据的滑块行程（视口高减滑块高）。
+    pub fn travel(view_h: i32, content_h: i32) -> f32 {
+        (view_h as f32 - thumb_h(view_h, content_h)).max(1.0)
+    }
+
+    /// 轨道底衬色。`None` = 不画。
+    ///
+    /// 默认不画是有意的：滚动条是内容的轻量指示，常态下只露一截滑块即可。画满全高的
+    /// 底衬要么淡到没有意义，要么与滑块明度接近、整条糊成"全高一根"反而看不出当前
+    /// 位置在哪——底衬与滑块本就争同一段视觉预算，取舍下来滑块更重要。
+    pub fn track() -> Option<crate::geometry::Color> {
+        None
+    }
+
+    /// 滑块色。取自当前主题，**不用**固定的黑色半透明——后者在深色主题下会连滑块
+    /// 一起隐没（深底叠黑等于没画）。
+    ///
+    /// `active` 为拖动态，加深一档给出"抓住了"的反馈。
+    pub fn thumb(active: bool) -> crate::geometry::Color {
+        let p = &crate::theme::current().palette;
+        if active {
+            p.text_muted
+        } else {
+            p.border
+        }
+    }
+}
+
 /// 剪贴板读写抽象。由平台层提供实现，UiHost 注入到 `Tree`，控件经 `EventCtx` 访问。
 pub trait ClipboardProvider {
     fn get_text(&self) -> Option<String>;
@@ -172,6 +244,13 @@ pub struct Node {
     /// 必须在测量前生效，否则文字按更宽的可用宽排好版后才被裁掉——那是截断，不是限宽。
     /// 限宽的本意是让内容**在更窄的宽度内换行**，长正文的可读性正由此而来。
     pub max_width: i32,
+    /// 最大高度（0=无约束）：measure **后**对高度取上界。
+    ///
+    /// 与 `max_width` 不对称是刻意的：限宽必须在测量前收窄可用宽，否则文字会按更宽的
+    /// 宽度排完版才被裁（那是截断不是换行）；而高度方向没有"按高度重排"的语义，内容
+    /// 本就该按完整高度测量——滚动容器尤其依赖这一点，其 `content_h`（可滚动量的来源）
+    /// 正是完整内容高。故上界只收窄节点自身的占位，不影响内容测量。
+    pub max_height: i32,
     pub padding: Insets,
     pub margin: Insets,
     /// 自身对齐覆盖：None=继承容器交叉轴对齐；Some(a)=显式覆盖。
@@ -241,6 +320,12 @@ pub struct Tree {
     /// 丢弃整个 `EventOutcome`，其中的 toast 无处上交宿主；单独在此累积，由宿主在
     /// layout 后 `take_pending_toasts` 取走上屏（否则 `toast_sink` 等经信号触发的提示全被吞）。
     pending_toasts: Vec<ToastRequest>,
+    /// arrange 递归中当前节点父级的绝对左上角。
+    ///
+    /// `arrange` 全程使用相对父的坐标，但滚动条要判断"本容器是否贴着窗口右缘"必须知道
+    /// 绝对位置。arrange 是严格嵌套的深度优先遍历，故用一个成员变量当栈顶（进入时累加、
+    /// 退出时还原）即可，无需给 `arrange_*` 全家加参数。
+    arrange_origin: Point,
 }
 
 impl Default for Tree {
@@ -259,6 +344,7 @@ impl Tree {
             clipboard: None,
             reactive_nodes: Vec::new(),
             pending_toasts: Vec::new(),
+            arrange_origin: Point::new(0, 0),
         }
     }
 
@@ -442,12 +528,13 @@ impl Tree {
         hspec: MeasureSpec,
         text: &mut dyn TextEngine,
     ) -> Size {
-        let (layout, padding, min_width, max_width, visible) = match self.get(id) {
+        let (layout, padding, min_width, max_width, max_height, visible) = match self.get(id) {
             Some(n) => (
                 n.layout,
                 n.padding,
                 n.min_width,
                 n.max_width,
+                n.max_height,
                 n.effective_visible(),
             ),
             None => return Size::ZERO,
@@ -492,7 +579,13 @@ impl Tree {
         if max_width > 0 {
             resolved_w = resolved_w.min(max_width);
         }
-        let size = Size::new(resolved_w, hspec.resolve(desired_h));
+        // 限高只收窄本节点占位，内容已按完整高度测完（滚动容器的 content_h 因此不受影响，
+        // 溢出部分转为可滚动量而非被丢弃）。
+        let mut resolved_h = hspec.resolve(desired_h);
+        if max_height > 0 {
+            resolved_h = resolved_h.min(max_height);
+        }
+        let size = Size::new(resolved_w, resolved_h);
         if let Some(n) = self.get_mut(id) {
             n.measured = size;
         }
@@ -678,6 +771,9 @@ impl Tree {
             (bounds.w - padding.horizontal()).max(0),
             (bounds.h - padding.vertical()).max(0),
         );
+        // 进入子树前把本节点的绝对左上角推为新原点，退出时还原（见 `arrange_origin`）。
+        let saved_origin = self.arrange_origin;
+        self.arrange_origin = Point::new(saved_origin.x + bounds.x, saved_origin.y + bounds.y);
         match layout {
             Layout::None => {}
             Layout::Linear {
@@ -687,6 +783,38 @@ impl Tree {
             } => self.arrange_linear(id, inner, axis, spacing, cross),
             Layout::Frame => self.arrange_frame(id, inner),
             Layout::Scroll => self.arrange_scroll(id, inner),
+        }
+        self.arrange_origin = saved_origin;
+    }
+
+    /// 滚动条为避开窗口缩放边框需额外内缩的距离（见 `scrollbar::WINDOW_EDGE_INSET`）。
+    ///
+    /// `abs_right` 为滚动容器的绝对右边界。只有真正贴着窗口右缘的容器才内缩——对话框、
+    /// 表单里那些远离窗口边的滚动区保持原有紧凑外观，不平白多出一段空白。
+    /// 点 `p` 是否落在滚动条可抓取区（`abs` 为滚动容器绝对矩形）。
+    ///
+    /// 命中区比视觉宽度宽出一倍有余，且**有上界**：内缩出来的那 10px 归还给窗口缩放边框，
+    /// 不被滚动条抢走——两种操作各占一段、互不干扰。控件侧（`ScrollWidget`）经
+    /// `EventCtx::scrollbar_hit_zone` 取同一区间，判定不会与命中分发漂移。
+    pub fn in_scrollbar_hit_zone(&self, p: Point, abs: Rect) -> bool {
+        let (lo, hi) = self.scrollbar_hit_zone(abs);
+        p.x >= lo && p.x < hi
+    }
+
+    /// 滚动条可抓取区的 x 区间 `[lo, hi)`（绝对坐标）。
+    pub fn scrollbar_hit_zone(&self, abs: Rect) -> (i32, i32) {
+        let hi = abs.right() - self.scrollbar_edge_inset(abs.right());
+        (hi - scrollbar::HIT_W, hi)
+    }
+
+    fn scrollbar_edge_inset(&self, abs_right: i32) -> i32 {
+        let Some(root_w) = self.root.and_then(|r| self.get(r)).map(|n| n.bounds.w) else {
+            return 0;
+        };
+        if abs_right >= root_w - scrollbar::WINDOW_EDGE_INSET {
+            scrollbar::WINDOW_EDGE_INSET
+        } else {
+            0
         }
     }
 
@@ -702,8 +830,14 @@ impl Tree {
         if let Some(n) = self.get_mut(id) {
             n.scroll_y = scroll_y;
         }
-        // 可滚动时为右侧滚动条预留宽度，避免内容被遮挡。
-        let scrollbar_w = if content_h > inner.h { 8 } else { 0 };
+        // 可滚动时为右侧滚动条预留宽度，避免内容被遮挡。贴窗口右缘的容器滚动条会内缩，
+        // 预留宽度须同步加上内缩量，否则滚动条会盖到内容上。
+        let scrollbar_w = if content_h > inner.h {
+            let abs_right = self.arrange_origin.x + inner.x + inner.w;
+            scrollbar::occupied_w(self.scrollbar_edge_inset(abs_right))
+        } else {
+            0
+        };
         // 子节点从视口顶起按内容顺序堆叠，整体上移 scroll_y；over_scroll 为越界回弹瞬时偏移。
         let children = self.visible_children(id);
         let mut y = inner.y - scroll_y + over;
@@ -896,24 +1030,28 @@ impl Tree {
             }
         }
 
-        // 滚动条：内容高于视口时在右缘绘制纵向指示条。
+        // 滚动条：内容高于视口时在右缘绘制纵向指示条。贴窗口右缘时整体内缩，避开
+        // 被 WM_NCHITTEST 判为缩放边框的那一段（否则画得出来、点不着）。
         if matches!(n.layout, Layout::Scroll) && n.content_h > content.h {
-            let track_w = 6.0;
-            let tx = (abs.right() - track_w as i32 - 2) as f32;
+            let track_w = scrollbar::TRACK_W;
+            let inset = self.scrollbar_edge_inset(abs.right());
+            let tx = abs.right() as f32 - track_w - scrollbar::MARGIN - inset as f32;
             let ty = content.y as f32;
             let th = content.h as f32;
-            let ratio = content.h as f32 / n.content_h as f32;
-            let thumb_h = (th * ratio).max(24.0);
+            let thumb_h = scrollbar::thumb_h(content.h, n.content_h);
             let max_scroll = (n.content_h - content.h).max(1) as f32;
             let thumb_y = ty + (th - thumb_h) * (n.scroll_y as f32 / max_scroll);
-            let thumb = crate::theme::current().palette.border;
+            let r = track_w / 2.0;
+            if let Some(track) = scrollbar::track() {
+                canvas.fill_round_rect(tx, ty, track_w, th, r, &Paint::fill(track));
+            }
             canvas.fill_round_rect(
                 tx,
                 thumb_y,
                 track_w,
                 thumb_h,
-                track_w / 2.0,
-                &Paint::fill(thumb),
+                r,
+                &Paint::fill(scrollbar::thumb(false)),
             );
         }
 
@@ -1133,6 +1271,11 @@ impl EventCtx<'_> {
         } else {
             (0, 0, 0)
         }
+    }
+    /// 本滚动节点的滚动条可抓取区 x 区间 `[lo, hi)`（绝对坐标）。
+    /// 与 `Tree::hit_test` 的分发判定同源，避免"分发到了控件、控件却认为没点中"。
+    pub fn scrollbar_hit_zone(&self) -> (i32, i32) {
+        self.tree.scrollbar_hit_zone(self.bounds())
     }
     /// 直接设置滚动偏移（拖动滚动条用），下一帧 arrange 钳制范围。
     pub fn set_scroll(&mut self, y: i32) {
@@ -1543,10 +1686,9 @@ impl Tree {
             return None;
         }
         // 滚动条区域优先命中滚动容器自身（用于拖动滚动条，而非下方内容）。
-        // 命中区 10px 与 containers::SCROLLBAR_HIT_W 一致。
         if matches!(n.layout, Layout::Scroll) {
             let content = abs.inset(n.padding);
-            if n.content_h > content.h && p.x >= abs.right() - 10 {
+            if n.content_h > content.h && self.in_scrollbar_hit_zone(p, abs) {
                 return Some(id);
             }
         }
@@ -2624,17 +2766,95 @@ mod tests {
         let id = sc.build(&mut tree);
         tree.root = Some(id);
         let mut te = crate::text::NullTextEngine;
-        tree.layout_root(Size::new(100, 100), &mut te); // content_h=300, view=100
+        // content_h=300, view=100
+        tree.layout_root(Size::new(100, 100), &mut te);
+        // 容器贴窗口右缘 → 滚动条内缩，命中区止于 100 - WINDOW_EDGE_INSET。
+        let (lo, hi) = tree.scrollbar_hit_zone(tree.abs_bounds(id));
+        let expect_hi = 100 - scrollbar::WINDOW_EDGE_INSET;
+        assert_eq!((lo, hi), (expect_hi - scrollbar::HIT_W, expect_hi));
+        let x = (lo + hi) / 2;
         let (mut h, mut cap) = (None, None);
-        // 右缘滚动条区域按下（x>=88）→ 捕获滚动容器
-        let down = PointerEvent::single(PointerKind::Down, Point::new(95, 10), MouseButton::Left);
+        let down = PointerEvent::single(PointerKind::Down, Point::new(x, 10), MouseButton::Left);
         tree.dispatch_pointer(down, &mut h, &mut cap);
         assert_eq!(cap, Some(id), "滚动条区域按下应捕获滚动容器");
         // 向下拖 30px → 内容按 content/view 比例移动
-        let mv = PointerEvent::single(PointerKind::Move, Point::new(95, 40), MouseButton::Left);
+        let mv = PointerEvent::single(PointerKind::Move, Point::new(x, 40), MouseButton::Left);
         tree.dispatch_pointer(mv, &mut h, &mut cap);
         tree.layout_root(Size::new(100, 100), &mut te);
         assert!(tree.get(id).unwrap().scroll_y > 0, "拖动滚动条应增加偏移");
+    }
+
+    /// 贴窗口右缘的滚动条须整体内缩，把最外侧那圈让给 `WM_NCHITTEST` 的缩放边框——
+    /// 否则滚动条画得出来却永远收不到指针事件（本次修复的核心回归）。
+    fn scroll_tree_of_width(win_w: i32, container_w: i32) -> (Tree, NodeId) {
+        let mut sc = Element::scroll().width(container_w).height(100);
+        for _ in 0..10 {
+            sc = sc.child(Element::leaf().width_match().height(30));
+        }
+        // 用一个左对齐的行包住，使容器右缘可控地远离/贴近窗口右缘。
+        let root = Element::row().width(win_w).height(100).child(sc);
+        let mut tree = Tree::new();
+        let rid = root.build(&mut tree);
+        tree.root = Some(rid);
+        let mut te = crate::text::NullTextEngine;
+        tree.layout_root(Size::new(win_w, 100), &mut te);
+        let sid = tree.get(rid).unwrap().children[0];
+        (tree, sid)
+    }
+
+    #[test]
+    fn scrollbar_insets_only_when_flush_with_window_edge() {
+        // 贴右缘：命中区上界须停在窗口边缘内 WINDOW_EDGE_INSET 处。
+        let (tree, sid) = scroll_tree_of_width(200, 200);
+        let (_, hi) = tree.scrollbar_hit_zone(tree.abs_bounds(sid));
+        assert_eq!(hi, 200 - scrollbar::WINDOW_EDGE_INSET, "贴边容器应内缩让位");
+        // 缩放边框那一圈不再被滚动条抢走。
+        assert!(
+            !tree.in_scrollbar_hit_zone(Point::new(195, 50), tree.abs_bounds(sid)),
+            "最外侧应归还给窗口缩放边框"
+        );
+
+        // 远离右缘（对话框内的滚动区）：保持紧凑，不平白多出一段空白。
+        let (tree, sid) = scroll_tree_of_width(200, 100);
+        let (_, hi) = tree.scrollbar_hit_zone(tree.abs_bounds(sid));
+        assert_eq!(hi, 100, "非贴边容器不内缩");
+    }
+
+    /// 命中区必须有上界。旧实现是 `x >= right - 10` 的半开区间，等于宣称最右一切都归
+    /// 滚动条，与窗口缩放边框直接争抢。
+    #[test]
+    fn scrollbar_hit_zone_is_bounded_on_both_sides() {
+        let (tree, sid) = scroll_tree_of_width(200, 100);
+        let b = tree.abs_bounds(sid);
+        assert!(
+            !tree.in_scrollbar_hit_zone(Point::new(83, 50), b),
+            "左侧界外"
+        );
+        assert!(tree.in_scrollbar_hit_zone(Point::new(84, 50), b), "区间内");
+        assert!(tree.in_scrollbar_hit_zone(Point::new(99, 50), b), "区间内");
+        assert!(
+            !tree.in_scrollbar_hit_zone(Point::new(100, 50), b),
+            "右侧界外"
+        );
+    }
+
+    /// 预留宽度必须跟着内缩量走，否则贴边容器的滚动条会压到内容上。
+    #[test]
+    fn scroll_content_width_reserves_room_for_inset_scrollbar() {
+        let (tree, sid) = scroll_tree_of_width(200, 200);
+        let child = tree.get(sid).unwrap().children[0];
+        assert_eq!(
+            tree.get(child).unwrap().bounds.w,
+            200 - scrollbar::occupied_w(scrollbar::WINDOW_EDGE_INSET),
+            "贴边容器内容宽须让出滚动条 + 内缩量"
+        );
+        let (tree, sid) = scroll_tree_of_width(200, 100);
+        let child = tree.get(sid).unwrap().children[0];
+        assert_eq!(
+            tree.get(child).unwrap().bounds.w,
+            100 - scrollbar::occupied_w(0),
+            "非贴边容器只让出滚动条本身"
+        );
     }
 
     /// 限宽必须在**测量前**收窄可用宽：节点撑满可用宽时，最终宽应被上界收住。
@@ -2678,6 +2898,35 @@ mod tests {
         let tree = layout(root, 400, 100);
         let child = tree.get(tree.root.unwrap()).unwrap().children[0];
         assert_eq!(tree.get(child).unwrap().measured.w, 200);
+    }
+
+    /// 限高封顶节点占位，但**不得**削减滚动容器的 `content_h`——溢出部分要转成可滚动量，
+    /// 而不是在测量阶段就被丢掉（否则限高等于截断，滚动条根本不会出现）。
+    #[test]
+    fn max_height_caps_node_but_keeps_scrollable_content() {
+        let mut sc = Element::scroll().width(100).max_height(80);
+        for _ in 0..10 {
+            sc = sc.child(Element::leaf().width_match().height(30));
+        }
+        let root = Element::col().width(200).height(400).child(sc);
+        let tree = layout(root, 200, 400);
+        let sid = tree.get(tree.root.unwrap()).unwrap().children[0];
+        let n = tree.get(sid).unwrap();
+        assert_eq!(n.measured.h, 80, "节点占位应被限高收住");
+        assert_eq!(n.content_h, 300, "内容高须保持完整，供滚动使用");
+    }
+
+    /// 上界是上界，不是固定高：内容比上界矮时不该被撑高（对话框才能自然收缩）。
+    #[test]
+    fn max_height_leaves_short_content_alone() {
+        let sc = Element::scroll()
+            .width(100)
+            .max_height(220)
+            .child(Element::leaf().width_match().height(40));
+        let root = Element::col().width(200).height(400).child(sc);
+        let tree = layout(root, 200, 400);
+        let sid = tree.get(tree.root.unwrap()).unwrap().children[0];
+        assert_eq!(tree.get(sid).unwrap().measured.h, 40);
     }
 
     /// 行高直接改变文字节点的占位高度（`NullTextEngine` 如实反映倍数）。

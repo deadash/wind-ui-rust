@@ -14,10 +14,6 @@ use crate::style::Style;
 use crate::text::TextEngine;
 use crate::ui::ImageContent;
 
-/// 滚动条右缘可抓取宽度（与 core::hit_node 的命中区一致）。
-const SCROLLBAR_HIT_W: i32 = 10;
-/// 滚动条 thumb 最小高（与 core paint 一致）。
-const SCROLLBAR_MIN_THUMB: f32 = 24.0;
 /// 标签内图标与文字间距。
 const TAB_ICON_GAP: i32 = 8;
 /// 每个标签的左右内边距（标签之间不再留 spacing，靠它自然分隔且使 hover 区连续）。
@@ -27,6 +23,10 @@ const TAB_PAD_MIN: i32 = 8;
 
 /// 可嵌入任意控件的垂直滚动条辅助器（非独立 Widget）。
 /// 封装绘制样式与拖动状态，由宿主控件在 `paint` / `on_event` 中调用。
+///
+/// 几何常量取自 `core::scrollbar`（唯一真相源）。**不含**窗口边缘内缩逻辑：现有宿主
+/// （多行输入框）恒嵌在有内边距的表单/对话框里，右缘不会贴到窗口缩放边框；若将来有
+/// 宿主要贴边铺满，需比照 `core::Tree::scrollbar_edge_inset` 补内缩。
 pub struct VScrollbar {
     pub dragging: bool,
     start_y: i32,
@@ -45,13 +45,13 @@ impl Default for VScrollbar {
 
 impl VScrollbar {
     /// 轨道视觉宽度（px）。
-    pub const TRACK_W: f32 = 5.0;
+    pub const TRACK_W: f32 = crate::core::scrollbar::TRACK_W;
     /// 上下及右侧边距（px）。
-    pub const MARGIN: f32 = 3.0;
+    pub const MARGIN: f32 = crate::core::scrollbar::MARGIN;
     /// 滑块最小高度（px）。
-    pub const MIN_THUMB: f32 = 16.0;
+    pub const MIN_THUMB: f32 = crate::core::scrollbar::MIN_THUMB;
     /// 命中区宽度（比视觉宽，容易点到）。
-    pub const HIT_W: i32 = 12;
+    pub const HIT_W: i32 = crate::core::scrollbar::HIT_W;
 
     pub fn new() -> Self {
         Self {
@@ -68,6 +68,9 @@ impl VScrollbar {
         (bounds.h as f32 - 2.0 * Self::MARGIN).max(0.0)
     }
 
+    /// 滑块高度。这里的基准是**轨道高** `bar_h`（已扣掉上下 `MARGIN`），与 core 直接用
+    /// 视口高的版本差一个常量留白，故不能直接复用 `core::scrollbar::thumb_h`；
+    /// 下界 `MIN_THUMB` 仍取共享常量。
     fn thumb_h(bar_h: f32, content_h: i32, view_h: i32) -> f32 {
         let ratio = (view_h as f32 / content_h as f32).min(1.0);
         (bar_h * ratio).max(Self::MIN_THUMB)
@@ -110,25 +113,21 @@ impl VScrollbar {
         let travel = (bh - th).max(1.0);
         let ty = by + Self::MARGIN + travel * (scroll_y as f32 / max);
         let r = Self::TRACK_W / 2.0;
-        // 轨道（几乎透明）
-        canvas.fill_round_rect(
-            bx,
-            by + Self::MARGIN,
-            Self::TRACK_W,
-            bh,
-            r,
-            &Paint::fill(Color::rgba(0, 0, 0, 0x14)),
-        );
-        // 滑块（拖动时加深）
-        let alpha = if self.dragging { 0x78u8 } else { 0x52u8 };
-        canvas.fill_round_rect(
-            bx,
-            ty,
-            Self::TRACK_W,
-            th,
-            r,
-            &Paint::fill(Color::rgba(0, 0, 0, alpha)),
-        );
+        // 配色取自主题（同 core 的滚动条）：写死黑色半透明会在深色主题下把滑块一起隐没。
+        // 轨道默认不画，只露滑块。
+        if let Some(track) = crate::core::scrollbar::track() {
+            canvas.fill_round_rect(
+                bx,
+                by + Self::MARGIN,
+                Self::TRACK_W,
+                bh,
+                r,
+                &Paint::fill(track),
+            );
+        }
+        // 滑块（拖动时加深，给出"抓住了"的反馈）
+        let thumb = crate::core::scrollbar::thumb(self.dragging);
+        canvas.fill_round_rect(bx, ty, Self::TRACK_W, th, r, &Paint::fill(thumb));
     }
 
     /// 按下处理：命中则开始拖动，返回 `true`。
@@ -209,10 +208,12 @@ impl Widget for ScrollWidget {
                 true
             }
             PointerKind::Down => {
-                // 命中到这里且在右缘滚动条区域时启动拖动（hit_node 已优先派发）。
-                let b = ctx.bounds();
+                // 命中到这里且在滚动条可抓取区时启动拖动（hit_node 已优先派发）。
+                // 区间取自 ctx，与 hit_node 的判定同源——贴窗口边的容器滚动条整体内缩，
+                // 这里若还按 `right - HIT_W` 自行推算就会错开一个内缩量。
+                let (lo, hi) = ctx.scrollbar_hit_zone();
                 let (scroll_y, content_h, view_h) = ctx.scroll_metrics();
-                if content_h > view_h && p.pos.x >= b.right() - SCROLLBAR_HIT_W {
+                if content_h > view_h && p.pos.x >= lo && p.pos.x < hi {
                     self.dragging = true;
                     self.start_y = p.pos.y;
                     self.start_scroll = scroll_y;
@@ -226,10 +227,8 @@ impl Widget for ScrollWidget {
                 let (_, content_h, view_h) = ctx.scroll_metrics();
                 if view_h > 0 && content_h > view_h {
                     let max_scroll = content_h - view_h;
-                    // 按 thumb 实际行程换算，精确反演绘制映射（thumb_h 与 core 同公式）。
-                    let thumb_h =
-                        (view_h as f32 * view_h as f32 / content_h as f32).max(SCROLLBAR_MIN_THUMB);
-                    let travel = (view_h as f32 - thumb_h).max(1.0);
+                    // 按 thumb 实际行程换算，精确反演绘制映射（与 core paint 同源公式）。
+                    let travel = crate::core::scrollbar::travel(view_h, content_h);
                     let dy = p.pos.y - self.start_y;
                     let delta = (dy as f32 * max_scroll as f32 / travel) as i32;
                     ctx.set_scroll((self.start_scroll + delta).clamp(0, max_scroll));

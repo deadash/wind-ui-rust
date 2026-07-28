@@ -802,6 +802,8 @@ pub struct Element {
     /// 最小宽度下界（None=无）：配合 Wrap 宽实现自适应但不小于该值，见 [`Element::min_width`]。
     min_width: Option<i32>,
     max_width: Option<i32>,
+    /// 最大高度上界（None=无）：配合 Wrap 高实现"短则收缩、长则封顶"，见 [`Element::max_height`]。
+    max_height: Option<i32>,
     padding: Insets,
     margin: Insets,
     align: Option<Align>,
@@ -833,6 +835,7 @@ impl Element {
             height: Dimension::Wrap,
             min_width: None,
             max_width: None,
+            max_height: None,
             padding: Insets::default(),
             margin: Insets::default(),
             align: None,
@@ -2398,6 +2401,20 @@ impl Element {
         self.max_width = Some(px);
         self
     }
+    /// 最大高度（逻辑像素）。节点占位封顶于此，内容仍按完整高度测量。
+    ///
+    /// 与滚动容器是天生一对：`Element::scroll()` 的高度默认按内容自适应，加上本上界即得
+    /// 「内容短则对话框自然收缩、内容长则封顶并可滚动」——不必为了给长内容留余地而
+    /// 写死一个高度，让短内容那边空出一大片。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// Element::scroll().width_match().max_height(220).child(Element::label("很长的说明……"));
+    /// ```
+    pub fn max_height(mut self, px: i32) -> Self {
+        self.max_height = Some(px);
+        self
+    }
     pub fn height_match(mut self) -> Self {
         self.height = Dimension::Match;
         self
@@ -2599,6 +2616,7 @@ impl Element {
             height: self.height,
             min_width: self.min_width.unwrap_or(0),
             max_width: self.max_width.unwrap_or(0),
+            max_height: self.max_height.unwrap_or(0),
             padding: self.padding,
             margin: self.margin,
             align: self.align,

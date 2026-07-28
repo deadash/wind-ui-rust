@@ -1122,6 +1122,13 @@ unsafe fn handle_nccalcsize(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     LRESULT(0)
 }
 
+/// 无边框窗口缩放边框宽度（逻辑像素）。
+///
+/// 这一圈会在 `WM_NCHITTEST` 阶段就把指针事件截走，**永远进不到客户区**——任何贴着窗口
+/// 边缘绘制的可点元素都会被它吞掉。滚动条正是踩过这个坑的受害者，现由
+/// `core::scrollbar::WINDOW_EDGE_INSET`（略大于此值）整体内缩避让；两者须一同调整。
+const RESIZE_BORDER_LOGICAL: i32 = 8;
+
 /// 无边框窗口自定义命中：窗口边缘 N px 内返回缩放命中；否则查拖动区
 /// （HTCAPTION）或普通客户区（HTCLIENT）。
 unsafe fn handle_nchittest(hwnd: HWND, lparam: LPARAM) -> LRESULT {
@@ -1141,9 +1148,9 @@ unsafe fn handle_nchittest(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     if interactive {
         return LRESULT(HTCLIENT as isize);
     }
-    // 缩放边框宽度（物理像素，按 DPI 放大）。
+    // 缩放边框宽度（物理像素，按 DPI 放大；逻辑上恒为 RESIZE_BORDER_LOGICAL）。
     let dpi = GetDpiForWindow(hwnd).max(96);
-    let m = ((8.0 * dpi as f32 / 96.0) as i32).max(4);
+    let m = ((RESIZE_BORDER_LOGICAL as f32 * dpi as f32 / 96.0) as i32).max(4);
     let (left, right) = (pt.x < m, pt.x >= w - m);
     let (top, bottom) = (pt.y < m, pt.y >= h - m);
     let ht: i32 = if top && left {
