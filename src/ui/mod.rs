@@ -3202,6 +3202,70 @@ mod tests {
         );
     }
 
+    /// 自绘控件可按当前命中项动态给出提示，且优先于节点静态文本；
+    /// 返回 None 时回退到静态文本。
+    #[test]
+    fn widget_tooltip_overrides_static_and_falls_back() {
+        struct Chart {
+            hit: std::rc::Rc<std::cell::Cell<Option<u8>>>,
+        }
+        impl crate::core::Widget for Chart {
+            fn measure(
+                &self,
+                _a: crate::geometry::Size,
+                _s: &crate::style::Style,
+                _t: &mut dyn crate::text::TextEngine,
+            ) -> crate::geometry::Size {
+                crate::geometry::Size::new(100, 30)
+            }
+            fn tooltip(&self) -> Option<String> {
+                self.hit.get().map(|i| format!("第 {i} 项"))
+            }
+        }
+
+        let hit = std::rc::Rc::new(std::cell::Cell::new(None));
+        let tree = layout(
+            Element::col().fill().child(
+                Element::leaf()
+                    .widget(Chart { hit: hit.clone() })
+                    .width(100)
+                    .height(30)
+                    .tooltip("静态说明"),
+            ),
+        );
+        let node = tree.hit_test(Point::new(20, 15)).expect("应命中图表");
+
+        // 未命中数据点 → 回退到节点静态文本。
+        assert_eq!(tree.node_tooltip(node).as_deref(), Some("静态说明"));
+
+        // 命中某项 → 控件的动态文案胜出。
+        hit.set(Some(3));
+        assert_eq!(tree.node_tooltip(node).as_deref(), Some("第 3 项"));
+    }
+
+    /// 无静态 tooltip 的自绘控件，未命中时不应弹出空提示。
+    #[test]
+    fn widget_tooltip_absent_yields_none() {
+        struct Silent;
+        impl crate::core::Widget for Silent {
+            fn measure(
+                &self,
+                _a: crate::geometry::Size,
+                _s: &crate::style::Style,
+                _t: &mut dyn crate::text::TextEngine,
+            ) -> crate::geometry::Size {
+                crate::geometry::Size::new(50, 20)
+            }
+        }
+        let tree = layout(
+            Element::col()
+                .fill()
+                .child(Element::leaf().widget(Silent).width(50).height(20)),
+        );
+        let node = tree.hit_test(Point::new(10, 10)).expect("应命中控件");
+        assert_eq!(tree.node_tooltip(node), None);
+    }
+
     #[test]
     fn drop_skips_disabled_subtree() {
         let got = signal(0u32);

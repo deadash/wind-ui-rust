@@ -191,6 +191,17 @@ pub trait Widget {
     fn text_truncated(&self) -> Option<bool> {
         None
     }
+    /// 控件自报的悬停提示，**优先于**节点上 `.tooltip(..)` 设的静态文本。
+    ///
+    /// 给自绘控件用：图表类控件整个是一个节点，提示内容取决于指针落在哪个数据点上
+    /// （日历热力图的哪一格、柱状图的哪一根），静态文本表达不了。控件在
+    /// [`Widget::on_event`] 里记下当前命中项，这里据此返回对应文案；未命中返回
+    /// `None`，宿主即回退到节点静态文本（没有则不弹）。
+    ///
+    /// 每帧在悬停节点上调用，实现应只读已有状态、不做重计算。
+    fn tooltip(&self) -> Option<String> {
+        None
+    }
 }
 
 /// 容器/纯样式节点占位控件。
@@ -1440,6 +1451,11 @@ impl Tree {
     /// 原语义正常返回，不受影响。
     pub fn node_tooltip(&self, id: NodeId) -> Option<String> {
         let n = self.get(id)?;
+        // 控件动态提示优先：自绘图表按指针所在的数据点给文案，静态文本给不了
+        // （见 [`Widget::tooltip`]）。返回 None 才回退到节点上设的静态文本。
+        if let Some(dynamic) = n.widget.tooltip() {
+            return Some(dynamic);
+        }
         let text = n.tooltip.clone()?;
         if n.widget.text_truncated() == Some(false) {
             return None;
