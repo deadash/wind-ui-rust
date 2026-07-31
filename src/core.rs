@@ -185,6 +185,15 @@ pub trait Widget {
     fn hit_opaque(&self) -> bool {
         true
     }
+    /// 本节点在**窗口拖动区判定**（`Tree::drag_hit_at`）中是否透明。true（仅模态遮罩）
+    /// = 拖动判定时穿透到其下层兄弟，使无边框窗口的自绘标题栏在对话框弹出后仍可拖窗。
+    /// 只影响 `WM_NCHITTEST` 侧的 HTCAPTION 判定，**不影响事件分发与交互控件判定**——
+    /// 遮罩照常吞掉指针事件、照常屏蔽标题栏上的窗口按钮，模态语义不变。
+    /// 覆写为 true 的容器必须自带背景（对话框面板都设了 `Role::Surface`），否则面板
+    /// 空白区会一并穿透、被误判成拖动区。
+    fn scrim_passthrough(&self) -> bool {
+        false
+    }
     /// 单行省略配置下，最近一次绘制的文本是否被实际截断。`None`=本控件不具备
     /// 该概念（如按钮/容器），`Some(false)`=配了省略但当前完整放得下、未截断。
     /// 供 [`Tree::node_tooltip`] 判定：仅在文本确被截断时才弹出与其重复的悬浮提示。
@@ -1475,8 +1484,10 @@ impl Tree {
 
     /// `pos`（逻辑坐标）是否落在窗口拖动区（自定义标题栏）。命中的是可聚焦控件
     /// （按钮等）则不拖动——交控件处理；否则自身或任一祖先标了 `window_drag` 即可拖。
+    /// 走穿透遮罩的命中（见 [`Tree::hit_test_for_drag`]）：模态对话框弹出时标题栏
+    /// 仍可拖窗，但窗口按钮照旧被遮罩屏蔽（`interactive_hit_at` 用的是普通命中）。
     pub fn drag_hit_at(&self, pos: Point) -> bool {
-        let Some(hit) = self.hit_test(pos) else {
+        let Some(hit) = self.hit_test_for_drag(pos) else {
             return false;
         };
         if self.get(hit).map(|n| n.widget.focusable()).unwrap_or(false) {
@@ -1684,10 +1695,19 @@ impl Tree {
     /// 命中测试：返回包含该点的最深可见节点。
     pub fn hit_test(&self, p: Point) -> Option<NodeId> {
         let root = self.root?;
-        self.hit_node(root, p, Point::new(0, 0))
+        self.hit_node(root, p, Point::new(0, 0), false)
     }
 
-    fn hit_node(&self, id: NodeId, p: Point, origin: Point) -> Option<NodeId> {
+    /// 拖动区专用命中：同 [`Tree::hit_test`]，但模态遮罩（`Widget::scrim_passthrough`）
+    /// 不落定、继续穿透到下层兄弟。供 [`Tree::drag_hit_at`] 判断标题栏——对话框弹出后
+    /// 遮罩覆盖全窗，普通命中会停在遮罩上，标题栏因此失去 HTCAPTION、拖不动窗口。
+    fn hit_test_for_drag(&self, p: Point) -> Option<NodeId> {
+        let root = self.root?;
+        self.hit_node(root, p, Point::new(0, 0), true)
+    }
+
+    /// `for_drag`：拖动区判定模式，遇 `scrim_passthrough` 节点穿透（见 `hit_test_for_drag`）。
+    fn hit_node(&self, id: NodeId, p: Point, origin: Point, for_drag: bool) -> Option<NodeId> {
         let n = self.get(id)?;
         if !n.effective_visible() {
             return None;
@@ -1718,10 +1738,16 @@ impl Tree {
             // 倒序遍历子节点：后绘制者在上层，优先命中。
             let child_origin = Point::new(abs.x, abs.y);
             for &c in n.children.iter().rev() {
-                if let Some(hit) = self.hit_node(c, p, child_origin) {
+                if let Some(hit) = self.hit_node(c, p, child_origin, for_drag) {
                     return Some(hit);
                 }
             }
+        }
+        // 拖动区判定：模态遮罩自身不落定，穿透到下层兄弟（标题栏在其下），
+        // 使对话框弹出后仍能拖窗。遮罩内的面板有背景、会在上面的子遍历里落定，
+        // 故被面板压住的标题栏区域仍判为不可拖。
+        if for_drag && n.widget.scrim_passthrough() {
+            return None;
         }
         // 子节点都未命中：仅当本节点「吞命中」时在此落定；否则穿透（None），
         // 让父节点继续测试其下层兄弟。防止透明纯布局容器（尤其根级全窗覆盖层，

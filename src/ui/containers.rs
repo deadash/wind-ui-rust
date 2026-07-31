@@ -253,6 +253,12 @@ impl Widget for ModalScrim {
         // 仅吞指针事件；键盘仍可冒泡（如 Escape 关闭由宿主处理）。
         matches!(ev, Event::Pointer(_))
     }
+
+    fn scrim_passthrough(&self) -> bool {
+        // 仅对窗口拖动区判定透明：无边框窗口弹出对话框后，自绘标题栏仍可拖窗
+        // （遮罩照常吞事件、照常屏蔽标题栏窗口按钮）。见 `Widget::scrim_passthrough`。
+        true
+    }
 }
 
 /// 可点击容器三态。

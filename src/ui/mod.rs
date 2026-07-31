@@ -1750,6 +1750,11 @@ impl Element {
 
     /// 模态对话框：全窗半透明遮罩 + 居中内容，遮罩吞掉指针事件实现模态。
     /// `show` 绑定显示标志。
+    ///
+    /// 无边框窗口下遮罩对**窗口拖动区判定**透明（`ModalScrim::scrim_passthrough`）：
+    /// 对话框弹出后自绘标题栏仍可拖窗，窗口按钮则照旧被模态屏蔽。因此 `content`
+    /// 面板须自带背景（`bg_role(Role::Surface)` 等），否则面板空白区会穿透遮罩、
+    /// 让其下的标题栏被误判成拖动区。
     pub fn dialog(show: Signal<bool>, content: Element) -> Self {
         // 注册到宿主的对话框信号栈，使 ESC / WM_CLOSE 能优先关闭此对话框。
         crate::app::register_modal(show);
@@ -3139,6 +3144,67 @@ mod tests {
         assert!(
             !tree.interactive_hit_at(Point::new(40, 20)),
             "标题文字区不应判为交互控件"
+        );
+    }
+
+    /// 在 200×200 窗口里布局「顶部标题栏 + 模态对话框」，面板尺寸由参数给定。
+    fn layout_titlebar_with_modal(panel_w: i32, panel_h: i32) -> Tree {
+        let show = crate::signal::signal(true);
+        let titlebar = Element::row()
+            .width_match()
+            .height(40)
+            .window_drag()
+            .child(Element::label("标题").width(120).height(40))
+            .child(
+                Element::window_button(WindowButtonKind::Close)
+                    .width(46)
+                    .height(40),
+            );
+        layout(
+            Element::stack()
+                .fill()
+                .child(Element::col().fill().child(titlebar))
+                .child(Element::dialog(
+                    show,
+                    Element::col()
+                        .width(panel_w)
+                        .height(panel_h)
+                        .bg_role(crate::style::Role::Surface),
+                )),
+        )
+    }
+
+    #[test]
+    fn window_drag_survives_modal_scrim() {
+        // 回归：模态遮罩全窗覆盖，普通命中会停在遮罩上，导致无边框窗口弹出对话框后
+        // 标题栏拿不到 HTCAPTION、整窗拖不动。拖动判定须穿透遮罩（scrim_passthrough）。
+        let tree = layout_titlebar_with_modal(120, 80); // 居中面板 y 60..140，不压标题栏
+        assert!(
+            tree.drag_hit_at(Point::new(40, 20)),
+            "对话框弹出时，遮罩下的标题栏文字区仍应可拖窗"
+        );
+        assert!(
+            !tree.drag_hit_at(Point::new(130, 20)),
+            "窗口按钮区仍不拖窗（交按钮处理）"
+        );
+        // 模态语义不变：遮罩照旧屏蔽标题栏窗口按钮（交互判定走普通命中，不穿透）。
+        assert!(
+            !tree.interactive_hit_at(Point::new(130, 20)),
+            "模态期间窗口按钮应被遮罩屏蔽，不判为交互控件"
+        );
+    }
+
+    #[test]
+    fn modal_panel_over_titlebar_blocks_drag() {
+        // 面板自身压住标题栏的部分不可拖——按的是对话框内容，不是标题栏。
+        let tree = layout_titlebar_with_modal(120, 200); // 居中面板 x 40..160，y 0..200
+        assert!(
+            !tree.drag_hit_at(Point::new(100, 20)),
+            "被对话框面板压住的标题栏区域不应拖窗"
+        );
+        assert!(
+            tree.drag_hit_at(Point::new(20, 20)),
+            "面板左侧露出的标题栏区域仍可拖窗"
         );
     }
 
