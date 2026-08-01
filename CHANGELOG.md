@@ -5,6 +5,11 @@
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-01
+
+本版本集中修无边框窗口下的交互缺陷——滚动条被窗口缩放边框压住、弹出对话框后整窗拖不动，
+另有文本控件选区与插入光标的渲染增强，以及非整数 DPI 下末字误换行的修复。
+
 ### Added
 - **`Widget::tooltip()` 动态悬停提示**：控件可按当前指针位置自报提示文本，优先于节点上
   `.tooltip(..)` 设的静态文本，返回 `None` 则回退到静态文本（没有则不弹）。
@@ -12,6 +17,36 @@
   （日历热力图的哪一格、柱状图的哪一根），静态文本表达不了。控件在 `on_event` 里记下
   命中项、在 `tooltip()` 里据此返回文案即可，浮层的延时/跟随/边缘翻转仍由宿主统一处理。
   默认实现返回 `None`，既有控件不受影响。
+- **`Element::max_height(px)` 限高**：只收窄节点占位，不削减滚动容器的 `content_h`
+  ——限高的滚动区仍可滚到全部内容。
+- **`Rect::scaled_out(scale)`**：左/上 `floor`、右/下 `ceil` 的物理化，契约为物理宽高不
+  小于 `size × scale`、空矩形恒为空。`scaled()` 保持 `round` 语义，裁剪 mask 与相邻矩形
+  仍无缝不重叠。
+
+### Changed
+- **插入光标改反色渲染**：光标条铺好后裁到光标矩形、用输入框底色把本行文字重画一遍，
+  落在光标宽度内的字形笔画因此翻成底色（等同经典 XOR 插入符的观感）。光标与文字同色时
+  压在笔画上会粘连、看不出落点，反色后不再沉进文字里。不走 difference 混合是因为 D2D
+  后端的 `SetPrimitiveBlend` 只有 SourceOver/Copy/Min/Add，真反相需改走 `ID2D1Effect`
+  离屏合成或每帧 GPU 读回。
+
+### Fixed
+- **无边框窗口弹出对话框后整窗拖不动**：模态遮罩全窗覆盖且自带背景，命中测试停在遮罩上，
+  自绘标题栏因此拿不到 `HTCAPTION`。拖动区判定改走穿透遮罩的命中（新增
+  `Widget::scrim_passthrough`，仅 `ModalScrim` 覆写），遮罩内的面板仍会在子遍历里先落定
+  ——被面板压住的标题栏区域照旧不可拖。事件分发与交互控件判定不受影响：遮罩照常吞指针
+  事件、照常屏蔽标题栏上的窗口按钮，模态语义不变。
+- **选区高亮改按行盒全高铺底**：`TextInput` 原先上下各内缩 2px、`RichText` 按碎片自身高
+  铺底，`p`/`{` 等下伸部露在高亮外，多行选中还在行与行之间留白缝。现在纵向一律取行盒
+  ——混排字号同行顶底齐平、相邻行首尾相接。
+- **滚动条避开窗口缩放边框**：无边框窗口把客户区右缘 8 逻辑 px 判为 `HTRIGHT`，贴边的
+  滚动条整条压在缩放边框底下，看得见点不着。贴窗口右缘的滚动容器整体内缩 8px 与边框相接
+  （不贴边的容器如对话框内滚动区保持原有紧凑外观），命中区由 10px 加宽至 16px 且两侧有界；
+  滑块配色改取主题角色——原先写死的黑色半透明在深色主题下会连滑块一起隐没，轨道底衬默认不画。
+- **非整数 DPI 下文字末字误换行**（125%/175%/225% 等档位）：`Rect::scaled()` 四条边各自
+  `round`，取整方向不一致时物理宽会比 `w × scale` 略窄，据此反向换算出的排版宽度装不下原
+  文本，DirectWrite/CoreText 便把本应单行的最后一个字挤到下一行。排版最大宽度改用
+  `scaled_out()`，与 measure 的 `max_width × scale` 同源；定位仍走 `scaled()`。（#6）
 
 ## [0.9.0] - 2026-07-23
 
@@ -252,7 +287,8 @@
 - **windows-rs 0.58 → 0.62 迁移**：`implement` 宏改由 `windows-core` 提供；可空句柄参数
   语义化为 `Option<T>`；`BOOL` 迁至 `windows::core`；COM 实现入参 `Option<&T>` → `Ref<'_, T>`。
 
-[Unreleased]: https://github.com/huanfeng/wind-ui-rust/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/huanfeng/wind-ui-rust/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/huanfeng/wind-ui-rust/compare/v0.8.3...v0.9.0
 [0.8.3]: https://github.com/huanfeng/wind-ui-rust/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/huanfeng/wind-ui-rust/compare/v0.8.1...v0.8.2
