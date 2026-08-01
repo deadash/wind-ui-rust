@@ -1449,11 +1449,13 @@ impl Widget for TextInput {
                     } else {
                         ln.x[b - ln.start]
                     };
+                    // 铺满整个行盒（不内缩）：对齐系统文本控件——`p`/`{` 等下伸部
+                    // 完整包住，且多行选中时行与行之间无横向白缝（行距 == line_h）。
                     canvas.fill_rect(
                         (base_x + x1) as f32,
-                        (ly + 2) as f32,
+                        ly as f32,
                         (x2 - x1) as f32,
-                        (line_h - 4) as f32,
+                        line_h as f32,
                         &Paint::fill(inp.selection(pal)),
                     );
                 }

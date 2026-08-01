@@ -482,6 +482,11 @@ struct Frag {
     rect: Rect,
     /// 文字矩形：高恰为该文字自然行高——引擎"矩形内垂直居中"即顶对齐，落在基线上。
     text_rect: Rect,
+    /// 所在视觉行的行盒纵向范围（行顶 y、行盒高 = 全行 max ascent + max descent）。
+    /// 选区高亮按行盒铺满而非按碎片 `rect`：混排字号/chip 时同行选区顶底齐平、
+    /// 下伸部（`p`/`{`）完整包住，且相邻行首尾相接——多行选中无横向白缝。
+    line_top: i32,
+    line_h: i32,
     /// 基线距 text_rect 顶（画下划线/删除线用）。
     ascent: f32,
     style: FragStyle,
@@ -800,6 +805,10 @@ impl Walker<'_> {
         }
         let asc = line.iter().map(Item::box_ascent).fold(0.0f32, f32::max);
         let desc = line.iter().map(Item::box_descent).fold(0.0f32, f32::max);
+        // 行盒：所有碎片共用，供选区高亮铺满整行（碎片自身 rect 只有各自文字高）。
+        // 与下方 `self.y` 的推进量同源，故相邻行的选区首尾相接、不留白缝。
+        let line_top = self.y;
+        let line_h = (asc + desc).ceil() as i32;
         let mut x = x0;
         for it in line.drain(..) {
             let top = self.y + (asc - it.box_ascent()).round() as i32;
@@ -812,6 +821,8 @@ impl Walker<'_> {
                 text: it.text,
                 rect,
                 text_rect,
+                line_top,
+                line_h,
                 ascent: it.ascent,
                 style: it.style,
                 chevron: it.chevron,
@@ -1606,15 +1617,17 @@ impl Widget for RichText {
         }
 
         // 选区高亮：先于文字整片铺底（空白碎片也在碎片列表里，词隙不断档）。
+        // 纵向按行盒铺满（非碎片自身高）：对齐系统文本控件——下伸部完整包住、
+        // 同行混排字号顶底齐平、多行选中行与行之间无白缝。
         if let Some((a, b)) = self.sel.get() {
             let (a, b) = (a.min(b), a.max(b).min(lay.frags.len().saturating_sub(1)));
             let selc = th.rich.selection(pal);
             for f in lay.frags.iter().take(b + 1).skip(a) {
                 canvas.fill_rect(
                     (content.x + f.rect.x) as f32,
-                    (content.y + f.rect.y) as f32,
+                    (content.y + f.line_top) as f32,
                     f.rect.w as f32,
-                    f.rect.h as f32,
+                    f.line_h as f32,
                     &Paint::fill(selc),
                 );
             }
@@ -2070,6 +2083,49 @@ mod tests {
         assert_eq!(frags.len(), 2);
         assert_eq!(frags[0].rect.y, 11, "小字应下沉到公共基线");
         assert_eq!(frags[1].rect.y, 0, "大字决定行盒、顶对齐");
+    }
+
+    #[test]
+    fn selection_box_covers_full_line_height() {
+        // 回归：选区曾按碎片自身 rect 铺，混排字号时小字高亮只有 11..25、
+        // 与大字顶底参差，下伸部也露在高亮外。行盒（0..28）才是正确铺底范围。
+        let doc = RichDoc::new().para(Para::new().text("a").span("b", SpanStyle::new().size(28.0)));
+        let rt = RichText::new(doc);
+        let style = Style::default();
+        rt.measure(Size::new(500, 0), &style, &mut crate::text::NullTextEngine);
+        let cache = rt.cache.borrow();
+        let frags = &cache.as_ref().unwrap().frags;
+        for (i, f) in frags.iter().enumerate() {
+            assert_eq!(f.line_top, 0, "碎片 {i} 行盒顶应为行起点");
+            assert_eq!(f.line_h, 28, "碎片 {i} 应共用大字号决定的行盒高");
+        }
+        assert!(
+            frags[0].line_h > frags[0].rect.h,
+            "小字碎片的行盒应高于其自身框（14），否则高亮仍参差"
+        );
+    }
+
+    #[test]
+    fn adjacent_line_selection_boxes_touch() {
+        // 回归：多行选中的行与行之间不得留白缝——上一行行盒底须正好是下一行行盒顶。
+        // 宽 20 只装两个 CJK 字（9px/字），"汉汉汉汉" 排成两行、行高各 14。
+        let doc = RichDoc::new().para("汉汉汉汉");
+        let rt = RichText::new(doc);
+        let style = Style::default();
+        rt.measure(Size::new(20, 0), &style, &mut crate::text::NullTextEngine);
+        let cache = rt.cache.borrow();
+        let frags = &cache.as_ref().unwrap().frags;
+        let second = frags.iter().find(|f| f.line == 1).expect("应折出第二行");
+        assert_eq!(
+            second.line_top,
+            frags[0].line_top + frags[0].line_h,
+            "下一行行盒顶应紧接上一行行盒底"
+        );
+        // 同一行内所有碎片共用行盒（横向连片，无高低差）。
+        for f in frags.iter().filter(|f| f.line == 0) {
+            assert_eq!(f.line_top, frags[0].line_top);
+            assert_eq!(f.line_h, frags[0].line_h);
+        }
     }
 
     #[test]
