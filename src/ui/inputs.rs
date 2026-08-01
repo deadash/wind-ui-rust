@@ -679,6 +679,9 @@ const TEXT_PAD: i32 = 10;
 const NO_WRAP_W: i32 = 100_000;
 /// 选区跨行时行尾延伸宽度（标示换行/折行被选中）。
 const SEL_EOL_EXTRA: i32 = 6;
+/// 插入光标宽度（逻辑 px）。反色渲染在此宽度内翻转字形笔画：过窄则压在笔画上时
+/// 断口不够醒目，过宽会啃掉字形。1px 与系统插入符一致。
+const CARET_W: i32 = 1;
 /// 密码掩码字符（U+2022 BULLET）。
 const PASSWORD_MASK: char = '\u{2022}';
 
@@ -1462,6 +1465,7 @@ impl Widget for TextInput {
             }
         }
 
+        let chars: Vec<char> = disp.chars().collect();
         if is_empty {
             let pr = Rect::new(inner.x, first_line_y, inner.w, line_h);
             canvas.draw_text(
@@ -1472,7 +1476,6 @@ impl Widget for TextInput {
                 ts,
             );
         } else {
-            let chars: Vec<char> = disp.chars().collect();
             for (i, ln) in lay.lines.iter().enumerate() {
                 let ly = first_line_y + i as i32 * line_h;
                 if ly + line_h < inner.y || ly > inner.y + inner.h {
@@ -1494,14 +1497,30 @@ impl Widget for TextInput {
         // 组合态期间不画自绘光标：系统组合浮层自带随组合进度前进的光标，
         // 两者并存会显得我们的光标"卡在组合开始前"。
         if focused && !self.composing.get() {
-            canvas.draw_line(
-                cxx as f32,
-                (ly + 2) as f32,
-                cxx as f32,
-                (ly + line_h - 2) as f32,
-                1.0,
+            // 反色光标：先铺光标条，再裁到光标矩形、用输入框底色把本行文字重画一遍。
+            // 于是压在字形笔画上的那一段翻成浅色（等同经典 XOR 插入符的观感），
+            // 光标不会沉进深色文字里认不出位置；笔画之外仍是纯粹的光标条。
+            //
+            // 之所以用「重画一遍再裁剪」而不是 difference 混合：D2D 后端（本库默认）
+            // 的 SetPrimitiveBlend 只有 SourceOver/Copy/Min/Add，真反相要么改走
+            // ID2D1Effect 离屏合成、要么每帧 GPU 读回，代价都远超此处所值。
+            let caret = Rect::new(cxx, ly + 2, CARET_W, line_h - 4);
+            canvas.fill_rect(
+                caret.x as f32,
+                caret.y as f32,
+                caret.w as f32,
+                caret.h as f32,
                 &Paint::fill(inp.cursor(pal)),
             );
+            if let Some(ln) = lay.lines.get(cl).filter(|ln| ln.end > ln.start) {
+                let s: String = chars[ln.start..ln.end].iter().collect();
+                canvas.save();
+                canvas.clip_rect(caret);
+                // 与常规绘制同一 rect/ts，只换颜色：同次排版故字形逐像素对齐。
+                let tr = Rect::new(base_x, ly, NO_WRAP_W, line_h);
+                canvas.draw_text(&s, tr, inp.bg(pal), Align::Start, ts);
+                canvas.restore();
+            }
         }
         canvas.restore();
 
