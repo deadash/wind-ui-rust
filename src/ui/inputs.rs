@@ -1517,8 +1517,9 @@ impl Widget for TextInput {
                 canvas.save();
                 canvas.clip_rect(caret);
                 // 与常规绘制同一 rect/ts，只换颜色：同次排版故字形逐像素对齐。
+                // 取本次实际填的底色（非 inp.bg），背景逻辑再变反色也自动跟随。
                 let tr = Rect::new(base_x, ly, NO_WRAP_W, line_h);
-                canvas.draw_text(&s, tr, inp.bg(pal), Align::Start, ts);
+                canvas.draw_text(&s, tr, bg, Align::Start, ts);
                 canvas.restore();
             }
         }
