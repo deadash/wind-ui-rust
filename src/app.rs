@@ -1408,6 +1408,17 @@ impl UiHost {
         changed
     }
 
+    /// 关闭浮层菜单，并标记下一帧整窗重绘。
+    ///
+    /// 浮层画在控件树之上、不属于任何节点，故不在任何控件的交互脏区内。而 `render` 的
+    /// `overlay` 判定问的是"**本帧**有没有浮层"——关闭帧已经没有了，此时若恰好存在一小块
+    /// 脏区（如打开菜单时清 hover 触发的边框补间仍在跑），就会走局部重绘，只擦那一小块，
+    /// 面板像素留在屏上。关闭浮层必经此处，勿直接写 `self.menu = None`。
+    fn close_menu(&mut self) {
+        self.menu = None;
+        self.needs_full = true;
+    }
+
     /// 菜单激活时处理指针；返回是否需重绘。
     fn handle_menu_pointer(&mut self, ev: PointerEvent) -> bool {
         match ev.kind {
@@ -1454,7 +1465,7 @@ impl UiHost {
                 // 常规 Down：关闭菜单（命中叶子项执行后关 / 点外关）。
                 self.swallow_up = true;
                 let Some(k) = self.menu.as_ref().and_then(|m| m.level_at(ev.pos)) else {
-                    self.menu = None; // 点击所有面板之外：关闭
+                    self.close_menu(); // 点击所有面板之外：关闭
                     return true;
                 };
                 // 同步悬停路径（保证子菜单按当前指针展开）。
@@ -1471,7 +1482,7 @@ impl UiHost {
                             .clone()
                     });
                 if let Some(f) = trailing_hit {
-                    self.menu = None;
+                    self.close_menu();
                     f();
                     return true;
                 }
@@ -1494,7 +1505,7 @@ impl UiHost {
                             return true;
                         }
                         let target = self.menu.as_ref().unwrap().target;
-                        self.menu = None;
+                        self.close_menu();
                         match item.action {
                             MenuAction::SendKey(key) => {
                                 let res = self.tree.dispatch_key(key, Some(target));
@@ -2274,7 +2285,7 @@ impl AppHandler for UiHost {
         // 菜单激活时：Escape 关闭，其余键吞掉（避免在菜单后误编辑）。
         if self.menu.is_some() {
             if ev.key == Key::Escape {
-                self.menu = None;
+                self.close_menu();
             }
             return true;
         }
@@ -3299,6 +3310,54 @@ mod tests {
         ));
         handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(120, 120));
         assert!(!handler.last_frame_full, "无结构变化的点击应走局部重绘");
+    }
+
+    #[test]
+    fn closing_menu_repaints_full() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        // 回归：关闭浮层的那一帧必须整窗——菜单画在控件树之上，局部重绘只擦交互脏区，
+        // 面板像素会残留在屏上。overlay 判定读的是"本帧有没有浮层"，而关闭帧已经没有了，
+        // 恰好此时补间还在跑（打开时 hover 清零触发边框补间）就会带着小脏区走局部路径。
+        let app = App::new("t", 200, 200).content(Element::col().width(200).height(200).child(
+            Element::dropdown(vec!["甲", "乙", "丙"], crate::signal::signal(0usize)).width(120),
+        ));
+        let mut handler = app.into_handler_for_test();
+        handler.set_scale(1.0);
+        let mut pm = Pixmap::new(200, 200).unwrap();
+        handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(200, 200));
+
+        // 点控件展开菜单。
+        let on_ctl = Point::new(40, 12);
+        handler.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            on_ctl,
+            MouseButton::Left,
+        ));
+        handler.on_pointer(PointerEvent::single(
+            PointerKind::Up,
+            on_ctl,
+            MouseButton::Left,
+        ));
+        handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(200, 200));
+        assert!(handler.menu.is_some(), "应已展开菜单");
+        assert!(handler.last_frame_full, "有浮层的帧本就整窗");
+
+        // 点面板外关闭：这一帧浮层已消失，必须整窗把面板像素擦掉。
+        let outside = Point::new(190, 190);
+        handler.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            outside,
+            MouseButton::Left,
+        ));
+        handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(200, 200));
+        assert!(handler.menu.is_none(), "点面板外应关闭菜单");
+        assert!(
+            handler.last_frame_full,
+            "关闭浮层的那一帧必须整窗，否则面板像素残留"
+        );
     }
 
     #[test]
