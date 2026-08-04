@@ -238,6 +238,14 @@ pub struct MenuItem {
     pub trailing_icon: Option<String>,
     /// 点击尾随图标的回调，与主项 `action` 完全独立；`None` 则图标不可点击（仅展示）。
     pub on_trailing_click: Option<std::rc::Rc<dyn Fn()>>,
+    /// 粘滞项：点击执行 `action` 后菜单保持展开（复选菜单的开关项）。
+    /// 默认 `false`——单选下拉/右键菜单里"点中即完成决定"，理应关闭。
+    /// 粘滞项每次点击只翻转一个状态，决定要到点面板外才算完成，故不关。
+    /// 需配合 [`MenuRequest::rebuild`] 才能在原地刷新勾选态。
+    ///
+    /// 仅对 [`MenuAction::Run`] 有效：`SendKey` 是"把按键交给控件、菜单退场"的语义，
+    /// 与粘滞矛盾——粘滞的 `SendKey` 项点击后按键不派发，只保持展开。
+    pub stay_open: bool,
 }
 
 /// 空动作（分隔线/子菜单父项占位，永不执行）。
@@ -261,6 +269,7 @@ impl MenuItem {
             badge: None,
             trailing_icon: None,
             on_trailing_click: None,
+            stay_open: false,
         }
     }
     /// 便捷构造：标签 + 闭包动作。
@@ -278,6 +287,7 @@ impl MenuItem {
             badge: None,
             trailing_icon: None,
             on_trailing_click: None,
+            stay_open: false,
         }
     }
     /// 分隔线项。
@@ -295,6 +305,7 @@ impl MenuItem {
             badge: None,
             trailing_icon: None,
             on_trailing_click: None,
+            stay_open: false,
         }
     }
     /// 级联子菜单父项：悬停展开 `items`。
@@ -312,6 +323,7 @@ impl MenuItem {
             badge: None,
             trailing_icon: None,
             on_trailing_click: None,
+            stay_open: false,
         }
     }
     /// 设置前置图标（字符/emoji）。
@@ -349,6 +361,16 @@ impl MenuItem {
         self.on_trailing_click = Some(std::rc::Rc::new(on_click));
         self
     }
+    /// 标记为粘滞项：点击执行后菜单保持展开（见 [`MenuItem::stay_open`]）。
+    pub fn stay_open(mut self) -> Self {
+        self.stay_open = true;
+        self
+    }
+    /// 设置启用态（禁用项变灰且不可点击）。
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
     /// 是否可点击执行（非分隔、无子菜单、启用）。
     pub fn is_actionable(&self) -> bool {
         !self.separator && self.submenu.is_empty() && self.enabled
@@ -366,6 +388,12 @@ pub struct MenuRequest {
     /// 下拉控件自身的顶部 y（逻辑坐标）：空间不足时菜单向上翻转，避免遮住控件。
     /// 普通右键菜单留 None，不需要翻转语义。
     pub anchor_top: Option<i32>,
+    /// 项重建器：粘滞项（[`MenuItem::stay_open`]）点击后调用它重新生成整棵项树，
+    /// 使勾选态/标签在菜单不关闭的前提下原地刷新。`None` 则粘滞项点击后菜单内容不变。
+    ///
+    /// 面板宽度与位置**不随重建变化**——项文本变化会让面板忽宽忽窄，而指针正停在
+    /// 上面准备点下一项。宽度以首次弹出的测量结果为准。
+    pub rebuild: Option<std::rc::Rc<dyn Fn() -> Vec<MenuItem>>>,
 }
 
 /// 轻提示语义类型：决定提示图标（及默认强调色）。

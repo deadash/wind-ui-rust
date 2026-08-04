@@ -1322,6 +1322,7 @@ impl EventCtx<'_> {
             items,
             min_width,
             anchor_top: None,
+            rebuild: None,
         });
         self.out.repaint = true;
     }
@@ -1336,6 +1337,28 @@ impl EventCtx<'_> {
             items,
             min_width: bounds.w,
             anchor_top: Some(bounds.y),
+            rebuild: None,
+        });
+        self.out.repaint = true;
+    }
+    /// 复选菜单专用：同 [`show_dropdown_menu`](Self::show_dropdown_menu) 的定位与翻转，
+    /// 但项由 `rebuild` 生成，且粘滞项（[`MenuItem::stay_open`]）点击后会再次调用它
+    /// 原地刷新勾选态——菜单保持展开，可连点多个开关。项为空则不弹。
+    pub fn show_check_menu(
+        &mut self,
+        bounds: crate::geometry::Rect,
+        rebuild: std::rc::Rc<dyn Fn() -> Vec<MenuItem>>,
+    ) {
+        let items = rebuild();
+        if items.is_empty() {
+            return;
+        }
+        self.out.menu = Some(MenuRequest {
+            pos: Point::new(bounds.x, bounds.y + bounds.h),
+            items,
+            min_width: bounds.w,
+            anchor_top: Some(bounds.y),
+            rebuild: Some(rebuild),
         });
         self.out.repaint = true;
     }
@@ -1973,6 +1996,7 @@ impl Tree {
                                 items,
                                 min_width: 0,
                                 anchor_top: None,
+                                rebuild: None,
                             });
                             res.consumed = true;
                         }

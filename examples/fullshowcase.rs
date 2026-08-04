@@ -84,6 +84,7 @@ fn main() {
     let dark = signal(false);
     let notify = signal(true);
     let beta = signal(false);
+    let (hide_disabled, show_special) = (signal(true), signal(false));
     let quality = signal(1usize);
     let lang = signal(0usize);
     let volume = signal(0.7f32);
@@ -114,6 +115,23 @@ fn main() {
                 .child(row(
                     "界面语言",
                     Element::dropdown(vec!["简体中文", "English", "日本語"], lang).width_match(),
+                ))
+                .child(row(
+                    "列表显示",
+                    Element::check_menu(
+                        "列表显示",
+                        vec![
+                            CheckMenuItem::check("隐藏未启用", hide_disabled),
+                            CheckMenuItem::check("显示特殊项", show_special),
+                            CheckMenuItem::separator(),
+                            CheckMenuItem::action("恢复默认", || {}),
+                        ],
+                    )
+                    .summary(|on| match on.len() {
+                        0 => "列表显示".to_string(),
+                        n => format!("列表显示 ({n})"),
+                    })
+                    .width_match(),
                 ))
                 .child(row("深色主题", Element::switch(dark)))
                 .child(row("接收通知", Element::checkbox("启用推送通知", notify)))

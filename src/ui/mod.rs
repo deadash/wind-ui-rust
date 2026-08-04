@@ -42,7 +42,7 @@ pub use nav::{AccordionHeader, CollapsibleHeader, ExpandState, NavRow};
 pub use progress::ProgressBar;
 pub use rich::{Para, RichColor, RichDoc, RichText, SpanStyle};
 pub use segmented::SegmentedControl;
-pub use select::{Dropdown, DropdownItem};
+pub use select::{CheckMenu, CheckMenuItem, Dropdown, DropdownItem};
 pub use sortable_table::SortStyle;
 pub use stepper::Stepper;
 pub use window_buttons::{WindowButton, WindowButtonKind};
@@ -1459,6 +1459,50 @@ impl Element {
         selected: Signal<usize>,
     ) -> Self {
         Self::base(Layout::None).widget(select::Dropdown::with_items_reactive(items, selected))
+    }
+
+    /// 下拉式复选菜单：外观同 `dropdown`，面板里的开关项**点击后菜单不关闭**，
+    /// 可连点多个；点面板外才收起。项支持开关 / 动作 / 分隔线混排，
+    /// 见 [`select::CheckMenuItem`]。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// # let (hide, special) = (signal(false), signal(false));
+    /// Element::check_menu("列表显示", vec![
+    ///     CheckMenuItem::check("隐藏未启用", hide).on_change(|v| println!("{v}")),
+    ///     CheckMenuItem::check("显示特殊方案", special),
+    ///     CheckMenuItem::separator(),
+    ///     CheckMenuItem::action("全部展开", || {}),
+    /// ]).width(132);
+    /// ```
+    pub fn check_menu(title: impl Into<String>, items: Vec<select::CheckMenuItem>) -> Self {
+        Self::base(Layout::None).widget(select::CheckMenu::new(title, items))
+    }
+
+    /// 复选菜单的收起态文案生成器：入参是**已开启**的开关项标签（按声明顺序），
+    /// 默认恒显示标题。摘要会改变控件宽度，建议同时 `.width(..)` 固定，
+    /// 否则工具栏会随开关增减而抖动。仅 `Element::check_menu(..)` 可用。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// Element::check_menu("列表显示", vec![])
+    ///     .summary(|on| match on.len() {
+    ///         0 => "列表显示".to_string(),
+    ///         n => format!("列表显示 ({n})"),
+    ///     })
+    ///     .width(132);
+    /// ```
+    pub fn summary(mut self, f: impl Fn(&[&str]) -> String + 'static) -> Self {
+        if let Some(m) = self
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<select::CheckMenu>())
+        {
+            m.set_summary(f);
+        } else {
+            debug_assert!(false, "summary() 仅适用于 Element::check_menu(..)");
+        }
+        self
     }
 
     /// 数字步进（绑定 `Signal<f64>`，带范围与步长；小数位由步长推断）。

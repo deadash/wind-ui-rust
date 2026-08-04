@@ -106,8 +106,9 @@ pub(crate) fn run_offscreen(cfg: &WindowConfig, handler: &mut Box<dyn AppHandler
         };
         handler.render(&mut tgt, size);
     }
-    // 可选：合成一次左键单击（Down+Up），捕获下拉展开等。
-    if let Some((lx, ly)) = cfg.screenshot_click {
+    // 可选：依次合成左键单击（Down+Up），捕获下拉展开等。多个 `--click` 按序回放，
+    // 用于验证需要连续点击才能到达的状态（如复选菜单连点多个开关而菜单不关）。
+    for &(lx, ly) in &cfg.screenshot_clicks {
         let pos = Point::new(
             (lx as f32 * s).round() as i32,
             (ly as f32 * s).round() as i32,
@@ -215,8 +216,9 @@ pub struct WindowConfig {
     pub screenshot_scale: f32,
     /// 截屏前合成一次右键按下（逻辑坐标），用于验证右键菜单等交互视觉。
     pub screenshot_rclick: Option<(i32, i32)>,
-    /// 截屏前合成一次左键单击（逻辑坐标，Down+Up），用于验证下拉展开等交互视觉。
-    pub screenshot_click: Option<(i32, i32)>,
+    /// 截屏前依次回放的左键单击（逻辑坐标，各合成 Down+Up），用于验证下拉展开等交互视觉。
+    /// 多个点按序回放，可捕获需连续点击才能到达的状态（如复选菜单连点多个开关）。
+    pub screenshot_clicks: Vec<(i32, i32)>,
     /// 截屏前合成一次悬停（逻辑坐标 Move）并等待超过提示延时，用于验证 tooltip 等悬停视觉。
     pub screenshot_hover: Option<(i32, i32)>,
     /// 系统托盘图标（None=不创建）。窗口创建后安装，窗口销毁时自动清理。
@@ -252,7 +254,7 @@ impl Default for WindowConfig {
             screenshot: None,
             screenshot_scale: 1.0,
             screenshot_rclick: None,
-            screenshot_click: None,
+            screenshot_clicks: Vec::new(),
             screenshot_hover: None,
             tray: None,
             hotkeys: Vec::new(),

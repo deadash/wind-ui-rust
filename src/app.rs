@@ -237,12 +237,47 @@ struct ContextMenu {
     levels: Vec<MenuLevel>,
     /// 发起菜单的控件（合成按键的派发目标）。
     target: NodeId,
+    /// 项重建器（见 [`crate::event::MenuRequest::rebuild`]）：粘滞项点击后原地刷新。
+    rebuild: Option<Rc<dyn Fn() -> Vec<MenuItem>>>,
 }
 
 impl ContextMenu {
     /// 命中点落在最深（最上层）的哪一级面板内。
     fn level_at(&self, p: Point) -> Option<usize> {
         self.levels.iter().rposition(|l| l.rect.contains(p))
+    }
+
+    /// 粘滞项点击后原地刷新各级项：沿 `spawn` 路径把重建结果逐级换进去，
+    /// **保留每级的 rect/scroll/hover**（见 `MenuRequest::rebuild` 关于宽度不变的说明）。
+    /// 重建后项数变少导致某级的 spawn 越界或不再是子菜单父项时，截断其后的级。
+    fn refresh_items(&mut self) {
+        let Some(rb) = self.rebuild.clone() else {
+            return;
+        };
+        let mut items = rb();
+        let mut keep = self.levels.len();
+        for k in 0..self.levels.len() {
+            let next_spawn = self.levels.get(k + 1).and_then(|l| l.spawn);
+            let sub = next_spawn
+                .and_then(|i| items.get(i))
+                .map(|it| it.submenu.clone());
+            self.levels[k].has_icons = items.iter().any(|it| it.icon.is_some());
+            self.levels[k].content_h =
+                items.iter().map(menu_item_height).sum::<i32>() + 2 * MENU_VPAD;
+            self.levels[k].items = items;
+            let max_sc = self.levels[k].max_scroll();
+            self.levels[k].scroll = self.levels[k].scroll.clamp(0, max_sc);
+            match sub {
+                // 子菜单父项仍在：继续把它的子项换进下一级。
+                Some(s) if !s.is_empty() => items = s,
+                // 下一级已无来源（项没了/不再有子菜单）：截断到本级。
+                _ => {
+                    keep = k + 1;
+                    break;
+                }
+            }
+        }
+        self.levels.truncate(keep);
     }
 }
 
@@ -354,7 +389,7 @@ impl App {
                 screenshot: None,
                 screenshot_scale: 1.0,
                 screenshot_rclick: None,
-                screenshot_click: None,
+                screenshot_clicks: Vec::new(),
                 screenshot_hover: None,
                 tray: None,
                 hotkeys: Vec::new(),
@@ -473,12 +508,16 @@ impl App {
             }
         }
         // --click X Y：截屏前合成左键单击，验证下拉展开等交互视觉。
-        if let Some(i) = args.iter().position(|a| a == "--click") {
+        // 可重复出现，按序回放（如展开复选菜单后连点两个开关，验证菜单不关）。
+        for (i, a) in args.iter().enumerate() {
+            if a != "--click" {
+                continue;
+            }
             if let (Some(x), Some(y)) = (
                 args.get(i + 1).and_then(|s| s.parse::<i32>().ok()),
                 args.get(i + 2).and_then(|s| s.parse::<i32>().ok()),
             ) {
-                self.cfg.screenshot_click = Some((x, y));
+                self.cfg.screenshot_clicks.push((x, y));
             }
         }
         // --hover X Y：截屏前在 (X,Y) 合成悬停并等待超过提示延时，验证 tooltip 等悬停视觉。
@@ -1251,6 +1290,7 @@ impl UiHost {
         self.menu = Some(ContextMenu {
             levels: vec![level],
             target,
+            rebuild: req.rebuild,
         });
     }
 
@@ -1442,6 +1482,17 @@ impl UiHost {
                 });
                 if let Some(item) = hit {
                     if item.is_actionable() {
+                        // 粘滞项（复选菜单的开关）：执行后菜单留在原地并刷新勾选态，
+                        // 可连点多个开关；点面板外才关（见上方 level_at 为 None 的分支）。
+                        if item.stay_open {
+                            if let MenuAction::Run(f) = item.action {
+                                f();
+                            }
+                            if let Some(m) = self.menu.as_mut() {
+                                m.refresh_items();
+                            }
+                            return true;
+                        }
                         let target = self.menu.as_ref().unwrap().target;
                         self.menu = None;
                         match item.action {
@@ -1552,6 +1603,7 @@ impl UiHost {
                     badge: None,
                     trailing_icon: None,
                     on_trailing_click: None,
+                    stay_open: false,
                 };
                 if let Some(target) = self.focus.or(self.tree.root) {
                     self.open_menu(
@@ -1560,6 +1612,7 @@ impl UiHost {
                             items: vec![item],
                             min_width: 0,
                             anchor_top: None,
+                            rebuild: None,
                         },
                         target,
                     );
@@ -2782,6 +2835,7 @@ mod tests {
         app.menu = Some(ContextMenu {
             levels: vec![level],
             target,
+            rebuild: None,
         });
 
         let rect = app.menu.as_ref().unwrap().levels[0].rect;
@@ -2804,6 +2858,117 @@ mod tests {
         assert!(trashed.get(), "点击尾随图标应触发其自身回调");
         assert!(!selected.get(), "点击尾随图标不应触发主项 action（选中）");
         assert!(app.menu.is_none(), "点击后菜单应关闭");
+    }
+
+    #[test]
+    fn sticky_item_keeps_menu_open_and_refreshes_checks() {
+        // 复选菜单的核心回归：开关项点击后菜单**不关闭**、勾选态原地刷新，
+        // 可连点多个；混排的动作项仍是"点了执行并关闭"。
+        use crate::event::{MenuItem, MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+
+        let app = App::new("t", 400, 300).content(Element::col());
+        let mut app = app.into_handler_for_test();
+        let target = app.tree.root.unwrap();
+
+        let a = crate::signal::signal(false);
+        let b = crate::signal::signal(false);
+        let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+        let ran_cb = ran.clone();
+        let rebuild: Rc<dyn Fn() -> Vec<MenuItem>> = Rc::new(move || {
+            let r = ran_cb.clone();
+            vec![
+                MenuItem::run("甲", move || a.set(!a.get()), a.get()).stay_open(),
+                MenuItem::run("乙", move || b.set(!b.get()), b.get()).stay_open(),
+                MenuItem::run("执行", move || r.set(true), false),
+            ]
+        });
+
+        let level = app.build_level(rebuild(), 20, 20, 0, None, None);
+        let rect = level.rect;
+        app.menu = Some(ContextMenu {
+            levels: vec![level],
+            target,
+            rebuild: Some(rebuild),
+        });
+        macro_rules! click {
+            ($i:expr) => {
+                app.handle_menu_pointer(PointerEvent::single(
+                    PointerKind::Down,
+                    Point::new(
+                        rect.x + 20,
+                        rect.y + MENU_VPAD + $i * MENU_ITEM_H + MENU_ITEM_H / 2,
+                    ),
+                    MouseButton::Left,
+                ))
+            };
+        }
+
+        click!(0);
+        assert!(a.get(), "开关项应翻转绑定值");
+        assert!(app.menu.is_some(), "开关项点击后菜单须保持展开");
+        assert!(
+            app.menu.as_ref().unwrap().levels[0].items[0].checked,
+            "重建后勾选态应原地刷新"
+        );
+
+        // 连点第二个开关：无需重新打开菜单。
+        click!(1);
+        assert!(b.get());
+        assert!(app.menu.is_some());
+        let items = &app.menu.as_ref().unwrap().levels[0].items;
+        assert!(items[0].checked && items[1].checked, "两个开关都应为开");
+
+        // 再点第一个：翻回关闭态，菜单仍在。
+        click!(0);
+        assert!(!a.get());
+        assert!(!app.menu.as_ref().unwrap().levels[0].items[0].checked);
+
+        // 混排的动作项不粘滞：执行并关闭。
+        click!(2);
+        assert!(ran.get(), "动作项应执行");
+        assert!(app.menu.is_none(), "动作项点击后菜单须关闭");
+    }
+
+    #[test]
+    fn sticky_refresh_preserves_panel_geometry() {
+        // 面板宽度/位置不随重建变化：项文本变宽也不重新测量，否则指针下的项会在
+        // 两次点击之间挪位，用户点到的不是他瞄准的那一项。
+        use crate::event::{MenuItem, MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+
+        let app = App::new("t", 400, 300).content(Element::col());
+        let mut app = app.into_handler_for_test();
+        let target = app.tree.root.unwrap();
+
+        let wide = crate::signal::signal(false);
+        let rebuild: Rc<dyn Fn() -> Vec<MenuItem>> = Rc::new(move || {
+            let label = if wide.get() {
+                "开关项——展开后标签显著变长以撑宽面板"
+            } else {
+                "短"
+            };
+            vec![MenuItem::run(label, move || wide.set(!wide.get()), wide.get()).stay_open()]
+        });
+
+        let level = app.build_level(rebuild(), 20, 20, 0, None, None);
+        let before = level.rect;
+        app.menu = Some(ContextMenu {
+            levels: vec![level],
+            target,
+            rebuild: Some(rebuild),
+        });
+        app.handle_menu_pointer(PointerEvent::single(
+            PointerKind::Down,
+            Point::new(before.x + 20, before.y + MENU_VPAD + MENU_ITEM_H / 2),
+            MouseButton::Left,
+        ));
+        assert!(wide.get());
+        assert_eq!(
+            app.menu.as_ref().unwrap().levels[0].rect,
+            before,
+            "重建不得改变面板矩形"
+        );
     }
 
     #[test]

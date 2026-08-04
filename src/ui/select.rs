@@ -73,6 +73,74 @@ impl From<&str> for DropdownItem {
     }
 }
 
+/// 绘制 [`Dropdown`] 与 [`CheckMenu`] 共用的字段外壳：圆角底 + hover/focus 补间边框
+/// + 右侧 ▼ 箭头。返回正文文字色（禁用态已折算为 `text_disabled`）。
+///
+/// 两者外观必须一致——它们在同一排工具栏里并列，一个是"选一项"、一个是"开几个开关"，
+/// 边框圆角差半像素都会看出来。故共用同一段绘制，而不是各画各的。
+fn paint_field_chrome(
+    bounds: Rect,
+    focused: bool,
+    hover: bool,
+    enabled: bool,
+    canvas: &mut dyn Canvas,
+    border_anim: &Cell<Transition<Color>>,
+    primed: &Cell<bool>,
+) -> Color {
+    let th = crate::theme::current();
+    let (pal, dd) = (&th.palette, &th.dropdown);
+    let (x, y, w, h) = (
+        bounds.x as f32,
+        bounds.y as f32,
+        bounds.w as f32,
+        bounds.h as f32,
+    );
+    let corner = dd.corner(&th.metrics);
+    // 禁用：背景弱化、文字与箭头用 text_disabled。
+    let bg = if enabled { dd.bg(pal) } else { pal.surface_alt };
+    let text_color = if enabled {
+        dd.text(pal)
+    } else {
+        pal.text_disabled
+    };
+    let chevron = if enabled {
+        dd.chevron(pal)
+    } else {
+        pal.text_disabled
+    };
+    canvas.fill_round_rect(x, y, w, h, corner, &Paint::fill(bg));
+    // 边框色补间：hover/focus 高亮淡变；首帧靠 primed 落定。
+    let target_border = if focused || hover {
+        dd.border_focus(pal)
+    } else {
+        dd.border(pal)
+    };
+    let mut ba = border_anim.get();
+    if !primed.get() {
+        ba = Transition::new(target_border);
+        primed.set(true);
+    } else if ba.target() != target_border {
+        ba.retarget(target_border, th.anim.fast(), Easing::EaseOut);
+    }
+    let border = ba.animate();
+    border_anim.set(ba);
+    let bw = if focused {
+        th.metrics.border_width_focus.to_logical(canvas.dpi_scale())
+    } else {
+        th.metrics.border_width.to_logical(canvas.dpi_scale())
+    };
+    canvas.stroke_round_rect(x, y, w, h, corner, bw, &Paint::fill(border));
+
+    // 右侧下拉箭头 ▼（两段线）。
+    let cx = bounds.x as f32 + bounds.w as f32 - PAD_X as f32 - CHEVRON_W as f32 / 2.0;
+    let cy = bounds.y as f32 + bounds.h as f32 / 2.0;
+    let p = Paint::fill(chevron);
+    canvas.draw_line(cx - 4.0, cy - 2.0, cx, cy + 3.0, 1.6, &p);
+    canvas.draw_line(cx, cy + 3.0, cx + 4.0, cy - 2.0, 1.6, &p);
+
+    text_color
+}
+
 /// 选项存储：纯文本（原有 `Vec<String>` 入口）或富内容（`DropdownItem`）。
 enum OptionSource {
     Plain(Signal<Vec<String>>),
@@ -236,48 +304,16 @@ impl Widget for Dropdown {
         style: &Style,
     ) {
         let th = crate::theme::current();
-        let (pal, dd) = (&th.palette, &th.dropdown);
-        let (x, y, w, h) = (
-            bounds.x as f32,
-            bounds.y as f32,
-            bounds.w as f32,
-            bounds.h as f32,
+        let pal = &th.palette;
+        let text_color = paint_field_chrome(
+            bounds,
+            focused,
+            self.hover,
+            enabled,
+            canvas,
+            &self.border_anim,
+            &self.primed,
         );
-        let corner = dd.corner(&th.metrics);
-        // 禁用：背景弱化、文字与箭头用 text_disabled。
-        let bg = if enabled { dd.bg(pal) } else { pal.surface_alt };
-        let text_color = if enabled {
-            dd.text(pal)
-        } else {
-            pal.text_disabled
-        };
-        let chevron = if enabled {
-            dd.chevron(pal)
-        } else {
-            pal.text_disabled
-        };
-        canvas.fill_round_rect(x, y, w, h, corner, &Paint::fill(bg));
-        // 边框色补间：hover/focus 高亮淡变；首帧落定。
-        let target_border = if focused || self.hover {
-            dd.border_focus(pal)
-        } else {
-            dd.border(pal)
-        };
-        let mut ba = self.border_anim.get();
-        if !self.primed.get() {
-            ba = Transition::new(target_border);
-            self.primed.set(true);
-        } else if ba.target() != target_border {
-            ba.retarget(target_border, th.anim.fast(), Easing::EaseOut);
-        }
-        let border = ba.animate();
-        self.border_anim.set(ba);
-        let bw = if focused {
-            th.metrics.border_width_focus.to_logical(canvas.dpi_scale())
-        } else {
-            th.metrics.border_width.to_logical(canvas.dpi_scale())
-        };
-        canvas.stroke_round_rect(x, y, w, h, corner, bw, &Paint::fill(border));
 
         // 当前选中项的尾随徽章（若有）：贴 chevron 左侧，文本区相应收窄。
         let badge = self.current_badge();
@@ -331,13 +367,6 @@ impl Widget for Dropdown {
             Align::Start,
             &crate::text::TextStyle::of(style),
         );
-
-        // 右侧下拉箭头 ▼（两段线）。
-        let cx = bounds.x as f32 + bounds.w as f32 - PAD_X as f32 - CHEVRON_W as f32 / 2.0;
-        let cy = bounds.y as f32 + bounds.h as f32 / 2.0;
-        let p = Paint::fill(chevron);
-        canvas.draw_line(cx - 4.0, cy - 2.0, cx, cy + 3.0, 1.6, &p);
-        canvas.draw_line(cx, cy + 3.0, cx + 4.0, cy - 2.0, 1.6, &p);
     }
 
     fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
@@ -383,6 +412,262 @@ impl Widget for Dropdown {
     }
 }
 
+/// 收起态文案生成器：入参是已开启的开关项标签（按声明顺序）。见 [`CheckMenu`]。
+type SummaryFn = Rc<dyn Fn(&[&str]) -> String>;
+
+/// [`CheckMenu`] 的一项：开关项 / 普通动作项 / 分隔线。
+#[derive(Clone)]
+pub enum CheckMenuItem {
+    /// 开关项：绑定 `Signal<bool>`，点击原地翻转且**菜单不关闭**，可连点多个。
+    Check {
+        label: String,
+        state: Signal<bool>,
+        /// 翻转后通知（收到的是**新值**，默认翻转已经执行完）。用于落盘等副作用。
+        on_change: Option<Rc<dyn Fn(bool)>>,
+        enabled: bool,
+    },
+    /// 普通动作项：点击执行并关闭菜单（与右键菜单的项同语义）。
+    Action {
+        label: String,
+        on_click: Rc<dyn Fn()>,
+        enabled: bool,
+    },
+    /// 分隔线（不可命中）。
+    Separator,
+}
+
+impl CheckMenuItem {
+    /// 开关项：点击翻转 `state`，菜单保持展开。
+    pub fn check(label: impl Into<String>, state: Signal<bool>) -> Self {
+        Self::Check {
+            label: label.into(),
+            state,
+            on_change: None,
+            enabled: true,
+        }
+    }
+    /// 动作项：点击执行 `f` 并关闭菜单。
+    pub fn action(label: impl Into<String>, f: impl Fn() + 'static) -> Self {
+        Self::Action {
+            label: label.into(),
+            on_click: Rc::new(f),
+            enabled: true,
+        }
+    }
+    /// 分隔线。
+    pub fn separator() -> Self {
+        Self::Separator
+    }
+    /// 开关翻转后的通知（仅 `Check` 项有效）。回调收到新值，**不需要**自己再 `set`
+    /// ——与 `CheckBox::on_toggle`「取代默认翻转」不同，这里是翻转之后的副作用钩子。
+    pub fn on_change(mut self, f: impl Fn(bool) + 'static) -> Self {
+        if let Self::Check { on_change, .. } = &mut self {
+            *on_change = Some(Rc::new(f));
+        }
+        self
+    }
+    /// 设置启用态（禁用项变灰且不可点击；分隔线忽略）。
+    pub fn enabled(mut self, v: bool) -> Self {
+        match &mut self {
+            Self::Check { enabled, .. } | Self::Action { enabled, .. } => *enabled = v,
+            Self::Separator => {}
+        }
+        self
+    }
+}
+
+/// 下拉式复选菜单：外观同 [`Dropdown`]（当前项即入口），面板是菜单，
+/// 开关项**点击后菜单不关闭**，可连点多个；点面板外才收起。
+///
+/// 与 `Dropdown` 的语义分工：`Dropdown` 是"选一项"（选中即决定完成，故关闭），
+/// `CheckMenu` 是"开几个开关"（每次点击只翻一位，决定到点面板外才完成）。
+/// 用 `Dropdown` 模拟复选需要哨兵项 + 索引复位的绕法，且每开一个开关要重新点开一次。
+///
+/// 收起态默认恒显示 `title`；用 [`set_summary`](Self::set_summary) 可改为按已开项
+/// 生成文案。摘要会改变控件宽度，故用摘要时建议在 `Element` 上显式 `.width(..)` 固定。
+pub struct CheckMenu {
+    title: String,
+    items: Rc<Vec<CheckMenuItem>>,
+    /// 收起态文案生成器：入参是**已开启**的开关项标签（按声明顺序）。
+    summary: Option<SummaryFn>,
+    hover: bool,
+    /// 边框色补间（与 Dropdown 同源，见 [`paint_field_chrome`]）。
+    border_anim: Cell<Transition<Color>>,
+    primed: Cell<bool>,
+}
+
+impl CheckMenu {
+    pub fn new(title: impl Into<String>, items: Vec<CheckMenuItem>) -> Self {
+        Self {
+            title: title.into(),
+            items: Rc::new(items),
+            summary: None,
+            hover: false,
+            border_anim: Cell::new(Transition::new(Color::rgba(0, 0, 0, 0))),
+            primed: Cell::new(false),
+        }
+    }
+
+    /// 设置收起态文案生成器（见 [`CheckMenu`] 的宽度提示）。
+    pub fn set_summary(&mut self, f: impl Fn(&[&str]) -> String + 'static) {
+        self.summary = Some(Rc::new(f));
+    }
+
+    /// 收起态显示文本：无 summary 恒为标题，有则按当前已开项生成。
+    fn display_text(&self) -> String {
+        let Some(f) = &self.summary else {
+            return self.title.clone();
+        };
+        let on: Vec<&str> = self
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                CheckMenuItem::Check { label, state, .. } if state.get() => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        f(&on)
+    }
+
+    /// 把声明的项翻译成浮层菜单项。开关项标记 `stay_open` 且 `checked` 取当前值——
+    /// 该函数即 `MenuRequest::rebuild`，每次点击开关后重跑一遍，勾选态随之刷新。
+    fn build_menu_items(items: &[CheckMenuItem]) -> Vec<MenuItem> {
+        items
+            .iter()
+            .map(|it| match it {
+                CheckMenuItem::Check {
+                    label,
+                    state,
+                    on_change,
+                    enabled,
+                } => {
+                    let (st, cb) = (*state, on_change.clone());
+                    MenuItem::run(
+                        label.clone(),
+                        move || {
+                            let v = !st.get();
+                            st.set(v);
+                            if let Some(f) = &cb {
+                                f(v);
+                            }
+                        },
+                        st.get(),
+                    )
+                    .stay_open()
+                    .with_enabled(*enabled)
+                }
+                CheckMenuItem::Action {
+                    label,
+                    on_click,
+                    enabled,
+                } => {
+                    let f = on_click.clone();
+                    MenuItem::run(label.clone(), move || f(), false).with_enabled(*enabled)
+                }
+                CheckMenuItem::Separator => MenuItem::separator(),
+            })
+            .collect()
+    }
+
+    fn open(&self, ctx: &mut EventCtx) {
+        let b = ctx.bounds();
+        let items = self.items.clone();
+        ctx.show_check_menu(b, Rc::new(move || Self::build_menu_items(&items)));
+    }
+}
+
+impl Widget for CheckMenu {
+    fn measure(&self, _avail: Size, style: &Style, text: &mut dyn TextEngine) -> Size {
+        // 取标题与当前摘要中较宽者：摘要为空时回落到标题，宽度不至于塌缩。
+        let ts = crate::text::TextStyle::of(style);
+        let w = text
+            .measure(&self.title, &ts, None)
+            .w
+            .max(text.measure(&self.display_text(), &ts, None).w);
+        Size::new(w + 2 * PAD_X + CHEVRON_W, (style.font_size as i32) + 16)
+    }
+
+    fn paint(
+        &self,
+        bounds: Rect,
+        _content: Rect,
+        focused: bool,
+        enabled: bool,
+        canvas: &mut dyn Canvas,
+        style: &Style,
+    ) {
+        let text_color = paint_field_chrome(
+            bounds,
+            focused,
+            self.hover,
+            enabled,
+            canvas,
+            &self.border_anim,
+            &self.primed,
+        );
+        let tr = Rect::new(
+            bounds.x + PAD_X,
+            bounds.y,
+            bounds.w - 2 * PAD_X - CHEVRON_W,
+            bounds.h,
+        );
+        canvas.draw_text(
+            &self.display_text(),
+            tr,
+            text_color,
+            Align::Start,
+            &crate::text::TextStyle::of(style),
+        );
+    }
+
+    fn on_event(&mut self, ctx: &mut EventCtx, ev: &Event) -> bool {
+        match ev {
+            Event::Pointer(p) => match p.kind {
+                PointerKind::Enter => {
+                    self.hover = true;
+                    ctx.mark_dirty();
+                    true
+                }
+                PointerKind::Leave => {
+                    self.hover = false;
+                    ctx.mark_dirty();
+                    true
+                }
+                PointerKind::Down => {
+                    ctx.request_focus();
+                    true
+                }
+                PointerKind::Up => {
+                    if ctx.bounds().contains(p.pos) {
+                        // 同 Dropdown：宿主打开后独占指针，控件收不到 Leave。
+                        self.hover = false;
+                        self.open(ctx);
+                    }
+                    true
+                }
+                _ => false,
+            },
+            Event::Key(k) if k.pressed => match k.key {
+                Key::Enter | Key::Space | Key::Down => {
+                    self.open(ctx);
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
+    fn focusable(&self) -> bool {
+        true
+    }
+
+    /// 供 `Element::summary()` 向下转型配置（默认实现返回 None，不实现则 builder 失效）。
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +694,65 @@ mod tests {
         assert_eq!(dd.current(), "b"); // 钳到末项
         opts.set(vec![]); // 空列表
         assert_eq!(dd.current(), ""); // 不 panic，返回空
+    }
+
+    #[test]
+    fn check_menu_items_are_sticky_and_track_signal() {
+        let a = signal(false);
+        let b = signal(true);
+        let items = vec![
+            CheckMenuItem::check("甲", a),
+            CheckMenuItem::separator(),
+            CheckMenuItem::check("乙", b),
+            CheckMenuItem::action("执行", || {}),
+        ];
+        let built = CheckMenu::build_menu_items(&items);
+        assert_eq!(built.len(), 4);
+        assert!(built[0].stay_open, "开关项须粘滞（点了不关菜单）");
+        assert!(!built[0].checked);
+        assert!(built[1].separator);
+        assert!(built[2].checked, "checked 取自 Signal 当前值");
+        assert!(
+            !built[3].stay_open,
+            "动作项不粘滞：点了执行并关闭，与右键菜单同语义"
+        );
+
+        // 触发开关项的动作 → Signal 翻转；重建后 checked 随之刷新（rebuild 的作用）。
+        if let crate::event::MenuAction::Run(f) = &built[0].action {
+            f();
+        }
+        assert!(a.get());
+        assert!(CheckMenu::build_menu_items(&items)[0].checked);
+    }
+
+    #[test]
+    fn check_menu_on_change_receives_new_value_after_default_flip() {
+        // on_change 是「翻转之后的副作用钩子」，与 CheckBox::on_toggle「取代默认翻转」
+        // 语义不同：调用方不必自己 set，回调收到的就是已生效的新值。
+        let s = signal(false);
+        let seen = Rc::new(Cell::new(None::<bool>));
+        let sink = seen.clone();
+        let items = vec![CheckMenuItem::check("x", s).on_change(move |v| sink.set(Some(v)))];
+        let built = CheckMenu::build_menu_items(&items);
+        if let crate::event::MenuAction::Run(f) = &built[0].action {
+            f();
+        }
+        assert_eq!(seen.get(), Some(true));
+        assert!(s.get(), "默认翻转已执行，回调无需自己 set");
+    }
+
+    #[test]
+    fn check_menu_display_text_defaults_to_title() {
+        let s = signal(true);
+        let mut m = CheckMenu::new("列表显示", vec![CheckMenuItem::check("隐藏未启用", s)]);
+        assert_eq!(m.display_text(), "列表显示", "无 summary 时恒为标题");
+        m.set_summary(|on| match on.len() {
+            0 => "列表显示".to_string(),
+            _ => format!("列表显示 ({})", on.join("、")),
+        });
+        assert_eq!(m.display_text(), "列表显示 (隐藏未启用)");
+        s.set(false);
+        assert_eq!(m.display_text(), "列表显示", "全关时回落");
     }
 
     #[test]
