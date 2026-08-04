@@ -476,12 +476,16 @@ impl CheckMenuItem {
     }
 }
 
-/// 下拉式复选菜单：外观同 [`Dropdown`]（当前项即入口），面板是菜单，
-/// 开关项**点击后菜单不关闭**，可连点多个；点面板外才收起。
+/// 下拉式复选菜单：外观同 [`Dropdown`]（当前项即入口），面板是菜单，项可单独开关。
 ///
-/// 与 `Dropdown` 的语义分工：`Dropdown` 是"选一项"（选中即决定完成，故关闭），
-/// `CheckMenu` 是"开几个开关"（每次点击只翻一位，决定到点面板外才完成）。
-/// 用 `Dropdown` 模拟复选需要哨兵项 + 索引复位的绕法，且每开一个开关要重新点开一次。
+/// **默认点击即关闭**，与右键菜单/单选下拉一致——菜单的通行惯例是「点一下、做一件事、
+/// 退场」，多数开关也确实一次只改一个。要连改多个再用
+/// [`set_stay_open`](Self::set_stay_open) 显式打开粘滞，此时开关项点了不关、
+/// 点面板外才收起（动作项无论如何都关闭，它本就是「执行完就退场」的语义）。
+///
+/// 与 `Dropdown` 的语义分工：`Dropdown` 是"选一项"（选中即改变唯一的选择），
+/// `CheckMenu` 是"开几个开关"（每项是独立的一位）。用 `Dropdown` 模拟复选需要
+/// 哨兵项 + 索引复位的绕法，且入口文案会被最后点的那一项顶替。
 ///
 /// 收起态默认恒显示 `title`；用 [`set_summary`](Self::set_summary) 可改为按已开项
 /// 生成文案。摘要会改变控件宽度，故用摘要时建议在 `Element` 上显式 `.width(..)` 固定。
@@ -490,6 +494,8 @@ pub struct CheckMenu {
     items: Rc<Vec<CheckMenuItem>>,
     /// 收起态文案生成器：入参是**已开启**的开关项标签（按声明顺序）。
     summary: Option<SummaryFn>,
+    /// 粘滞：开关项点击后菜单保持展开、可连点。默认 false（点击即关，同普通菜单）。
+    stay_open: bool,
     hover: bool,
     /// 边框色补间（与 Dropdown 同源，见 [`paint_field_chrome`]）。
     border_anim: Cell<Transition<Color>>,
@@ -502,6 +508,7 @@ impl CheckMenu {
             title: title.into(),
             items: Rc::new(items),
             summary: None,
+            stay_open: false,
             hover: false,
             border_anim: Cell::new(Transition::new(Color::rgba(0, 0, 0, 0))),
             primed: Cell::new(false),
@@ -511,6 +518,13 @@ impl CheckMenu {
     /// 设置收起态文案生成器（见 [`CheckMenu`] 的宽度提示）。
     pub fn set_summary(&mut self, f: impl Fn(&[&str]) -> String + 'static) {
         self.summary = Some(Rc::new(f));
+    }
+
+    /// 粘滞开关：`true` 时开关项点击后菜单保持展开、可连点多个，点面板外才收起。
+    /// 默认 `false`（点击即关）。整菜单统一，不做逐项差异——同一个面板里
+    /// 有的项点了关、有的不关，用户没法预期下一次点击会发生什么。
+    pub fn set_stay_open(&mut self, on: bool) {
+        self.stay_open = on;
     }
 
     /// 收起态显示文本：无 summary 恒为标题，有则按当前已开项生成。
@@ -529,9 +543,10 @@ impl CheckMenu {
         f(&on)
     }
 
-    /// 把声明的项翻译成浮层菜单项。开关项标记 `stay_open` 且 `checked` 取当前值——
-    /// 该函数即 `MenuRequest::rebuild`，每次点击开关后重跑一遍，勾选态随之刷新。
-    fn build_menu_items(items: &[CheckMenuItem]) -> Vec<MenuItem> {
+    /// 把声明的项翻译成浮层菜单项：`checked` 取 Signal 当前值，`stay_open` 时开关项标记
+    /// 粘滞。该函数即 `MenuRequest::rebuild`，粘滞下每次点击后重跑一遍刷新勾选态；
+    /// 非粘滞下菜单点完就关，rebuild 只在下次展开时用到。
+    fn build_menu_items(items: &[CheckMenuItem], stay_open: bool) -> Vec<MenuItem> {
         items
             .iter()
             .map(|it| match it {
@@ -542,7 +557,7 @@ impl CheckMenu {
                     enabled,
                 } => {
                     let (st, cb) = (*state, on_change.clone());
-                    MenuItem::run(
+                    let mut mi = MenuItem::run(
                         label.clone(),
                         move || {
                             let v = !st.get();
@@ -552,9 +567,11 @@ impl CheckMenu {
                             }
                         },
                         st.get(),
-                    )
-                    .stay_open()
-                    .with_enabled(*enabled)
+                    );
+                    if stay_open {
+                        mi = mi.stay_open();
+                    }
+                    mi.with_enabled(*enabled)
                 }
                 CheckMenuItem::Action {
                     label,
@@ -572,7 +589,8 @@ impl CheckMenu {
     fn open(&self, ctx: &mut EventCtx) {
         let b = ctx.bounds();
         let items = self.items.clone();
-        ctx.show_check_menu(b, Rc::new(move || Self::build_menu_items(&items)));
+        let sticky = self.stay_open;
+        ctx.show_check_menu(b, Rc::new(move || Self::build_menu_items(&items, sticky)));
     }
 }
 
@@ -697,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn check_menu_items_are_sticky_and_track_signal() {
+    fn check_menu_items_track_signal_and_close_by_default() {
         let a = signal(false);
         let b = signal(true);
         let items = vec![
@@ -706,23 +724,39 @@ mod tests {
             CheckMenuItem::check("乙", b),
             CheckMenuItem::action("执行", || {}),
         ];
-        let built = CheckMenu::build_menu_items(&items);
+        let built = CheckMenu::build_menu_items(&items, false);
         assert_eq!(built.len(), 4);
-        assert!(built[0].stay_open, "开关项须粘滞（点了不关菜单）");
+        assert!(!built[0].stay_open, "默认点击即关，与右键菜单/单选下拉一致");
         assert!(!built[0].checked);
         assert!(built[1].separator);
         assert!(built[2].checked, "checked 取自 Signal 当前值");
-        assert!(
-            !built[3].stay_open,
-            "动作项不粘滞：点了执行并关闭，与右键菜单同语义"
-        );
+        assert!(!built[3].stay_open, "动作项恒为点击即关");
 
         // 触发开关项的动作 → Signal 翻转；重建后 checked 随之刷新（rebuild 的作用）。
         if let crate::event::MenuAction::Run(f) = &built[0].action {
             f();
         }
         assert!(a.get());
-        assert!(CheckMenu::build_menu_items(&items)[0].checked);
+        assert!(CheckMenu::build_menu_items(&items, false)[0].checked);
+    }
+
+    #[test]
+    fn check_menu_stay_open_marks_only_check_items() {
+        // 粘滞是整菜单开关，但只作用于开关项——动作项本就是"执行完退场"的语义，
+        // 粘滞它会让菜单在动作已经发生后还赖着不走。
+        let items = vec![
+            CheckMenuItem::check("甲", signal(false)),
+            CheckMenuItem::separator(),
+            CheckMenuItem::action("执行", || {}),
+        ];
+        let built = CheckMenu::build_menu_items(&items, true);
+        assert!(built[0].stay_open, "开关项在粘滞模式下点了不关");
+        assert!(!built[2].stay_open, "动作项即使在粘滞模式下也关闭");
+
+        let mut m = CheckMenu::new("t", vec![CheckMenuItem::check("甲", signal(false))]);
+        assert!(!m.stay_open, "构造默认非粘滞");
+        m.set_stay_open(true);
+        assert!(m.stay_open);
     }
 
     #[test]
@@ -733,7 +767,7 @@ mod tests {
         let seen = Rc::new(Cell::new(None::<bool>));
         let sink = seen.clone();
         let items = vec![CheckMenuItem::check("x", s).on_change(move |v| sink.set(Some(v)))];
-        let built = CheckMenu::build_menu_items(&items);
+        let built = CheckMenu::build_menu_items(&items, false);
         if let crate::event::MenuAction::Run(f) = &built[0].action {
             f();
         }

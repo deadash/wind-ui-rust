@@ -1461,9 +1461,10 @@ impl Element {
         Self::base(Layout::None).widget(select::Dropdown::with_items_reactive(items, selected))
     }
 
-    /// 下拉式复选菜单：外观同 `dropdown`，面板里的开关项**点击后菜单不关闭**，
-    /// 可连点多个；点面板外才收起。项支持开关 / 动作 / 分隔线混排，
-    /// 见 [`select::CheckMenuItem`]。
+    /// 下拉式复选菜单：外观同 `dropdown`，面板是菜单，项可单独开关。
+    /// 项支持开关 / 动作 / 分隔线混排，见 [`select::CheckMenuItem`]。
+    ///
+    /// 默认点击即关闭（同普通菜单）；要连改多个开关用 [`stay_open`](Self::stay_open)。
     ///
     /// ```no_run
     /// # use windui::prelude::*;
@@ -1477,6 +1478,32 @@ impl Element {
     /// ```
     pub fn check_menu(title: impl Into<String>, items: Vec<select::CheckMenuItem>) -> Self {
         Self::base(Layout::None).widget(select::CheckMenu::new(title, items))
+    }
+
+    /// 复选菜单粘滞：开关项点击后菜单保持展开、可连点多个，点面板外才收起。
+    /// 默认关闭——菜单的通行惯例是「点一下、做一件事、退场」，多数开关一次也只改一个。
+    /// 一次要连改多个（如一组显示过滤）才值得打开。动作项不受影响，恒为点击即关。
+    /// 仅 `Element::check_menu(..)` 可用。
+    ///
+    /// ```no_run
+    /// # use windui::prelude::*;
+    /// # let (a, b) = (signal(false), signal(false));
+    /// Element::check_menu("列表显示", vec![
+    ///     CheckMenuItem::check("隐藏未启用", a),
+    ///     CheckMenuItem::check("显示特殊项", b),
+    /// ]).stay_open();
+    /// ```
+    pub fn stay_open(mut self) -> Self {
+        if let Some(m) = self
+            .widget
+            .as_any_mut()
+            .and_then(|a| a.downcast_mut::<select::CheckMenu>())
+        {
+            m.set_stay_open(true);
+        } else {
+            debug_assert!(false, "stay_open() 仅适用于 Element::check_menu(..)");
+        }
+        self
     }
 
     /// 复选菜单的收起态文案生成器：入参是**已开启**的开关项标签（按声明顺序），

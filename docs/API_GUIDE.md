@@ -159,12 +159,13 @@ Element::switch(state)                            // state: Rc<Cell<bool>>
 Element::radio("选项", group, index)             // group: Rc<Cell<usize>>
 Element::slider(value)                            // value: Rc<Cell<f32>> (0..=1)
 Element::dropdown(vec!["A", "B"], selected)       // selected: Rc<Cell<usize>>
-Element::check_menu("列表显示", vec![             // 下拉式复选菜单：开关点了不关，可连点多个
+Element::check_menu("列表显示", vec![             // 下拉式复选菜单：外观同 dropdown，面板是菜单
     CheckMenuItem::check("隐藏未启用", flag)      //   开关项（flag: Signal<bool>）
         .on_change(|v| save(v)),                  //   翻转后通知（收到新值，默认翻转已执行）
     CheckMenuItem::separator(),
-    CheckMenuItem::action("恢复默认", || {}),     //   动作项：点了执行并关闭（同右键菜单）
+    CheckMenuItem::action("恢复默认", || {}),     //   动作项：点了执行并关闭
 ]).summary(|on| format!("显示 ({})", on.len()))   // 收起态文案（默认恒为标题；用摘要建议配 .width）
+//  默认点击即关（同普通菜单）；.stay_open() 改为开关点了不关、可连点，点面板外才收起
 Element::stepper(value, min, max, step)           // value: Rc<Cell<f64>>
 Element::list(vec!["行1", "行2"], selected)       // selected: Rc<Cell<usize>>
 Element::list_icons(vec![("收件箱", icon), ..], selected)  // 带前置图标的行（icon: ImageContent）
