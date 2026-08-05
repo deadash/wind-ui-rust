@@ -1863,6 +1863,57 @@ impl Tree {
         }
     }
 
+    /// 把 `id` 滚进其各级祖先滚动容器的视口（由内向外逐级）。返回是否有容器滚动量变化。
+    ///
+    /// Tab 焦点落到滚动区外的控件时由宿主调用：滚出视口的节点 `visible` 仍为 true
+    /// （只是被 `clip_children` 裁掉），照样在焦点环里，不滚过去焦点就"跑到看不见的
+    /// 地方"了。反过来把它们踢出焦点环也不行——长列表下半截会变成键盘不可达。
+    ///
+    /// 逐级向外时目标矩形换成刚处理完的那一级容器自身：内层滚完后目标项就落在内层
+    /// 视口内了，外层只需把内层容器整个滚进来。这样每级都只依赖当前帧的几何，不必
+    /// 预演尚未发生的重排——`scroll_y` 的钳制要到下一帧 `arrange_scroll` 才生效。
+    pub fn scroll_into_view(&mut self, id: NodeId) -> bool {
+        let mut changed = false;
+        let mut target = self.abs_bounds(id);
+        // skip(1)：祖先链含自身，滚动容器要找的是它的**祖先**。
+        for c in self.ancestor_chain(id).into_iter().skip(1) {
+            let Some(n) = self.get(c) else {
+                continue;
+            };
+            if !matches!(n.layout, Layout::Scroll) {
+                continue;
+            }
+            let (pad, content_h, scroll_y) = (n.padding, n.content_h, n.scroll_y);
+            let abs = self.abs_bounds(c);
+            let view = Rect::new(
+                abs.x + pad.left,
+                abs.y + pad.top,
+                (abs.w - pad.horizontal()).max(0),
+                (abs.h - pad.vertical()).max(0),
+            );
+            // 上溢取负（内容下移、scroll 减小），下溢取正；都在视口内则不动。
+            let delta = if target.y < view.y {
+                target.y - view.y
+            } else if target.bottom() > view.bottom() {
+                target.bottom() - view.bottom()
+            } else {
+                0
+            };
+            if delta != 0 {
+                let next = (scroll_y + delta).clamp(0, (content_h - view.h).max(0));
+                if next != scroll_y {
+                    if let Some(n) = self.get_mut(c) {
+                        n.scroll_y = next;
+                    }
+                    changed = true;
+                }
+            }
+            // 无论本级是否真滚了，下一级（更外层）要对齐的都是本级容器自身。
+            target = self.abs_bounds(c);
+        }
+        changed
+    }
+
     fn collect_focusable(&self, id: NodeId, out: &mut Vec<NodeId>) {
         if let Some(n) = self.get(id) {
             if !n.effective_visible() || !n.own_enabled() {
@@ -2560,6 +2611,44 @@ mod tests {
             .child(Element::button("B"));
         let tree = layout(root, 300, 50);
         assert_eq!(tree.focusable_order().len(), 2, "应收集到 2 个可聚焦按钮");
+    }
+
+    #[test]
+    fn scroll_into_view_brings_offscreen_node_into_viewport() {
+        // 滚出视口的节点 visible 仍为 true（只是被 clip_children 裁掉），照样在焦点环里。
+        // 焦点落上去必须把它滚出来，否则键盘用户"焦点跑到看不见的地方"。
+        let mut col = Element::col();
+        for i in 0..8 {
+            col = col.child(Element::button(format!("B{i}")).height(40));
+        }
+        let tree_root = Element::col()
+            .fill()
+            .child(Element::scroll().height(100).child(col));
+        let mut tree = layout(tree_root, 200, 100);
+        let order = tree.focusable_order();
+        assert_eq!(order.len(), 8, "8 个按钮都应在焦点环里（含滚出视口的）");
+
+        let scroll_id = tree.ancestor_chain(order[0])[..]
+            .iter()
+            .copied()
+            .find(|&c| matches!(tree.get(c).map(|n| &n.layout), Some(Layout::Scroll)))
+            .expect("应能找到祖先滚动容器");
+        assert_eq!(tree.get(scroll_id).unwrap().scroll_y, 0, "初始不滚动");
+
+        // 首项本就在视口内：不该动。
+        assert!(!tree.scroll_into_view(order[0]), "视口内的节点不应触发滚动");
+        assert_eq!(tree.get(scroll_id).unwrap().scroll_y, 0);
+
+        // 末项在视口外：应滚到刚好露出它（下溢对齐底边）。
+        assert!(tree.scroll_into_view(order[7]), "视口外的节点应触发滚动");
+        let sy = tree.get(scroll_id).unwrap().scroll_y;
+        assert!(sy > 0, "应向下滚动，实际 scroll_y={sy}");
+        let view_h = 100;
+        let content_h = tree.get(scroll_id).unwrap().content_h;
+        assert!(
+            sy <= (content_h - view_h).max(0),
+            "滚动量不应超过可滚动上限"
+        );
     }
 
     #[test]

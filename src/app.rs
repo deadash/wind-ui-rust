@@ -1799,6 +1799,11 @@ impl UiHost {
         let old = self.focus;
         self.tree.set_focused(nf, old);
         self.focus = nf;
+        // 新焦点可能在滚动区外（滚出视口的节点仍在焦点环里），滚过去让它露出来。
+        // 调用方 Tab 分支已置 needs_full，本帧的全窗路径会重排并钳制新的 scroll_y。
+        if let Some(f) = nf {
+            self.tree.scroll_into_view(f);
+        }
         true
     }
 
@@ -3896,6 +3901,50 @@ mod tests {
         handler.on_pointer(PointerEvent::single(PointerKind::Up, at, MouseButton::Left));
         frame!();
         assert_eq!(handler.focus, outside, "关闭后焦点应还给弹出前那个控件");
+    }
+
+    /// Tab 走到滚动区外的控件时应把它滚进视口。断言的是「焦点控件可见」这个目标
+    /// 本身，而不是 scroll_y 的具体数值。
+    #[test]
+    fn tab_scrolls_focus_into_view() {
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        let mut col = Element::col();
+        for i in 0..8 {
+            col = col.child(Element::button(format!("B{i}")).height(40));
+        }
+        let app = App::new("t", 200, 100).content(
+            Element::col()
+                .fill()
+                .child(Element::scroll().height(100).child(col)),
+        );
+        let mut handler = app.into_handler_for_test();
+        handler.set_scale(1.0);
+        let mut pm = Pixmap::new(200, 100).unwrap();
+        macro_rules! frame {
+            () => {
+                handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(200, 100))
+            };
+        }
+        frame!();
+        assert_eq!(handler.focus_order.len(), 8, "8 个按钮都在焦点环里");
+
+        let k = key_ev();
+        // Tab 到最后一项（视口只装得下前两个半）。
+        for _ in 0..8 {
+            handler.on_key(k(Key::Tab));
+        }
+        frame!(); // 重排应用新的 scroll_y
+        let f = handler.focus.expect("应有焦点");
+        assert_eq!(f, handler.focus_order[7], "应停在最后一项");
+        let b = handler.tree.abs_bounds(f);
+        assert!(
+            b.y >= 0 && b.bottom() <= 100,
+            "焦点控件应被滚进视口，实际 y={} bottom={}",
+            b.y,
+            b.bottom()
+        );
     }
 
     /// 三项下拉（初值选中第 1 项）+ 已暖过布局的宿主。
