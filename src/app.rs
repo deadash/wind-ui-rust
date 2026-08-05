@@ -86,6 +86,13 @@ fn menu_item_height(it: &MenuItem) -> i32 {
     }
 }
 
+/// 该项能否被键盘高亮停留：分隔线与禁用项跳过。子菜单父项**可以**停留
+/// （停在它上面按 → 展开），故不看 `submenu`——这与 `MenuItem::is_actionable`
+/// （能否执行）是两个问题。
+fn menu_item_selectable(it: &MenuItem) -> bool {
+    !it.separator && it.enabled
+}
+
 /// 悬停提示：触发延时（ms）、字号、内边距、相对指针的偏移。
 /// 换行宽度上限由宿主经 `Theme.tooltip.max_width` 配置（见 [`crate::theme::TooltipTheme::max_width`]）。
 const TOOLTIP_DELAY_MS: u64 = 500;
@@ -1358,26 +1365,17 @@ impl UiHost {
                 changed = true;
             }
         }
-        // 取出悬停项的子菜单（克隆）与展开锚点（父项右缘、该项顶部）。
-        let (submenu, anchor) = {
+        // 悬停项是否有可展开的子菜单（锚点计算与压栈见 menu_spawn_submenu，键盘 → 共用）。
+        let spawnable = {
             let lvl = &self.menu.as_ref().unwrap().levels[k];
-            match item_idx {
-                Some(i) if !lvl.items[i].submenu.is_empty() && lvl.items[i].enabled => {
-                    let (top, _) = lvl.item_rows()[i];
-                    (
-                        Some(lvl.items[i].submenu.clone()),
-                        Some((lvl.rect.right(), top - MENU_VPAD, lvl.rect.x, i)),
-                    )
-                }
-                _ => (None, None),
-            }
+            matches!(item_idx, Some(i) if !lvl.items[i].submenu.is_empty() && lvl.items[i].enabled)
         };
         let existing_spawn = self
             .menu
             .as_ref()
             .and_then(|m| m.levels.get(k + 1).map(|l| l.spawn));
-        match (submenu, anchor) {
-            (Some(items), Some((ax, ay, parent_left, i))) => {
+        match item_idx {
+            Some(i) if spawnable => {
                 if existing_spawn == Some(Some(i)) {
                     // 该子菜单已展开：仅收起更深层。
                     let m = self.menu.as_mut().unwrap();
@@ -1386,14 +1384,7 @@ impl UiHost {
                         changed = true;
                     }
                 } else {
-                    if let Some(m) = self.menu.as_mut() {
-                        m.levels.truncate(k + 1);
-                    }
-                    let mut child =
-                        self.build_level(items, ax - 2, ay, 0, Some(parent_left + 2), None);
-                    child.spawn = Some(i);
-                    self.menu.as_mut().unwrap().levels.push(child);
-                    changed = true;
+                    changed |= self.menu_spawn_submenu(k, i);
                 }
             }
             _ => {
@@ -1492,30 +1483,7 @@ impl UiHost {
                     lvl.item_at(ev.pos).map(|i| lvl.items[i].clone())
                 });
                 if let Some(item) = hit {
-                    if item.is_actionable() {
-                        // 粘滞项（复选菜单的开关）：执行后菜单留在原地并刷新勾选态，
-                        // 可连点多个开关；点面板外才关（见上方 level_at 为 None 的分支）。
-                        if item.stay_open {
-                            if let MenuAction::Run(f) = item.action {
-                                f();
-                            }
-                            if let Some(m) = self.menu.as_mut() {
-                                m.refresh_items();
-                            }
-                            return true;
-                        }
-                        let target = self.menu.as_ref().unwrap().target;
-                        self.close_menu();
-                        match item.action {
-                            MenuAction::SendKey(key) => {
-                                let res = self.tree.dispatch_key(key, Some(target));
-                                if res.close {
-                                    self.apply_close_intent();
-                                }
-                            }
-                            MenuAction::Run(f) => f(),
-                        }
-                    }
+                    return self.activate_menu_item(item);
                 }
                 true
             }
@@ -1535,6 +1503,240 @@ impl UiHost {
                 true
             }
             _ => true, // 其余事件吞掉，避免穿透到下层
+        }
+    }
+
+    /// 执行一个菜单项：粘滞项原地刷新勾选态、菜单留在原处，其余关闭菜单后执行。
+    /// 非 actionable（分隔线 / 禁用 / 子菜单父项）为空操作。
+    ///
+    /// 指针命中与键盘回车共用此处——两条入口各写一份迟早会分叉（粘滞项、SendKey
+    /// 的关闭时机都藏在这里）。
+    fn activate_menu_item(&mut self, item: MenuItem) -> bool {
+        if !item.is_actionable() {
+            return true;
+        }
+        // 粘滞项（复选菜单的开关）：执行后菜单留在原地并刷新勾选态，可连点多个开关。
+        if item.stay_open {
+            if let MenuAction::Run(f) = item.action {
+                f();
+            }
+            if let Some(m) = self.menu.as_mut() {
+                m.refresh_items();
+            }
+            return true;
+        }
+        let target = self.menu.as_ref().map(|m| m.target);
+        self.close_menu();
+        match item.action {
+            MenuAction::SendKey(key) => {
+                if let Some(t) = target {
+                    let res = self.tree.dispatch_key(key, Some(t));
+                    if res.close {
+                        self.apply_close_intent();
+                    }
+                }
+            }
+            MenuAction::Run(f) => f(),
+        }
+        true
+    }
+
+    /// 在第 `k` 级的第 `i` 项上展开子菜单：截断更深层后压入新级。返回是否压入。
+    /// 锚点为父项右缘、顶部对齐该项；鼠标悬停展开与键盘 → 共用此处。
+    fn menu_spawn_submenu(&mut self, k: usize, i: usize) -> bool {
+        let Some(m) = self.menu.as_ref() else {
+            return false;
+        };
+        let Some(lvl) = m.levels.get(k) else {
+            return false;
+        };
+        let Some(it) = lvl.items.get(i) else {
+            return false;
+        };
+        if it.submenu.is_empty() || !it.enabled {
+            return false;
+        }
+        let items = it.submenu.clone();
+        let (top, _) = lvl.item_rows()[i];
+        let (ax, ay, parent_left) = (lvl.rect.right(), top - MENU_VPAD, lvl.rect.x);
+        if let Some(m) = self.menu.as_mut() {
+            m.levels.truncate(k + 1);
+        }
+        let mut child = self.build_level(items, ax - 2, ay, 0, Some(parent_left + 2), None);
+        child.spawn = Some(i);
+        self.menu.as_mut().unwrap().levels.push(child);
+        true
+    }
+
+    /// 最深一级面板的下标（菜单必然非空时才调用）。
+    fn menu_top_level(&self) -> Option<usize> {
+        self.menu
+            .as_ref()
+            .and_then(|m| m.levels.len().checked_sub(1))
+    }
+
+    /// 设置第 `k` 级高亮项：收起其下已展开的子菜单（同鼠标移开），并滚进可视区。
+    /// 有子菜单的项不在此自动展开——键盘上由 → 显式进入（同 Windows 菜单）。
+    fn menu_set_hover(&mut self, k: usize, i: usize) {
+        if let Some(m) = self.menu.as_mut() {
+            if m.levels.len() > k + 1 {
+                m.levels.truncate(k + 1);
+            }
+            if let Some(lvl) = m.levels.get_mut(k) {
+                lvl.hover = Some(i);
+            }
+        }
+        self.menu_scroll_into_view(k, i);
+    }
+
+    /// 把第 `k` 级的第 `i` 项滚进面板可视区（已在视口内则不动）。
+    /// 内容坐标 `off` 与 `MenuLevel::item_rows` 同源：`MENU_VPAD` + 前序项高之和，
+    /// 屏幕 y = `rect.y + off - scroll`，故可视范围即 `[scroll, scroll + rect.h]`。
+    fn menu_scroll_into_view(&mut self, k: usize, i: usize) {
+        let Some(m) = self.menu.as_mut() else {
+            return;
+        };
+        let Some(lvl) = m.levels.get_mut(k) else {
+            return;
+        };
+        let Some(h) = lvl.items.get(i).map(menu_item_height) else {
+            return;
+        };
+        let off = MENU_VPAD + lvl.items.iter().take(i).map(menu_item_height).sum::<i32>();
+        let max_sc = lvl.max_scroll();
+        if off < lvl.scroll {
+            lvl.scroll = off;
+        } else if off + h > lvl.scroll + lvl.rect.h {
+            lvl.scroll = off + h - lvl.rect.h;
+        }
+        lvl.scroll = lvl.scroll.clamp(0, max_sc);
+    }
+
+    /// ↑/↓：最深层内移动高亮，跳过分隔线与禁用项，到头循环。
+    ///
+    /// 尚无高亮时落到 checked 项（下拉的当前选中），没有则落到首/末项——让键盘用户
+    /// 先看清起点在哪，而不是凭空跳走一格。
+    fn menu_move_hover(&mut self, forward: bool) -> bool {
+        let Some(k) = self.menu_top_level() else {
+            return true;
+        };
+        let lvl = &self.menu.as_ref().unwrap().levels[k];
+        let sel: Vec<usize> = (0..lvl.items.len())
+            .filter(|&i| menu_item_selectable(&lvl.items[i]))
+            .collect();
+        if sel.is_empty() {
+            return true;
+        }
+        let target = match lvl.hover.and_then(|h| sel.iter().position(|&i| i == h)) {
+            Some(p) => {
+                let step = if forward { 1 } else { sel.len() - 1 };
+                sel[(p + step) % sel.len()]
+            }
+            None => sel
+                .iter()
+                .copied()
+                .find(|&i| lvl.items[i].checked)
+                .unwrap_or(if forward { sel[0] } else { sel[sel.len() - 1] }),
+        };
+        self.menu_set_hover(k, target);
+        true
+    }
+
+    /// Home/End：跳到本级首个/末个可选项。
+    fn menu_jump_hover(&mut self, first: bool) -> bool {
+        let Some(k) = self.menu_top_level() else {
+            return true;
+        };
+        let lvl = &self.menu.as_ref().unwrap().levels[k];
+        let target = if first {
+            lvl.items.iter().position(menu_item_selectable)
+        } else {
+            lvl.items.iter().rposition(menu_item_selectable)
+        };
+        if let Some(i) = target {
+            self.menu_set_hover(k, i);
+        }
+        true
+    }
+
+    /// →：进入当前高亮项的子菜单，高亮落到子菜单首个可选项。无子菜单则不动。
+    fn menu_enter_submenu(&mut self) -> bool {
+        let Some(k) = self.menu_top_level() else {
+            return true;
+        };
+        let Some(i) = self.menu.as_ref().unwrap().levels[k].hover else {
+            return true;
+        };
+        if !self.menu_spawn_submenu(k, i) {
+            return true;
+        }
+        let nk = self.menu.as_ref().unwrap().levels.len() - 1;
+        let first = self.menu.as_ref().unwrap().levels[nk]
+            .items
+            .iter()
+            .position(menu_item_selectable);
+        if let Some(f) = first {
+            self.menu_set_hover(nk, f);
+        }
+        true
+    }
+
+    /// ←：收起最深一级回到父级。已在根级则不动（不关闭整个菜单，同 Windows 菜单）。
+    fn menu_leave_level(&mut self) -> bool {
+        if let Some(m) = self.menu.as_mut() {
+            if m.levels.len() > 1 {
+                m.levels.pop();
+            }
+        }
+        true
+    }
+
+    /// Enter/Space：激活当前高亮项。子菜单父项等同 →（展开而非执行）。
+    fn menu_activate_hover(&mut self) -> bool {
+        let Some(k) = self.menu_top_level() else {
+            return true;
+        };
+        let m = self.menu.as_ref().unwrap();
+        let Some(i) = m.levels[k].hover else {
+            return true;
+        };
+        let Some(item) = m.levels[k].items.get(i).cloned() else {
+            return true;
+        };
+        if !item.submenu.is_empty() {
+            return self.menu_enter_submenu();
+        }
+        self.activate_menu_item(item)
+    }
+
+    /// 菜单激活时处理键盘；返回是否需重绘。
+    ///
+    /// 键盘与指针是菜单的两套并行入口：指针按坐标命中（`handle_menu_pointer`），
+    /// 键盘按最深层的 hover 下标走，两者共用 `activate_menu_item` /
+    /// `menu_spawn_submenu`。未识别的键一律吞掉——菜单是模态浮层，放行会让按键
+    /// 打到被遮住的控件上。
+    fn handle_menu_key(&mut self, ev: crate::event::KeyEvent) -> bool {
+        if !ev.pressed {
+            return true;
+        }
+        match ev.key {
+            Key::Escape => {
+                self.close_menu();
+                true
+            }
+            Key::Down => self.menu_move_hover(true),
+            Key::Up => self.menu_move_hover(false),
+            Key::Home => self.menu_jump_hover(true),
+            Key::End => self.menu_jump_hover(false),
+            Key::Right => self.menu_enter_submenu(),
+            Key::Left => self.menu_leave_level(),
+            Key::Enter | Key::Space => self.menu_activate_hover(),
+            // Tab 不在菜单里导航焦点：先收起浮层，让焦点回到发起控件。
+            Key::Tab => {
+                self.close_menu();
+                true
+            }
+            _ => true,
         }
     }
 
@@ -2302,12 +2504,10 @@ impl AppHandler for UiHost {
 
     fn on_key(&mut self, ev: crate::event::KeyEvent) -> bool {
         self.sync_clock();
-        // 菜单激活时：Escape 关闭，其余键吞掉（避免在菜单后误编辑）。
+        // 菜单激活时由浮层独占键盘：↑↓ 选项、←→ 进出子菜单、回车/空格执行、
+        // Escape 关闭，其余吞掉（避免打到被遮住的控件上）。
         if self.menu.is_some() {
-            if ev.key == Key::Escape {
-                self.close_menu();
-            }
-            return true;
+            return self.handle_menu_key(ev);
         }
         // Tab 由宿主独占用于焦点导航，并启用焦点环显示。焦点环跨节点变化（低频）→ 整窗。
         if ev.key == Key::Tab {
@@ -2320,8 +2520,25 @@ impl AppHandler for UiHost {
         }
         // 其余键先交给焦点控件；未被消费的 Escape 回退为关闭窗口。
         let res = self.tree.dispatch_key(ev, self.focus);
+        // 焦点转移请求：键盘路径同样要接住，否则控件在键盘上调 request_focus 无效。
+        // 与鼠标聚焦相反，此处保留焦点环——本来就是键盘导航中。
+        if let Some(f) = res.focus {
+            let old = self.focus;
+            self.tree.set_focused(Some(f), old);
+            self.focus = Some(f);
+            self.focus_visible = true;
+            self.needs_full = true;
+        }
         if res.close {
             self.apply_close_intent();
+        }
+        // 控件请求弹出浮层（Dropdown/CheckMenu 按空格、回车、↓ 展开）。指针路径一直
+        // 接着这一段，键盘路径此前漏了——控件的 open 请求被 dispatch_key 收进
+        // DispatchResult 后静默丢弃，表现为"按空格没反应"。target 语义同 on_pointer。
+        if let Some(req) = res.menu {
+            if let Some(target) = self.focus.or(self.tree.root) {
+                self.open_menu(req, target);
+            }
         }
         if let Some(url) = res.open_url {
             platform::open_url(&url);
@@ -3479,5 +3696,117 @@ mod tests {
 
         click(&mut handler, blank);
         assert!(handler.focus.is_none(), "点空白应清空焦点");
+    }
+
+    /// 回归：Dropdown 一直正确处理 Key::Space（select.rs 的 Key 分支），断的是宿主——
+    /// on_key 消费了 close/open_url/window_op/dialog/toast，唯独漏了 res.menu，
+    /// 控件的展开请求被 dispatch_key 收进 DispatchResult 后静默丢弃。
+    #[test]
+    fn keyboard_space_opens_dropdown_menu() {
+        use crate::event::KeyEvent;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        let sel = crate::signal::signal(0usize);
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .child(Element::dropdown(vec!["甲", "乙"], sel).width(200)),
+        );
+        let mut handler = app.into_handler_for_test();
+        handler.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+
+        let k = |key| KeyEvent {
+            key,
+            pressed: true,
+            shift: false,
+            ctrl: false,
+        };
+        handler.on_key(k(Key::Tab));
+        assert!(handler.focus.is_some(), "Tab 应把焦点落到下拉框");
+        assert!(handler.menu.is_none(), "此时尚无浮层");
+
+        handler.on_key(k(Key::Space));
+        assert!(handler.menu.is_some(), "按空格应展开下拉菜单");
+    }
+
+    /// 菜单展开后的键盘操作：此前 on_key 在 menu.is_some() 时只放行 Escape、
+    /// 其余全吞，弹出来也只能用鼠标点。
+    #[test]
+    fn keyboard_navigates_and_activates_dropdown_menu() {
+        let (mut handler, sel) = dropdown_handler();
+        let k = key_ev();
+        handler.on_key(k(Key::Tab));
+        handler.on_key(k(Key::Space));
+
+        // 尚无高亮时首次 ↓ 落到 checked 项（当前选中的第 1 项），而不是凭空跳走一格。
+        handler.on_key(k(Key::Down));
+        assert_eq!(
+            handler.menu.as_ref().unwrap().levels[0].hover,
+            Some(1),
+            "首次 ↓ 应停在当前选中项上"
+        );
+        handler.on_key(k(Key::Down));
+        assert_eq!(
+            handler.menu.as_ref().unwrap().levels[0].hover,
+            Some(2),
+            "再次 ↓ 应移到下一项"
+        );
+
+        handler.on_key(k(Key::Enter));
+        assert!(handler.menu.is_none(), "回车执行后菜单应关闭");
+        assert_eq!(sel.get(), 2, "回车应选中高亮项");
+    }
+
+    #[test]
+    fn keyboard_wraps_and_escapes_dropdown_menu() {
+        let (mut handler, sel) = dropdown_handler();
+        let k = key_ev();
+        handler.on_key(k(Key::Tab));
+        handler.on_key(k(Key::Space));
+
+        // ↑ 从无高亮起同样落到 checked 项，再 ↑ 回到上一项；首项继续 ↑ 循环到末项。
+        handler.on_key(k(Key::Up));
+        handler.on_key(k(Key::Up));
+        assert_eq!(handler.menu.as_ref().unwrap().levels[0].hover, Some(0));
+        handler.on_key(k(Key::Up));
+        assert_eq!(
+            handler.menu.as_ref().unwrap().levels[0].hover,
+            Some(2),
+            "首项再 ↑ 应循环到末项"
+        );
+
+        handler.on_key(k(Key::Escape));
+        assert!(handler.menu.is_none(), "Escape 应关闭菜单");
+        assert_eq!(sel.get(), 1, "Escape 不应改变选中值");
+    }
+
+    /// 三项下拉（初值选中第 1 项）+ 已暖过布局的宿主。
+    fn dropdown_handler() -> (UiHost, crate::signal::Signal<usize>) {
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        let sel = crate::signal::signal(1usize);
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .child(Element::dropdown(vec!["甲", "乙", "丙"], sel).width(200)),
+        );
+        let mut handler = app.into_handler_for_test();
+        handler.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        (handler, sel)
+    }
+
+    fn key_ev() -> impl Fn(Key) -> crate::event::KeyEvent {
+        |key| crate::event::KeyEvent {
+            key,
+            pressed: true,
+            shift: false,
+            ctrl: false,
+        }
     }
 }
