@@ -3315,6 +3315,36 @@ mod tests {
     }
 
     #[test]
+    fn window_button_space_requests_op() {
+        // 回归：窗口按钮 focusable=true（供 drag_hit_at 判定），Tab 能停上去，
+        // 但此前 on_event 只有 Pointer 分支——按空格没反应，成了键盘死角。
+        let mut tree = layout(
+            Element::window_button(WindowButtonKind::Minimize)
+                .width(46)
+                .height(40),
+        );
+        let btn = tree.focusable_order()[0];
+        let k = |key| crate::event::KeyEvent {
+            key,
+            pressed: true,
+            shift: false,
+            ctrl: false,
+        };
+        let res = tree.dispatch_key(k(Key::Space), Some(btn));
+        assert_eq!(
+            res.window_op,
+            Some(crate::event::WindowOp::Minimize),
+            "空格应等同点击，请求 Minimize"
+        );
+        let res = tree.dispatch_key(k(Key::Enter), Some(btn));
+        assert_eq!(
+            res.window_op,
+            Some(crate::event::WindowOp::Minimize),
+            "回车同理"
+        );
+    }
+
+    #[test]
     fn tooltip_attaches_to_node_and_resolves_by_hit() {
         // .tooltip(..) 挂到节点上；命中最深节点即可取到其提示文本。
         let tree = layout(

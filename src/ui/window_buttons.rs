@@ -9,7 +9,7 @@ use std::cell::Cell;
 
 use crate::anim::{Easing, Transition};
 use crate::core::{EventCtx, Widget};
-use crate::event::{Event, PointerKind};
+use crate::event::{Event, Key, PointerKind};
 use crate::geometry::{Color, Rect, Size};
 use crate::render::{Canvas, Paint};
 use crate::style::Style;
@@ -191,7 +191,16 @@ impl Widget for WindowButton {
                 }
                 _ => false,
             },
-            _ => false,
+            // 键盘激活：Tab 停在窗口按钮上时空格/回车等同点击（同 Button）。
+            // 本控件可聚焦，不实现这条就成了"能停上去、按不动"的死角。
+            Event::Key(k) => {
+                if k.pressed && (k.key == Key::Enter || k.key == Key::Space) {
+                    self.activate(ctx);
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
