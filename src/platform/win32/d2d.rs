@@ -1192,10 +1192,24 @@ impl Canvas for D2DCanvas<'_> {
             }
             Fit::None => (1.0, 1.0),
         };
-        let (dw, dh) = (iw * sx, ih * sy);
+        let (mut dw, mut dh) = (iw * sx, ih * sy);
+        // 物理尺寸与源图相差不足 1 像素时吸附为 1:1（镜像 SkiaCanvas::draw_image）：
+        // DPI 感知的矢量图标经此免去一次双线性重采样。此处 dw/dh 是逻辑值，
+        // 故与源像素比较前要 ×scale。
+        let scale = self.scale;
+        if scale > 0.0 && (dw * scale - iw).abs() < 1.0 && (dh * scale - ih).abs() < 1.0 {
+            dw = iw / scale;
+            dh = ih / scale;
+        }
         // 在 dst 框内居中（Cover/None 的溢出由裁剪收口）。
         let tx = dst.x as f32 + (dw0 - dw) / 2.0;
         let ty = dst.y as f32 + (dh0 - dh) / 2.0;
+        // 落点吸附到整数**物理**像素：本路径全程逻辑坐标（ctx 已 SetTransform(scale)），
+        // 逻辑整数在 125%/150% 下会落到半物理像素上，DrawBitmap 的 LINEAR 插值照样糊。
+        let (tx, ty) = match scale > 0.0 {
+            true => ((tx * scale).round() / scale, (ty * scale).round() / scale),
+            false => (tx, ty),
+        };
         let dest_rect = D2D_RECT_F {
             left: tx,
             top: ty,

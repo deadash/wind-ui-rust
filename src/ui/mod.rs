@@ -1169,13 +1169,17 @@ impl Element {
     pub fn image_bytes(bytes: &[u8]) -> Self {
         Self::base(Layout::None).widget(ImageView::new(Image::from_bytes(bytes).ok()))
     }
-    /// 图片控件：从 SVG 字节光栅化（`svg` feature）。`target_width=None` 用 SVG 固有尺寸，
-    /// `Some(w)` 按该宽度等比光栅——HiDPI 求清晰可传 2× 逻辑宽度。加载失败显示占位框。
+    /// 图片控件：从 SVG 字节光栅化（`svg` feature）。加载失败显示占位框。
+    ///
+    /// `target_width=None`（**推荐**）为 **DPI 感知**：SVG 固有尺寸即逻辑尺寸，
+    /// paint 期按实际物理尺寸光栅化，任何 DPI 下都 1:1 落像素。`Some(w)` 写死光栅
+    /// 宽（逻辑尺寸随之为 `w` dp），在物理宽 ≠ `w` 的 DPI 下要经一次重采样。
     #[cfg(feature = "svg")]
     pub fn image_svg(bytes: &[u8], target_width: Option<u32>) -> Self {
-        Self::base(Layout::None).widget(ImageView::new(
-            Image::from_svg_bytes(bytes, target_width).ok(),
-        ))
+        Self::base(Layout::None).widget(ImageView::from_content(ImageContent::from_svg_bytes(
+            bytes,
+            target_width,
+        )))
     }
     /// 图片控件：从原始非预乘 RGBA8 像素构造（`rgba.len()==w*h*4`）。
     pub fn image_rgba(w: u32, h: u32, rgba: &[u8]) -> Self {

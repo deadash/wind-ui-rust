@@ -12,8 +12,10 @@
 //!
 //! SVG 是矢量、分辨率无关的：内置解码器按 SVG 的**固有尺寸**一次光栅化（顺着
 //! `ImageDecoder` 的定长 RGBA 契约接入，`from_bytes`/`from_file` 自动识别 `.svg`）；
-//! 需要 HiDPI 清晰度的调用方改用 [`Image::from_svg_bytes`] 显式指定光栅宽度（如传 2×
-//! 逻辑宽度）。resvg 渲染产物经 `DecodedImage` 原始 RGBA「统一货币」转入本项目的
+//! 需要 HiDPI 清晰度的调用方用 [`crate::ui::ImageContent::from_svg_bytes`] 并传
+//! `target_width=None`——它保留矢量源、按实际 DPI 现场光栅化，任何缩放倍率下都
+//! 1:1；本层的 `target_width=Some(w)` 是写死光栅宽的底层出口。resvg 渲染产物经
+//! `DecodedImage` 原始 RGBA「统一货币」转入本项目的
 //! tiny-skia，与位图解码同一条入库路径。
 
 use std::cell::RefCell;

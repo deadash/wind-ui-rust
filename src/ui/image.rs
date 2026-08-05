@@ -9,10 +9,15 @@
 //! - **调制**：按状态调不透明度（禁用置灰，见 `VisualState::opacity`）。
 //! - **着色**：可选 `tint`，把单色图标按颜色重着色（随主题/状态变色），结果按层缓存。
 //! - **换图**：可选 `on_state` 覆盖表，特定状态用专图，否则回退基图。
+//!
+//! **DPI 感知**（SVG）：`from_svg_bytes(bytes, None)` 保留矢量源，paint 期按 `dst`
+//! 的**实际物理尺寸**重新光栅化并按该尺寸缓存——写死光栅宽的做法只在恰好等于该
+//! 倍率的 DPI 下是 1:1，其余倍率都要经一次双线性重采样，细描边会被摊成灰边。
 
 use std::any::Any;
 use std::cell::RefCell;
 use std::path::Path;
+use std::rc::Rc;
 
 use crate::core::{EventCtx, Widget};
 use crate::event::Event;
@@ -53,6 +58,34 @@ impl Layer {
     }
 }
 
+/// DPI 感知的矢量源：保留 SVG 字节，按 paint 期算出的物理宽重新光栅化。
+///
+/// 缓存单条 `(物理宽, 结果)`：同一控件的物理宽只在 DPI 变化或布局改尺寸时才变，
+/// 单条缓存即可命中每一帧；着色结果一并存入，避免每帧重跑 `tinted`。
+struct SvgSource {
+    bytes: Rc<[u8]>,
+    cache: RefCell<Option<(u32, Image)>>,
+}
+
+impl SvgSource {
+    /// 取指定物理宽的光栅（含着色）结果；缓存未命中则重新光栅化。
+    fn resolve(&self, target_w: u32, tint: Option<Color>) -> Option<Image> {
+        let mut cache = self.cache.borrow_mut();
+        if let Some((w, img)) = cache.as_ref() {
+            if *w == target_w {
+                return Some(img.clone());
+            }
+        }
+        let raw = Image::from_svg_bytes(&self.bytes, Some(target_w)).ok()?;
+        let img = match tint {
+            Some(c) => raw.tinted(c),
+            None => raw,
+        };
+        *cache = Some((target_w, img.clone()));
+        Some(img)
+    }
+}
+
 /// 可复用图片内容原语：解码结果 + 适配模式 + 状态调制（着色/换图）。
 /// 圆角由消费方传入的 `Style.corner_radius` 决定。
 pub struct ImageContent {
@@ -62,6 +95,9 @@ pub struct ImageContent {
     fit: Fit,
     /// 模板着色（单色图标随主题/状态变色）；None=按原色绘制。
     tint: Option<Color>,
+    /// DPI 感知矢量源（仅 `from_svg_bytes(_, None)` 持有）。`base` 保留固有尺寸
+    /// 光栅作 `intrinsic_size` 的度量依据与光栅失败时的回退。
+    svg: Option<SvgSource>,
 }
 
 impl ImageContent {
@@ -72,6 +108,7 @@ impl ImageContent {
             overrides: Vec::new(),
             fit: Fit::default(),
             tint: None,
+            svg: None,
         }
     }
 
@@ -83,11 +120,22 @@ impl ImageContent {
     pub fn from_file(path: impl AsRef<Path>) -> Self {
         Self::new(Image::from_file(path).ok())
     }
-    /// 便捷构造：从 SVG 字节光栅化（`svg` feature）。`target_width=None` 用固有尺寸，
-    /// `Some(w)` 按该宽度等比光栅（HiDPI 求清晰）。失败画占位框。
+    /// 便捷构造：从 SVG 字节光栅化（`svg` feature）。失败画占位框。
+    ///
+    /// - `None`（**推荐**）：**DPI 感知**——固有尺寸即逻辑尺寸，paint 期按实际物理
+    ///   尺寸光栅化，任何 DPI 下都 1:1 无重采样。
+    /// - `Some(w)`：写死光栅宽（逻辑尺寸随之变为 `w` dp）。只在需要精确控制光栅
+    ///   分辨率时用；它在 `物理宽 != w` 的 DPI 下必然经历一次重采样。
     #[cfg(feature = "svg")]
     pub fn from_svg_bytes(bytes: &[u8], target_width: Option<u32>) -> Self {
-        Self::new(Image::from_svg_bytes(bytes, target_width).ok())
+        let mut c = Self::new(Image::from_svg_bytes(bytes, target_width).ok());
+        if target_width.is_none() {
+            c.svg = Some(SvgSource {
+                bytes: Rc::from(bytes),
+                cache: RefCell::new(None),
+            });
+        }
+        c
     }
     /// 便捷构造：从原始 RGBA8。
     pub fn from_rgba(w: u32, h: u32, rgba: &[u8]) -> Self {
@@ -114,6 +162,9 @@ impl ImageContent {
     /// `&mut` 版着色设置（供 Builder 的 `.tint()` 调用）。着色色变更时清缓存。
     pub fn set_tint(&mut self, color: Color) {
         self.tint = Some(color);
+        if let Some(s) = &self.svg {
+            *s.cache.borrow_mut() = None;
+        }
         if let Some(l) = &self.base {
             *l.tinted.borrow_mut() = None;
         }
@@ -152,8 +203,32 @@ impl ImageContent {
         }
     }
 
+    /// 矢量源应光栅化到的**物理宽**：按 `fit` 求出图片实际绘制的逻辑宽，再乘 DPI。
+    /// 与 `Canvas::draw_image` 的 fit 语义保持一致，使那里算出的缩放因子落在 1.0。
+    #[cfg(feature = "svg")]
+    fn svg_target_width(&self, dst: Rect, scale: f32) -> Option<u32> {
+        let base = self.base.as_ref()?;
+        let (iw, ih) = (base.raw.width() as f32, base.raw.height() as f32);
+        if iw <= 0.0 || ih <= 0.0 || scale <= 0.0 {
+            return None;
+        }
+        let (dw, dh) = (dst.w as f32, dst.h as f32);
+        let draw_w = match self.fit {
+            Fit::Fill => dw,
+            Fit::Contain => iw * (dw / iw).min(dh / ih),
+            Fit::Cover => iw * (dw / iw).max(dh / ih),
+            // 1 图片像素 = 1 逻辑 dp。
+            Fit::None => iw,
+        };
+        // 上限保护：异常布局下不至于光栅出巨图拖垮 paint。
+        Some((draw_w * scale).round().clamp(1.0, 8192.0) as u32)
+    }
+
     /// 按状态把图片绘制进 `dst`；无图则画占位框。圆角取 `style.corner_radius`，
     /// 与核心层给背景/边框画圆角同源。禁用等状态按 `VisualState::opacity` 调制。
+    ///
+    /// 持有矢量源时按 `dst` 的物理尺寸现场光栅化（见模块头 DPI 感知），使图标在
+    /// 任意 DPI 下都 1:1 落像素；状态换图命中时用该状态的位图，不走矢量路径。
     pub fn paint_into(
         &self,
         dst: Rect,
@@ -165,9 +240,20 @@ impl ImageContent {
             return;
         }
         let radius = style.corner_radius;
-        match self.layer_for(state) {
-            Some(layer) => {
-                let img = layer.resolve(self.tint);
+
+        #[cfg(feature = "svg")]
+        let vector = match self.overrides.iter().any(|(s, _)| *s == state) {
+            true => None,
+            false => self.svg.as_ref().and_then(|s| {
+                self.svg_target_width(dst, canvas.dpi_scale())
+                    .and_then(|w| s.resolve(w, self.tint))
+            }),
+        };
+        #[cfg(not(feature = "svg"))]
+        let vector: Option<Image> = None;
+
+        match vector.or_else(|| self.layer_for(state).map(|l| l.resolve(self.tint))) {
+            Some(img) => {
                 canvas.draw_image(&img, dst, self.fit, radius, state.opacity());
             }
             None => {
@@ -252,6 +338,76 @@ mod tests {
         assert_eq!(
             c.intrinsic_size(),
             Size::new(PLACEHOLDER_SIZE, PLACEHOLDER_SIZE)
+        );
+    }
+
+    /// 20 网格 / 2px 描边的横线：网格与逻辑尺寸 1:1 时，描边正好盖满 2 个像素行。
+    #[cfg(feature = "svg")]
+    const BAR_SVG: &[u8] = br##"<svg viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M4 10h12" stroke="#000000" stroke-width="2"/></svg>"##;
+
+    /// 矢量源的光栅宽须跟随 DPI——写死光栅宽只在恰好等于该倍率的 DPI 下是 1:1，
+    /// 其余倍率都要经一次双线性重采样，细描边会被摊成灰边。
+    #[cfg(feature = "svg")]
+    #[test]
+    fn svg_target_width_follows_dpi() {
+        let c = ImageContent::from_svg_bytes(BAR_SVG, None);
+        let dst = Rect::new(0, 0, 20, 20);
+        assert_eq!(c.svg_target_width(dst, 1.0), Some(20));
+        assert_eq!(c.svg_target_width(dst, 1.25), Some(25));
+        assert_eq!(c.svg_target_width(dst, 1.5), Some(30));
+        assert_eq!(c.svg_target_width(dst, 2.0), Some(40));
+        // 写死光栅宽的构造不持有矢量源，不参与 DPI 感知。
+        assert!(ImageContent::from_svg_bytes(BAR_SVG, Some(40))
+            .svg
+            .is_none());
+    }
+
+    /// 各 DPI 下描边都应落满整像素（出现纯色像素）。写死 2× 光栅的老做法在
+    /// 1.0/1.5 下都会被降采样，一个纯色像素都拿不到。
+    #[cfg(feature = "svg")]
+    #[test]
+    fn svg_stays_pixel_exact_across_dpi() {
+        for scale in [1.0f32, 1.25, 1.5, 2.0] {
+            let side = (40.0 * scale) as u32;
+            let mut pm = Pixmap::new(side, side).unwrap();
+            pm.fill(tiny_skia::Color::WHITE);
+            let c = ImageContent::from_svg_bytes(BAR_SVG, None);
+            {
+                let mut te = crate::text::NullTextEngine;
+                let mut canvas = SkiaCanvas::with_text(&mut pm, &mut te, scale);
+                c.paint_into(
+                    Rect::new(10, 10, 20, 20),
+                    &mut canvas,
+                    &Style::default(),
+                    VisualState::Normal,
+                );
+            }
+            let solid = pm
+                .pixels()
+                .iter()
+                .filter(|p| p.red() == 0 && p.green() == 0 && p.blue() == 0 && p.alpha() == 255)
+                .count();
+            assert!(
+                solid > 0,
+                "scale={scale}：2px 描边应有纯色像素（按物理尺寸 1:1 光栅），实得 {solid}"
+            );
+        }
+    }
+
+    /// 着色变更须让矢量缓存失效，否则换主题后仍画旧颜色。
+    #[cfg(feature = "svg")]
+    #[test]
+    fn svg_cache_invalidated_on_tint_change() {
+        let c = ImageContent::from_svg_bytes(BAR_SVG, None).tint(Color::rgb(255, 0, 0));
+        let img = c.svg.as_ref().unwrap().resolve(20, c.tint).unwrap();
+        assert!(img.width() == 20, "应按请求的物理宽光栅");
+        assert!(c.svg.as_ref().unwrap().cache.borrow().is_some());
+
+        let mut c = c;
+        c.set_tint(Color::rgb(0, 0, 255));
+        assert!(
+            c.svg.as_ref().unwrap().cache.borrow().is_none(),
+            "改 tint 后矢量缓存应被清空"
         );
     }
 

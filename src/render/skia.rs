@@ -390,10 +390,21 @@ impl Canvas for SkiaCanvas<'_> {
             // 1 图片像素 = 1 逻辑 dp → 物理为 ×scale。
             Fit::None => (self.scale, self.scale),
         };
-        let (dw, dh) = (iw * sx, ih * sy);
-        // 在 dst 框内居中（Cover/None 的溢出由裁剪 mask 收口）。
-        let tx = px + (pw - dw) / 2.0;
-        let ty = py + (ph - dh) / 2.0;
+        let (mut sx, mut sy) = (sx, sy);
+        let (mut dw, mut dh) = (iw * sx, ih * sy);
+        // 物理尺寸与源图相差不足 1 像素时吸附为 1:1：DPI 感知的矢量图标经此走上纯
+        // blit 路径，不再被双线性重采样摊糊；`scaled()` 四边各自 round 带来的 ±1
+        // 误差也在此吸收（否则细描边会被 0.97 倍这种"几乎 1:1"的缩放糊掉）。
+        if (dw - iw).abs() < 1.0 && (dh - ih).abs() < 1.0 {
+            sx = 1.0;
+            sy = 1.0;
+            dw = iw;
+            dh = ih;
+        }
+        // 在 dst 框内居中（Cover/None 的溢出由裁剪 mask 收口）。落点取整到物理像素：
+        // 尺寸对上了但平移带半像素，双线性同样会把 1:1 的图糊掉。
+        let tx = (px + (pw - dw) / 2.0).round();
+        let ty = (py + (ph - dh) / 2.0).round();
         let transform = Transform::from_scale(sx, sy).post_translate(tx, ty);
 
         // 裁剪 mask：dst 圆角矩形 ∩ 当前裁剪区。radius<=0 时退化为矩形。
@@ -816,6 +827,55 @@ mod tests {
         assert!(
             r2 > 240 && g2 > 240 && b2 > 240,
             "dst 外不应被绘制，实得 ({r2},{g2},{b2})"
+        );
+    }
+
+    /// draw_image：物理尺寸与源图一致时须 1:1 blit——边缘不得出现插值灰边。
+    /// 这是 DPI 感知矢量图标的落地保证：光栅到物理尺寸后若仍被缩放/半像素平移，
+    /// 双线性会把细描边重新摊糊，前面的精确光栅就白做了。
+    #[test]
+    fn draw_image_unit_scale_is_pixel_exact() {
+        let mut pm = Pixmap::new(20, 20).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        // 4×4 纯红源图，dst 恰为 4×4 逻辑（scale=1 → 物理 4×4）。
+        let img = Image::from_rgba(4, 4, &[255u8, 0, 0, 255].repeat(4 * 4)).unwrap();
+        {
+            let mut c = SkiaCanvas::new(&mut pm);
+            c.draw_image(&img, Rect::new(5, 5, 4, 4), Fit::Contain, 0.0, 1.0);
+        }
+        for y in 5..9 {
+            for x in 5..9 {
+                let (r, g, b) = px(&pm, x, y);
+                assert_eq!(
+                    (r, g, b),
+                    (255, 0, 0),
+                    "({x},{y}) 应为纯红（1:1 无插值），实得 ({r},{g},{b})"
+                );
+            }
+        }
+        // 框外相邻像素不得被插值溢出污染。
+        let (r, g, b) = px(&pm, 9, 9);
+        assert_eq!((r, g, b), (255, 255, 255), "dst 外应保持背景白");
+    }
+
+    /// 尺寸差不足 1 物理像素时吸附 1:1：非整数 DPI 下 `scaled()` 四边各自 round，
+    /// 物理宽可能比理论值差 1，不吸附就会退化成 0.97 倍这种"几乎 1:1"的糊缩放。
+    #[test]
+    fn draw_image_snaps_near_unit_scale() {
+        let mut pm = Pixmap::new(30, 30).unwrap();
+        pm.fill(tiny_skia::Color::WHITE);
+        // 源 8×8，dst 逻辑 9×9（差 1 像素，落在吸附阈值内）→ 保持 8×8 不拉伸。
+        let img = Image::from_rgba(8, 8, &[255u8, 0, 0, 255].repeat(8 * 8)).unwrap();
+        {
+            let mut c = SkiaCanvas::new(&mut pm);
+            c.draw_image(&img, Rect::new(5, 5, 9, 9), Fit::Contain, 0.0, 1.0);
+        }
+        // 吸附后图片 8×8 在 9×9 框内居中（tx 取整），像素应为纯红而非插值中间色。
+        let (r, g, b) = px(&pm, 9, 9);
+        assert_eq!(
+            (r, g, b),
+            (255, 0, 0),
+            "近 1:1 应吸附为纯 blit，实得 ({r},{g},{b})"
         );
     }
 
