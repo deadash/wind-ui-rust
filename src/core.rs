@@ -144,6 +144,14 @@ pub trait Widget {
     fn focusable(&self) -> bool {
         false
     }
+    /// 本节点是否为**模态层根**（仅对话框遮罩）：可见时把 Tab 焦点环圈在其子树内，
+    /// 使键盘无法走到被遮罩盖住、鼠标点都点不到的控件上（见 [`Tree::focusable_order`]）。
+    ///
+    /// 与 [`Widget::scrim_passthrough`] 是两件事，勿合并：那个说的是窗口拖动区判定
+    /// 要不要穿透，这个说的是键盘焦点归谁管。
+    fn is_modal(&self) -> bool {
+        false
+    }
     /// 接收 Builder 传入的点击回调（仅交互控件实现）。
     fn take_click(&mut self, _f: ClickFn) {}
     /// 显隐切换时重置交互态（hover/press → 静止，并令下次绘制的补间瞬时落定不动画）。
@@ -1814,12 +1822,45 @@ impl Tree {
     }
 
     /// 收集可聚焦节点（前序遍历顺序），供 Tab 导航。
+    ///
+    /// 有可见模态层时只收集**最上层**模态子树内的节点（焦点陷阱）：对话框弹出后
+    /// Tab 不该走到遮罩后面去——那些控件鼠标点不到（`ModalScrim` 吞指针），键盘却
+    /// 能停上去并激活，是模态语义的破口。遮罩本身只吞指针，故这条必须在此另做。
     pub fn focusable_order(&self) -> Vec<NodeId> {
         let mut out = Vec::new();
-        if let Some(root) = self.root {
-            self.collect_focusable(root, &mut out);
+        let scope = self.topmost_modal().or(self.root);
+        if let Some(id) = scope {
+            self.collect_focusable(id, &mut out);
         }
         out
+    }
+
+    /// 最上层的可见模态子树根：前序遍历中最后出现的 `is_modal` 节点。
+    ///
+    /// 取"最后"而非"最深"——绘制顺序靠后者盖在上面，嵌套对话框里后开的那个无论
+    /// 是前者的子孙还是兄弟，都排在前序遍历的后面，与 hit_test 的层级语义一致。
+    /// 沿途遇不可见或自身禁用的节点即止，使返回的模态层其父链必然可见且启用。
+    ///
+    /// 宿主另用它检测模态层进出，据以移交焦点（见 `UiHost::sync_modal_focus`）。
+    pub(crate) fn topmost_modal(&self) -> Option<NodeId> {
+        let mut found = None;
+        self.scan_modal(self.root?, &mut found);
+        found
+    }
+
+    fn scan_modal(&self, id: NodeId, found: &mut Option<NodeId>) {
+        let Some(n) = self.get(id) else {
+            return;
+        };
+        if !n.effective_visible() || !n.own_enabled() {
+            return;
+        }
+        if n.widget.is_modal() {
+            *found = Some(id);
+        }
+        for &c in &n.children {
+            self.scan_modal(c, found);
+        }
     }
 
     fn collect_focusable(&self, id: NodeId, out: &mut Vec<NodeId>) {
@@ -2519,6 +2560,72 @@ mod tests {
             .child(Element::button("B"));
         let tree = layout(root, 300, 50);
         assert_eq!(tree.focusable_order().len(), 2, "应收集到 2 个可聚焦按钮");
+    }
+
+    #[test]
+    fn modal_dialog_traps_tab_focus() {
+        // 回归：ModalScrim 只吞指针，焦点环却仍从 root 遍历全树——对话框弹出后
+        // Tab 会走到遮罩后面那些鼠标点不到的控件上。
+        let show = signal(false);
+        let root = Element::stack()
+            .fill()
+            .child(
+                Element::col()
+                    .child(Element::button("后方A"))
+                    .child(Element::button("后方B")),
+            )
+            .child(Element::dialog(
+                show,
+                Element::col().child(Element::button("框内")),
+            ));
+        let tree = layout(root, 300, 200);
+        assert_eq!(
+            tree.focusable_order().len(),
+            2,
+            "对话框未显示时，Tab 应在后方两个按钮之间"
+        );
+
+        show.set(true);
+        assert_eq!(
+            tree.focusable_order().len(),
+            1,
+            "对话框弹出后 Tab 应被圈在框内，够不着后方按钮"
+        );
+
+        show.set(false);
+        assert_eq!(
+            tree.focusable_order().len(),
+            2,
+            "对话框关闭后焦点环应恢复到整树"
+        );
+    }
+
+    #[test]
+    fn nested_modal_traps_focus_to_topmost() {
+        // 嵌套对话框：焦点归最后打开（绘制在最上）的那一个，与 hit_test 的层级一致。
+        let (a, b) = (signal(true), signal(false));
+        let root = Element::stack()
+            .fill()
+            .child(Element::button("后方"))
+            .child(Element::dialog(
+                a,
+                Element::col().child(Element::button("A内")),
+            ))
+            .child(Element::dialog(
+                b,
+                Element::col()
+                    .child(Element::button("B内1"))
+                    .child(Element::button("B内2")),
+            ));
+        let tree = layout(root, 300, 200);
+        assert_eq!(tree.focusable_order().len(), 1, "只开 A 时焦点在 A 内");
+
+        b.set(true);
+        assert_eq!(
+            tree.focusable_order().len(),
+            2,
+            "B 压在 A 上时焦点应移交给 B，而不是留在 A"
+        );
     }
 
     #[test]

@@ -849,6 +849,11 @@ struct UiHost {
     scale: f32,
     /// 焦点环是否可见：键盘 Tab 导航时 true，鼠标聚焦时 false。
     focus_visible: bool,
+    /// 上一帧的模态作用域（`Tree::topmost_modal`）。与本帧比较以侦测对话框
+    /// 弹出/关闭/换层，据以移交焦点（见 `sync_modal_focus`）。
+    modal_scope: Option<NodeId>,
+    /// 进入模态前的焦点，退出时归还。嵌套对话框只记最外那次进入。
+    focus_before_modal: Option<NodeId>,
     /// 活动的上下文菜单浮层（None=无）。
     menu: Option<ContextMenu>,
     /// 最近一帧的逻辑窗口尺寸（菜单弹出位置钳制用）。
@@ -995,6 +1000,8 @@ impl UiHost {
             close: false,
             scale: 1.0,
             focus_visible: false,
+            modal_scope: None,
+            focus_before_modal: None,
             menu: None,
             logical_size: Size::new(0, 0),
             theme,
@@ -1740,6 +1747,39 @@ impl UiHost {
         }
     }
 
+    /// 模态层进出时移交焦点：弹出 → 落到对话框首个可聚焦控件并记下来处；
+    /// 关闭 → 还给弹出前那个控件。同网页 `<dialog>.showModal()` 的语义。
+    ///
+    /// 只在作用域**变化**的那一帧动作，此后用户 Tab 到哪儿就是哪儿——每帧都强制
+    /// 聚焦会把焦点粘死在首项上。
+    fn sync_modal_focus(&mut self) {
+        let scope = self.tree.topmost_modal();
+        if scope == self.modal_scope {
+            return;
+        }
+        let was_inside = self.modal_scope.is_some();
+        self.modal_scope = scope;
+        let target = if scope.is_some() {
+            // 进入模态。A→B 的嵌套切换不覆盖来处，B 关掉回到 A 时才不会丢掉最初那个。
+            if !was_inside {
+                self.focus_before_modal = self.focus;
+            }
+            self.focus_order.first().copied()
+        } else {
+            // 退出模态：归还来处（它可能已随结构变更消失，故再验一次）。
+            self.focus_before_modal
+                .take()
+                .filter(|f| self.focus_order.contains(f))
+        };
+        let old = self.focus;
+        self.tree.set_focused(target, old);
+        self.focus = target;
+        // 自动聚焦必须显示焦点环：焦点是框架替用户挪的，不画出来他不知道挪到哪了。
+        if target.is_some() {
+            self.focus_visible = true;
+        }
+    }
+
     /// Tab 焦点移动（forward=正向）。返回是否变化。
     fn move_focus(&mut self, forward: bool) -> bool {
         if self.focus_order.is_empty() {
@@ -1969,6 +2009,9 @@ impl AppHandler for UiHost {
         self.flush_pending_toasts();
         // 布局后结构稳定，刷新 Tab 焦点顺序。
         self.focus_order = self.tree.focusable_order();
+        // 模态层进出时移交焦点。必须在下面的归一化之前——归一化只会把落在框外的
+        // 旧焦点抹成 None，抹完就分不清"本该还给谁"了。
+        self.sync_modal_focus();
         // 若当前焦点已不在可聚焦集合中（结构变更），归一化为无焦点。
         if let Some(f) = self.focus {
             if !self.focus_order.contains(&f) {
@@ -3781,6 +3824,78 @@ mod tests {
         handler.on_key(k(Key::Escape));
         assert!(handler.menu.is_none(), "Escape 应关闭菜单");
         assert_eq!(sel.get(), 1, "Escape 不应改变选中值");
+    }
+
+    /// 对话框弹出时焦点应进入框内、关闭后还给来处（同 `<dialog>.showModal()`）。
+    /// 此前焦点留在后方按钮上，Tab 还能一路走到遮罩后面去。
+    #[test]
+    fn modal_open_moves_focus_into_dialog_and_restores_on_close() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        let show = crate::signal::signal(false);
+        let (open, close) = (show, show);
+        let app = App::new("t", 300, 200).content(
+            Element::stack()
+                .fill()
+                .child(
+                    Element::col()
+                        .padding(10)
+                        .child(Element::button("打开").on_click(move |_| open.set(true))),
+                )
+                .child(Element::dialog(
+                    show,
+                    Element::col().child(
+                        Element::button("确定")
+                            .width(80)
+                            .on_click(move |_| close.set(false)),
+                    ),
+                )),
+        );
+        let mut handler = app.into_handler_for_test();
+        handler.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        macro_rules! frame {
+            () => {
+                handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200))
+            };
+        }
+        frame!();
+
+        // 点开按钮：焦点落到它身上，同时请求弹出对话框。
+        let at = Point::new(40, 25);
+        handler.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            at,
+            MouseButton::Left,
+        ));
+        handler.on_pointer(PointerEvent::single(PointerKind::Up, at, MouseButton::Left));
+        let outside = handler.focus;
+        assert!(outside.is_some(), "点按钮应先聚焦到它");
+
+        frame!();
+        assert_eq!(
+            handler.focus,
+            handler.focus_order.first().copied(),
+            "对话框弹出后焦点应自动落到框内首个可聚焦控件"
+        );
+        assert_ne!(handler.focus, outside, "焦点不该留在遮罩后面的按钮上");
+        assert!(handler.focus_visible, "框架代挪的焦点必须显示焦点环");
+
+        // 点框内「确定」关闭对话框。
+        let inside = handler.focus.unwrap();
+        let b = handler.tree.abs_bounds(inside);
+        let at = Point::new(b.x + b.w / 2, b.y + b.h / 2);
+        handler.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            at,
+            MouseButton::Left,
+        ));
+        handler.on_pointer(PointerEvent::single(PointerKind::Up, at, MouseButton::Left));
+        frame!();
+        assert_eq!(handler.focus, outside, "关闭后焦点应还给弹出前那个控件");
     }
 
     /// 三项下拉（初值选中第 1 项）+ 已暖过布局的宿主。

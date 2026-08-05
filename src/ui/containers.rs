@@ -254,6 +254,12 @@ impl Widget for ModalScrim {
         matches!(ev, Event::Pointer(_))
     }
 
+    fn is_modal(&self) -> bool {
+        // 键盘侧的模态：Tab 焦点环圈在遮罩子树内，不走到被盖住的控件上。
+        // 指针侧靠上面的 on_event 吞事件，两者合起来才是完整的模态。
+        true
+    }
+
     fn scrim_passthrough(&self) -> bool {
         // 仅对窗口拖动区判定透明：无边框窗口弹出对话框后，自绘标题栏仍可拖窗
         // （遮罩照常吞事件、照常屏蔽标题栏窗口按钮）。见 `Widget::scrim_passthrough`。
