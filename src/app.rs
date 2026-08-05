@@ -2205,6 +2205,10 @@ impl AppHandler for UiHost {
             _ => {}
         }
         let old_hover = self.hover;
+        // 本次事件**之前**是否已有捕获：拖动过程中（按住不放）的按下不参与失焦判定。
+        // 取事件前的值而非之后——Down 自身常会设置捕获，用之后的值会把"点在捕获型
+        // 控件上"也算作拖动中，失焦就永远轮不到。
+        let had_capture = self.capture.is_some();
         let mut hover = self.hover;
         let mut capture = self.capture;
         let mut res = self.tree.dispatch_pointer(ev, &mut hover, &mut capture);
@@ -2241,6 +2245,22 @@ impl AppHandler for UiHost {
             self.focus = Some(f);
             // 鼠标聚焦：不显示焦点环，保持纯鼠标操作的纯净观感。
             self.focus_visible = false;
+        } else if ev.kind == PointerKind::Down && !had_capture {
+            // 点在当前焦点控件之外 → 清空焦点（网页 blur 语义：焦点归属由宿主每次
+            // 按下重新裁决，而不是"没人认领就维持原样"）。否则下拉框等控件的聚焦
+            // 边框会一直亮到下一个控件接手为止。
+            if let Some(f) = self.focus {
+                if !self.tree.hit_inside(ev.pos, f) {
+                    self.tree.set_focused(None, Some(f));
+                    self.focus = None;
+                    self.focus_visible = false;
+                    // 焦点环画在节点框外 1px，而 damage_rect 的额外余量只对 focused
+                    // 节点给足（见 core.rs）；此刻 focused 已置 false，按脏区走会残留
+                    // 一圈。跨节点的焦点变化本就低频，同 Tab 导航一样整窗重绘。
+                    self.needs_full = true;
+                    res.repaint = true;
+                }
+            }
         }
         if res.close {
             self.apply_close_intent();
@@ -3408,5 +3428,56 @@ mod tests {
         ));
         handler.on_pointer(PointerEvent::single(PointerKind::Up, at, MouseButton::Left));
         assert_eq!(sel.get(), 0, "离屏合成点击首个标签应把选中索引切到 0");
+    }
+
+    /// 点控件外的空白应清空焦点（网页 blur 语义）：否则聚焦边框会一直亮到
+    /// 下一个可聚焦控件接手为止。同时校验两条不该误清的边界。
+    #[test]
+    fn click_outside_clears_focus() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+        let app = App::new("t", 300, 200).content(
+            Element::col()
+                .padding(10)
+                .child(Element::button("A"))
+                .child(Element::flex_spacer()),
+        );
+        let mut handler = app.into_handler_for_test();
+        handler.set_scale(1.0);
+        let mut pm = Pixmap::new(300, 200).unwrap();
+        handler.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+
+        let click = |h: &mut UiHost, p: Point| {
+            h.on_pointer(PointerEvent::single(
+                PointerKind::Down,
+                p,
+                MouseButton::Left,
+            ));
+            h.on_pointer(PointerEvent::single(PointerKind::Up, p, MouseButton::Left));
+        };
+        let on_btn = Point::new(30, 20);
+        let blank = Point::new(150, 180);
+
+        click(&mut handler, on_btn);
+        let focused = handler.focus;
+        assert!(focused.is_some(), "点按钮应获得焦点");
+
+        // 焦点控件内部的按下不该清（命中节点在其祖先链上）。
+        click(&mut handler, on_btn);
+        assert_eq!(handler.focus, focused, "重复点同一控件应保持焦点");
+
+        // 移动不参与裁决：只有按下才重新裁定焦点归属。
+        handler.on_pointer(PointerEvent::single(
+            PointerKind::Move,
+            blank,
+            MouseButton::Left,
+        ));
+        assert_eq!(handler.focus, focused, "指针移出不应清焦点");
+
+        click(&mut handler, blank);
+        assert!(handler.focus.is_none(), "点空白应清空焦点");
     }
 }

@@ -1521,6 +1521,18 @@ impl Tree {
             .any(|&id| self.get(id).map(|n| n.window_drag).unwrap_or(false))
     }
 
+    /// `pos`（逻辑坐标）命中的节点是否落在 `id` 的子树内（含 `id` 自身）。
+    /// 供宿主判定"这次按下是否发生在当前焦点控件之外"，据此清空焦点。
+    ///
+    /// 判据取命中节点的祖先链而非"本次有没有控件 `request_focus`"：焦点控件的
+    /// 内部子节点、以及按下被上层容器先消费的情况，都不该被误判成点了空白。
+    pub fn hit_inside(&self, pos: Point, id: NodeId) -> bool {
+        let Some(hit) = self.hit_test(pos) else {
+            return false;
+        };
+        self.ancestor_chain(hit).contains(&id)
+    }
+
     /// 节点绝对窗口矩形（累加各级父节点偏移）。
     pub fn abs_bounds(&self, id: NodeId) -> Rect {
         let mut r = match self.get(id) {
