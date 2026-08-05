@@ -1774,10 +1774,10 @@ impl UiHost {
         let old = self.focus;
         self.tree.set_focused(target, old);
         self.focus = target;
-        // 自动聚焦必须显示焦点环：焦点是框架替用户挪的，不画出来他不知道挪到哪了。
-        if target.is_some() {
-            self.focus_visible = true;
-        }
+        // 焦点环可见性**沿用当前状态**，不因这次代挪而强制打开：鼠标点开的对话框
+        // 凭空冒出焦点框很突兀，而键盘用户此前 Tab 过、focus_visible 本就是 true，
+        // 焦点照常画得出来。同 :focus-visible 的启发式——聚焦虽是程序性的，判据是
+        // 用户最近一次交互用的什么。
     }
 
     /// Tab 焦点移动（forward=正向）。返回是否变化。
@@ -3887,7 +3887,7 @@ mod tests {
             "对话框弹出后焦点应自动落到框内首个可聚焦控件"
         );
         assert_ne!(handler.focus, outside, "焦点不该留在遮罩后面的按钮上");
-        assert!(handler.focus_visible, "框架代挪的焦点必须显示焦点环");
+        assert!(!handler.focus_visible, "鼠标点开的对话框不该凭空冒出焦点框");
 
         // 点框内「确定」关闭对话框。
         let inside = handler.focus.unwrap();
@@ -3945,6 +3945,65 @@ mod tests {
             b.y,
             b.bottom()
         );
+    }
+
+    /// 焦点环只跟随键盘：同一个对话框，鼠标点开不显示、键盘打开显示。
+    /// 判据是「用户最近一次交互用的什么」，而不是「焦点这次是不是框架挪的」。
+    #[test]
+    fn focus_ring_follows_keyboard_not_mouse() {
+        use crate::event::{MouseButton, PointerEvent, PointerKind};
+        use crate::geometry::Point;
+        use crate::platform::AppHandler;
+        use crate::render::PixmapTarget;
+        use tiny_skia::Pixmap;
+
+        // 每次从头搭一份：show 是构建期捕获的，两种打开方式不能共用同一棵树。
+        let build = || {
+            let show = crate::signal::signal(false);
+            let open = show;
+            let app = App::new("t", 300, 200).content(
+                Element::stack()
+                    .fill()
+                    .child(
+                        Element::col()
+                            .padding(10)
+                            .child(Element::button("打开").on_click(move |_| open.set(true))),
+                    )
+                    .child(Element::dialog(
+                        show,
+                        Element::col().child(Element::button("确定").width(80)),
+                    )),
+            );
+            let mut h = app.into_handler_for_test();
+            h.set_scale(1.0);
+            h
+        };
+        let mut pm = Pixmap::new(300, 200).unwrap();
+
+        // 鼠标路径：点按钮开框。
+        let mut h = build();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let at = Point::new(40, 25);
+        h.on_pointer(PointerEvent::single(
+            PointerKind::Down,
+            at,
+            MouseButton::Left,
+        ));
+        h.on_pointer(PointerEvent::single(PointerKind::Up, at, MouseButton::Left));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        assert!(h.focus.is_some(), "焦点仍应移进对话框（只是不画环）");
+        assert!(!h.focus_visible, "纯鼠标操作全程不应出现焦点框");
+
+        // 键盘路径：Tab 到按钮、空格激活。
+        let mut h = build();
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        let k = key_ev();
+        h.on_key(k(Key::Tab));
+        assert!(h.focus_visible, "Tab 导航应打开焦点环");
+        h.on_key(k(Key::Space));
+        h.render(&mut PixmapTarget { pixmap: &mut pm }, Size::new(300, 200));
+        assert!(h.focus.is_some(), "空格应激活按钮并弹出对话框");
+        assert!(h.focus_visible, "键盘打开的对话框应保留焦点环");
     }
 
     /// 三项下拉（初值选中第 1 项）+ 已暖过布局的宿主。
