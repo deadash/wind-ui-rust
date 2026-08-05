@@ -13,7 +13,7 @@ use crate::sync::{new_channel, Sender, WakerShared};
 
 use tiny_skia::Pixmap;
 
-use crate::core::{DamageReq, NodeId, Tree};
+use crate::core::{DamageReq, DispatchResult, NodeId, Tree};
 use crate::event::{
     CursorShape, Key, MenuAction, MenuItem, MouseButton, PointerEvent, PointerKind, ToastRequest,
     WindowOp,
@@ -84,6 +84,14 @@ fn menu_item_height(it: &MenuItem) -> i32 {
     } else {
         MENU_ITEM_H
     }
+}
+
+/// 焦点由哪种设备转移而来。决定焦点环显不显示——`:focus-visible` 的判据是用户最近
+/// 一次交互用的什么设备，而不是这次聚焦是不是程序性的。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FocusSource {
+    Pointer,
+    Keyboard,
 }
 
 /// 该项能否被键盘高亮停留：分隔线与禁用项跳过。子菜单父项**可以**停留
@@ -1747,6 +1755,93 @@ impl UiHost {
         }
     }
 
+    /// 一次分发的副作用消费（指针与键盘共用）。返回 `(repaint, damage, consumed)`
+    /// ——这三项与事件类型强相关（Move 走局部、Escape 要看有没有被消费），交调用方处理。
+    ///
+    /// **刻意用解构而非逐字段读取**：`DispatchResult` 新增字段时这里会编译失败，逼作者
+    /// 当场决定它归谁管。此前两条路径各自手写消费，键盘侧漏掉 `menu` 与 `focus` 没有
+    /// 任何征兆——请求型副作用漏接是静默的，表现只是"按空格没反应"。
+    ///
+    /// `blur_at`：指针路径专用。`Some(pos)` 表示本次是可参与失焦裁决的按下（Down 且
+    /// 事件前无捕获）；无人请求焦点时据此判断该不该清空。必须留在 `focus` 的 else 位置，
+    /// 挪到 `menu` 之后会让"右键点空白"的菜单 target 从旧焦点变成 root。
+    fn apply_dispatch_effects(
+        &mut self,
+        res: DispatchResult,
+        focus_from: FocusSource,
+        blur_at: Option<Point>,
+    ) -> (bool, DamageReq, bool) {
+        let DispatchResult {
+            mut repaint,
+            damage,
+            close,
+            focus,
+            consumed,
+            menu,
+            open_url,
+            window_op,
+            toast,
+            dialog,
+        } = res;
+        if let Some(f) = focus {
+            let old = self.focus;
+            self.tree.set_focused(Some(f), old);
+            self.focus = Some(f);
+            match focus_from {
+                // 鼠标聚焦不显示焦点环，保持纯鼠标操作的纯净观感。
+                FocusSource::Pointer => self.focus_visible = false,
+                // 键盘聚焦相反——本来就在键盘导航中。焦点环跨节点变化 → 整窗。
+                FocusSource::Keyboard => {
+                    self.focus_visible = true;
+                    self.needs_full = true;
+                }
+            }
+        } else if let Some(pos) = blur_at {
+            // 点在当前焦点控件之外 → 清空焦点（网页 blur 语义：焦点归属由宿主每次按下
+            // 重新裁决，而不是"没人认领就维持原样"）。
+            if let Some(f) = self.focus {
+                if !self.tree.hit_inside(pos, f) {
+                    self.tree.set_focused(None, Some(f));
+                    self.focus = None;
+                    self.focus_visible = false;
+                    // 焦点环画在节点框外 1px，而 damage_rect 的额外余量只对 focused 节点
+                    // 给足；此刻 focused 已置 false，按脏区走会残留一圈，故整窗。
+                    self.needs_full = true;
+                    repaint = true;
+                }
+            }
+        }
+        if close {
+            self.apply_close_intent();
+        }
+        // 浮层菜单。target 是 SendKey 动作的派发对象：优先当前焦点控件（如 TextInput
+        // 的右键剪贴板项），否则回退根节点（on_context_menu 容器不可聚焦，其菜单项多为
+        // Run 闭包、不依赖 target）。
+        if let Some(req) = menu {
+            if let Some(target) = self.focus.or(self.tree.root) {
+                self.open_menu(req, target);
+            }
+        }
+        // 链接点击等：交平台用默认程序打开。
+        if let Some(url) = open_url {
+            platform::open_url(&url);
+        }
+        // 窗口操作（自定义标题栏按钮）：暂存，平台分发后轮询执行（需 hwnd）。
+        if window_op.is_some() {
+            self.pending_window_op = window_op;
+        }
+        // 原生文件对话框：暂存，待事件分发完全返回、OS 捕获同步后再执行，避免在事件
+        // 回调栈内重入阻塞式模态对话框（见 DialogRequest 文档）。
+        if dialog.is_some() {
+            self.pending_dialog = dialog;
+        }
+        // 轻提示：居中浮层 + 淡入淡出 + 定时消失。
+        if let Some(req) = toast {
+            self.show_toast(req);
+        }
+        (repaint, damage, consumed)
+    }
+
     /// 模态层进出时移交焦点：弹出 → 落到对话框首个可聚焦控件并记下来处；
     /// 关闭 → 还给弹出前那个控件。同网页 `<dialog>.showModal()` 的语义。
     ///
@@ -2489,65 +2584,17 @@ impl AppHandler for UiHost {
             }
             _ => {}
         }
-        if let Some(f) = res.focus {
-            let old = self.focus;
-            self.tree.set_focused(Some(f), old);
-            self.focus = Some(f);
-            // 鼠标聚焦：不显示焦点环，保持纯鼠标操作的纯净观感。
-            self.focus_visible = false;
-        } else if ev.kind == PointerKind::Down && !had_capture {
-            // 点在当前焦点控件之外 → 清空焦点（网页 blur 语义：焦点归属由宿主每次
-            // 按下重新裁决，而不是"没人认领就维持原样"）。否则下拉框等控件的聚焦
-            // 边框会一直亮到下一个控件接手为止。
-            if let Some(f) = self.focus {
-                if !self.tree.hit_inside(ev.pos, f) {
-                    self.tree.set_focused(None, Some(f));
-                    self.focus = None;
-                    self.focus_visible = false;
-                    // 焦点环画在节点框外 1px，而 damage_rect 的额外余量只对 focused
-                    // 节点给足（见 core.rs）；此刻 focused 已置 false，按脏区走会残留
-                    // 一圈。跨节点的焦点变化本就低频，同 Tab 导航一样整窗重绘。
-                    self.needs_full = true;
-                    res.repaint = true;
-                }
-            }
-        }
-        if res.close {
-            self.apply_close_intent();
-        }
-        // 控件请求弹出上下文菜单。target 是 SendKey 动作的派发对象：优先刚获焦的控件
-        // （如 TextInput 右键剪贴板项），否则回退到根节点（on_context_menu 容器不可聚焦，
-        // 其菜单项多为 Run 闭包，不依赖 target）。
-        if let Some(req) = res.menu {
-            if let Some(target) = self.focus.or(self.tree.root) {
-                self.open_menu(req, target);
-            }
-        }
-        // 控件请求打开 URL/路径（链接点击）：交平台用默认程序打开。
-        if let Some(url) = res.open_url {
-            platform::open_url(&url);
-        }
-        // 窗口操作（自定义标题栏按钮）：暂存，平台分发后轮询执行（需 hwnd）。
-        if res.window_op.is_some() {
-            self.pending_window_op = res.window_op;
-        }
-        // 原生文件对话框请求：暂存，待本次事件分发完全返回、OS 捕获同步后再执行，
-        // 避免在事件回调栈内重入阻塞式模态对话框（见 DialogRequest 文档）。
-        if res.dialog.is_some() {
-            self.pending_dialog = res.dialog;
-        }
-        // 控件请求轻提示：居中浮层 + 淡入淡出 + 定时消失（强制整窗重绘以叠加浮层）。
-        if let Some(req) = res.toast {
-            self.show_toast(req);
-        }
+        // 可参与失焦裁决的按下：Down 且事件前无捕获（拖动中的按下不算）。
+        let blur_at = (ev.kind == PointerKind::Down && !had_capture).then_some(ev.pos);
+        let (repaint, damage, _) = self.apply_dispatch_effects(res, FocusSource::Pointer, blur_at);
         // hover/拖动（Move）自包含（控件自身视觉）→ 直接用其脏区走局部。
         // 点击等可能改变布局/显隐 → 置 needs_relayout：render 重排后用结构签名判定，
         // 签名不变才用控件脏区走局部，变了（对话框/切页等）自动升级整窗。
-        self.apply_damage(res.damage);
+        self.apply_damage(damage);
         if !matches!(ev.kind, PointerKind::Move) {
             self.needs_relayout = true;
         }
-        res.repaint
+        repaint
     }
 
     fn on_key(&mut self, ev: crate::event::KeyEvent) -> bool {
@@ -2568,48 +2615,19 @@ impl AppHandler for UiHost {
         }
         // 其余键先交给焦点控件；未被消费的 Escape 回退为关闭窗口。
         let res = self.tree.dispatch_key(ev, self.focus);
-        // 焦点转移请求：键盘路径同样要接住，否则控件在键盘上调 request_focus 无效。
-        // 与鼠标聚焦相反，此处保留焦点环——本来就是键盘导航中。
-        if let Some(f) = res.focus {
-            let old = self.focus;
-            self.tree.set_focused(Some(f), old);
-            self.focus = Some(f);
-            self.focus_visible = true;
-            self.needs_full = true;
-        }
-        if res.close {
-            self.apply_close_intent();
-        }
-        // 控件请求弹出浮层（Dropdown/CheckMenu 按空格、回车、↓ 展开）。指针路径一直
-        // 接着这一段，键盘路径此前漏了——控件的 open 请求被 dispatch_key 收进
-        // DispatchResult 后静默丢弃，表现为"按空格没反应"。target 语义同 on_pointer。
-        if let Some(req) = res.menu {
-            if let Some(target) = self.focus.or(self.tree.root) {
-                self.open_menu(req, target);
-            }
-        }
-        if let Some(url) = res.open_url {
-            platform::open_url(&url);
-        }
-        if res.window_op.is_some() {
-            self.pending_window_op = res.window_op;
-        }
-        if res.dialog.is_some() {
-            self.pending_dialog = res.dialog;
-        }
-        if let Some(req) = res.toast {
-            self.show_toast(req);
-        }
-        if !res.consumed && ev.key == Key::Escape && self.resolve_close() {
+        // 键盘路径不参与失焦裁决（没有"点在别处"这回事），故 blur_at 恒为 None。
+        let (repaint, damage, consumed) =
+            self.apply_dispatch_effects(res, FocusSource::Keyboard, None);
+        if !consumed && ev.key == Key::Escape && self.resolve_close() {
             self.close = true;
         }
         // 键盘改动可能影响布局（文本增减）或他处（切页/对话框）→ 置 needs_relayout：
         // render 重排后用结构签名判定，签名不变（定宽输入打字）走局部，变了升级整窗。
-        if res.repaint {
-            self.apply_damage(res.damage);
+        if repaint {
+            self.apply_damage(damage);
             self.needs_relayout = true;
         }
-        res.repaint
+        repaint
     }
 
     fn wants_close(&self) -> bool {
